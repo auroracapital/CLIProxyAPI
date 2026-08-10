@@ -122,6 +122,16 @@ PackyCode 为本软件用户提供了特别优惠：使用<a href="https://www.p
 
 CLIProxyAPI 用户手册： [https://help.router-for.me/](https://help.router-for.me/cn/)
 
+## 从 GitHub Releases 安装插件
+
+从插件仓库安装最新版本：
+
+```bash
+cli-proxy-api -plugin-install https://github.com/owner/repository
+```
+
+可以使用 `-plugin-version v1.2.3` 指定版本；当无法从 Release 资产中唯一推断插件 ID 时，可以使用 `-plugin-id id`。Release 必须符合 CLIProxyAPI 插件资产命名和校验文件格式。安装命令会启用对应插件配置，但不会修改全局 `plugins.enabled` 设置。插件二进制只会安装到当前节点；多节点部署需要在每个节点执行安装，或使用共享插件目录。
+
 ## 管理 API 文档
 
 请参见 [MANAGEMENT_API_CN.md](https://help.router-for.me/cn/management/api)

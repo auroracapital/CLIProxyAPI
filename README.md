@@ -126,6 +126,16 @@ PackyCode provides special discounts for our software users: register using <a h
 
 CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
 
+## Install a Plugin from GitHub Releases
+
+Install the latest release from a plugin repository:
+
+```bash
+cli-proxy-api -plugin-install https://github.com/owner/repository
+```
+
+Use `-plugin-version v1.2.3` to pin a release, or `-plugin-id id` when the plugin ID cannot be uniquely inferred from the release assets. The release must follow the CLIProxyAPI plugin asset naming and checksum format. Installation enables the plugin entry but does not change the global `plugins.enabled` setting. Only the current node receives the plugin binary; install it on every node or use a shared plugin directory.
+
 ## Management API
 
 see [MANAGEMENT_API.md](https://help.router-for.me/management/api)
