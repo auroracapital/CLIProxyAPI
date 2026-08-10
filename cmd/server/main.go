@@ -70,6 +70,21 @@ func shouldEnableExampleAPIKeySafeMode(cfg *config.Config, commandMode, tuiMode,
 // It parses command-line flags, loads configuration, and starts the appropriate
 // service based on the provided flags (login, codex-login, or server mode).
 func main() {
+	pluginInstallRequested := pluginInstallCommandRequested(os.Args[1:])
+	if pluginInstallRequested {
+		log.SetOutput(os.Stderr)
+	}
+	pluginInstallSucceeded := false
+	if pluginInstallRequested {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				panic(recovered)
+			}
+			if !pluginInstallSucceeded {
+				os.Exit(1)
+			}
+		}()
+	}
 	fmt.Printf("CLIProxyAPI Version: %s, Commit: %s, BuiltAt: %s\n", buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
 
 	// Command-line flags to control the application's behavior.
@@ -91,6 +106,9 @@ func main() {
 	var tuiMode bool
 	var standalone bool
 	var localModel bool
+	var pluginInstall string
+	var pluginVersion string
+	var pluginID string
 
 	// Define command-line flags for different operation modes.
 	flag.BoolVar(&codexLogin, "codex-login", false, "Login to Codex using OAuth")
@@ -111,6 +129,9 @@ func main() {
 	flag.BoolVar(&tuiMode, "tui", false, "Start with terminal management UI")
 	flag.BoolVar(&standalone, "standalone", false, "In TUI mode, start an embedded local server")
 	flag.BoolVar(&localModel, "local-model", false, "Use embedded models.json and codex_client_models.json only, skip remote model catalog fetching")
+	flag.StringVar(&pluginInstall, "plugin-install", "", "Install a plugin from a GitHub repository URL")
+	flag.StringVar(&pluginVersion, "plugin-version", "", "Install a specific GitHub plugin release version (use with -plugin-install)")
+	flag.StringVar(&pluginID, "plugin-id", "", "Override the plugin ID inferred from release assets (use with -plugin-install)")
 
 	flag.CommandLine.Usage = func() {
 		out := flag.CommandLine.Output()
@@ -140,13 +161,26 @@ func main() {
 	}
 
 	pluginHost := pluginhost.New()
-	if bootstrapCfg := loadPluginBootstrapConfig(pluginBootstrapConfigPath(os.Args[1:], DefaultConfigPath)); bootstrapCfg != nil {
-		pluginHost.ApplyConfig(context.Background(), bootstrapCfg)
-		pluginHost.RegisterCommandLineFlags(context.Background(), flag.CommandLine)
+	if !pluginInstallRequested {
+		if bootstrapCfg := loadPluginBootstrapConfig(pluginBootstrapConfigPath(os.Args[1:], DefaultConfigPath)); bootstrapCfg != nil {
+			pluginHost.ApplyConfig(context.Background(), bootstrapCfg)
+			pluginHost.RegisterCommandLineFlags(context.Background(), flag.CommandLine)
+		}
 	}
 
 	// Parse the command-line flags.
 	flag.Parse()
+	pluginInstall = strings.TrimSpace(pluginInstall)
+	pluginVersion = strings.TrimSpace(pluginVersion)
+	pluginID = strings.TrimSpace(pluginID)
+	if errPluginFlags := validatePluginInstallFlags(pluginInstallRequested, pluginInstall, pluginVersion, pluginID, vertexImport, antigravityLogin, codexLogin, codexDeviceLogin, claudeLogin, kimiLogin, xaiLogin, tuiMode, standalone); errPluginFlags != nil {
+		log.Error(errPluginFlags)
+		return
+	}
+	if pluginInstallRequested && pluginhost.SupportPluginHeaderValue() != "1" {
+		log.Error("plugin-install is unavailable because this binary was built without CGO plugin support")
+		return
+	}
 
 	// Core application variables.
 	var err error
@@ -208,6 +242,10 @@ func main() {
 		if v, ok := lookupEnv("HOME_JWT", "home_jwt"); ok {
 			homeJWT = v
 		}
+	}
+	if pluginInstallRequested && strings.TrimSpace(homeJWT) != "" {
+		log.Error("plugin-install cannot be used with Home-managed configuration")
+		return
 	}
 
 	if value, ok := lookupEnv("PGSTORE_DSN", "pgstore_dsn"); ok {
@@ -566,9 +604,11 @@ func main() {
 	coreauth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	coreauth.SetTransientErrorCooldownSeconds(cfg.TransientErrorCooldownSeconds)
 
-	if err = logging.ConfigureLogOutput(cfg); err != nil {
-		log.Errorf("failed to configure log output: %v", err)
-		return
+	if !pluginInstallRequested {
+		if err = logging.ConfigureLogOutput(cfg); err != nil {
+			log.Errorf("failed to configure log output: %v", err)
+			return
+		}
 	}
 
 	log.Infof("CLIProxyAPI Version: %s, Commit: %s, BuiltAt: %s", buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
@@ -590,7 +630,7 @@ func main() {
 		CallbackPort: oauthCallbackPort,
 	}
 
-	commandMode := vertexImport != "" || antigravityLogin || codexLogin || codexDeviceLogin || claudeLogin || kimiLogin || xaiLogin || devinLogin
+	commandMode := pluginInstallRequested || vertexImport != "" || antigravityLogin || codexLogin || codexDeviceLogin || claudeLogin || kimiLogin || xaiLogin || devinLogin
 	cloudConfigMissing := isCloudDeploy && !configFileExists
 	homeMode := configLoadedFromHome || (cfg != nil && cfg.Home.Enabled)
 	exampleAPIKeySafeMode := shouldEnableExampleAPIKeySafeMode(cfg, commandMode, tuiMode, standalone, cloudConfigMissing, homeMode)
@@ -602,14 +642,32 @@ func main() {
 	}
 
 	// Register the shared token store once so all components use the same persistence backend.
+	var persistPluginConfig func(context.Context) error
 	if usePostgresStore {
 		sdkAuth.RegisterTokenStore(pgStoreInst)
+		persistPluginConfig = pgStoreInst.PersistConfig
 	} else if useObjectStore {
 		sdkAuth.RegisterTokenStore(objectStoreInst)
+		persistPluginConfig = objectStoreInst.PersistConfig
 	} else if useGitStore {
 		sdkAuth.RegisterTokenStore(gitStoreInst)
+		persistPluginConfig = gitStoreInst.PersistConfig
 	} else {
 		sdkAuth.RegisterTokenStore(sdkAuth.NewFileTokenStore())
+	}
+
+	if pluginInstallRequested {
+		if _, errInstall := cmd.DoPluginInstall(context.Background(), cfg, configFilePath, cmd.PluginInstallOptions{
+			Repository:    pluginInstall,
+			Version:       pluginVersion,
+			ID:            pluginID,
+			PersistConfig: persistPluginConfig,
+		}); errInstall != nil {
+			log.Error(errInstall)
+			return
+		}
+		pluginInstallSucceeded = true
+		return
 	}
 
 	// Register built-in access providers before constructing services.
@@ -784,6 +842,41 @@ func startModelCatalogUpdaters(localModel, homeEnabled bool) {
 	} else if homeEnabled {
 		log.Info("Home mode: remote models.json updates disabled; Codex client model list follows Home model IDs")
 	}
+}
+
+func pluginInstallCommandRequested(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		if arg == "-plugin-install" || arg == "--plugin-install" ||
+			strings.HasPrefix(arg, "-plugin-install=") || strings.HasPrefix(arg, "--plugin-install=") {
+			return true
+		}
+	}
+	return false
+}
+
+func validatePluginInstallFlags(requested bool, pluginInstall, pluginVersion, pluginID, vertexImport string, modes ...bool) error {
+	pluginInstall = strings.TrimSpace(pluginInstall)
+	if !requested {
+		if strings.TrimSpace(pluginVersion) != "" || strings.TrimSpace(pluginID) != "" {
+			return fmt.Errorf("-plugin-version and -plugin-id require -plugin-install")
+		}
+		return nil
+	}
+	if pluginInstall == "" {
+		return fmt.Errorf("-plugin-install requires a GitHub repository URL")
+	}
+	if strings.TrimSpace(vertexImport) != "" {
+		return fmt.Errorf("-plugin-install cannot be combined with another command mode")
+	}
+	for _, enabled := range modes {
+		if enabled {
+			return fmt.Errorf("-plugin-install cannot be combined with another command mode")
+		}
+	}
+	return nil
 }
 
 func pluginBootstrapConfigPath(args []string, defaultPath string) string {

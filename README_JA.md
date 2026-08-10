@@ -125,6 +125,16 @@ PackyCodeは当ソフトウェアのユーザーに特別割引を提供して�
 
 CLIProxyAPIガイド：[https://help.router-for.me/](https://help.router-for.me/)
 
+## GitHub Releasesからプラグインをインストール
+
+プラグインリポジトリから最新リリースをインストールします：
+
+```bash
+cli-proxy-api -plugin-install https://github.com/owner/repository
+```
+
+`-plugin-version v1.2.3`でリリースを指定できます。ReleaseアセットからプラグインIDを一意に推測できない場合は、`-plugin-id id`を使用します。ReleaseはCLIProxyAPIのプラグインアセット命名規則とチェックサム形式に従う必要があります。インストール時に対象プラグインは有効化されますが、グローバルな`plugins.enabled`設定は変更されません。プラグインバイナリは現在のノードにのみインストールされるため、各ノードで実行するか共有プラグインディレクトリを使用してください。
+
 ## 管理API
 
 [MANAGEMENT_API.md](https://help.router-for.me/management/api)を参照

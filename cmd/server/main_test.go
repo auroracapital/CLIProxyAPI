@@ -88,6 +88,45 @@ func TestShouldEnableExampleAPIKeySafeMode(t *testing.T) {
 	}
 }
 
+func TestPluginInstallCommandRequested(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "single dash", args: []string{"-plugin-install", "https://github.com/owner/repo"}, want: true},
+		{name: "double dash equals", args: []string{"--plugin-install=https://github.com/owner/repo"}, want: true},
+		{name: "empty value still declares intent", args: []string{"-plugin-install="}, want: true},
+		{name: "after terminator", args: []string{"--", "-plugin-install", "https://github.com/owner/repo"}, want: false},
+		{name: "unrelated", args: []string{"-config", "config.yaml"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pluginInstallCommandRequested(tt.args); got != tt.want {
+				t.Fatalf("pluginInstallCommandRequested(%#v) = %t, want %t", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidatePluginInstallFlags(t *testing.T) {
+	if errValidate := validatePluginInstallFlags(false, "", "1.0.0", "", ""); errValidate == nil {
+		t.Fatal("version without install error = nil")
+	}
+	if errValidate := validatePluginInstallFlags(true, "", "", "", ""); errValidate == nil {
+		t.Fatal("empty install URL error = nil")
+	}
+	if errValidate := validatePluginInstallFlags(true, "https://github.com/owner/repo", "", "", "key.json"); errValidate == nil {
+		t.Fatal("install with vertex import error = nil")
+	}
+	if errValidate := validatePluginInstallFlags(true, "https://github.com/owner/repo", "", "", "", false, true); errValidate == nil {
+		t.Fatal("install with command mode error = nil")
+	}
+	if errValidate := validatePluginInstallFlags(true, "https://github.com/owner/repo", "v1.0.0", "sample", "", false, false); errValidate != nil {
+		t.Fatalf("valid install flags error = %v", errValidate)
+	}
+}
+
 func TestModelCatalogUpdaterPlan(t *testing.T) {
 	tests := []struct {
 		name            string
