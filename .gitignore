@@ -30,6 +30,8 @@ auths/*
 
 # Documentation
 docs/*
+!docs/plans/
+!docs/plans/2026-08-12-smart-router-execution-plan.md
 AGENTS.md
 CLAUDE.md
 GEMINI.md
@@ -55,6 +57,8 @@ _bmad/*
 _bmad-output/*
 .gocache/
 .gitnexus/
+__pycache__/
+*.py[cod]
 
 # macOS
 .DS_Store

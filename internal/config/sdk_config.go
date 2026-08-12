@@ -39,6 +39,13 @@ type SDKConfig struct {
 	// credentials as well.
 	ForceModelPrefix bool `yaml:"force-model-prefix" json:"force-model-prefix"`
 
+	// AutoRouting is a runtime copy of Config.Routing.Auto for API handlers.
+	// It is not marshalled separately because routing remains a top-level Config field.
+	AutoRouting AutoRoutingConfig `yaml:"-" json:"-"`
+
+	// RoutingObservability is the runtime copy of Config.Routing.Observability.
+	RoutingObservability RoutingObservabilityConfig `yaml:"-" json:"-"`
+
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
 

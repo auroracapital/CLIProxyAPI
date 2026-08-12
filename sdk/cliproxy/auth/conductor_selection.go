@@ -49,6 +49,17 @@ func isBuiltInSelector(selector Selector) bool {
 	}
 }
 
+func selectorUsesSessionAffinity(selector Selector) bool {
+	switch value := selector.(type) {
+	case *SessionAffinitySelector:
+		return true
+	case *ShadowLeastPressureSelector:
+		return value != nil && selectorUsesSessionAffinity(value.fallback)
+	default:
+		return false
+	}
+}
+
 type requiredAuthKindContextKey struct{}
 type credentialPolicyContextKey struct{}
 
@@ -342,7 +353,7 @@ func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, pro
 // priority tiers so an established binding can be validated instead of being preempted by a
 // recovered higher-priority credential.
 func (m *Manager) availableAuthsForSelector(selector Selector, auths []*Auth, provider, routeModel string, now time.Time) (priorityAuths, selectorAuths []*Auth, err error) {
-	if _, sessionAffinity := selector.(*SessionAffinitySelector); !sessionAffinity {
+	if !selectorUsesSessionAffinity(selector) {
 		priorityAuths, err = m.availableAuthsForRouteModel(auths, provider, routeModel, now)
 		if err != nil {
 			return nil, nil, err
@@ -631,7 +642,7 @@ func (m *Manager) AvailableProviders() []string {
 	seen := make(map[string]struct{}, len(m.auths))
 	out := make([]string, 0, len(m.auths))
 	for _, auth := range m.auths {
-		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		if auth == nil || auth.Disabled || auth.Status == StatusDisabled || !auth.reconcileReady() {
 			continue
 		}
 		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
@@ -662,7 +673,7 @@ func (m *Manager) HasProviderAuth(provider string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, auth := range m.auths {
-		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		if auth == nil || auth.Disabled || auth.Status == StatusDisabled || !auth.reconcileReady() {
 			continue
 		}
 		if strings.ToLower(strings.TrimSpace(auth.Provider)) == provider {
@@ -1338,7 +1349,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	registryRef := registry.GetGlobalRegistry()
 	for _, candidate := range m.auths {
-		if candidate == nil || candidate.Disabled {
+		if candidate == nil || candidate.Disabled || !candidate.reconcileReady() {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
@@ -1448,7 +1459,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		}
 		m.mu.RLock()
 		for _, candidate := range m.auths {
-			if candidate == nil || candidate.Disabled {
+			if candidate == nil || candidate.Disabled || !candidate.reconcileReady() {
 				continue
 			}
 			if _, ok := providerSet[executorKeyFromAuth(candidate)]; !ok {

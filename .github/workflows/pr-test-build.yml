@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  focused-routing-tests:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -19,7 +19,106 @@ jobs:
           cache: true
       - name: Refresh models catalog
         run: bash .github/scripts/refresh-model-catalogs.sh
-      - name: Build
+      - name: Focused routing tests
+        run: |
+          go test -timeout 30s \
+            ./sdk/api/handlers \
+            ./internal/config \
+            ./internal/api \
+            ./internal/api/handlers/management \
+            ./sdk/cliproxy/auth \
+            ./sdk/cliproxy \
+            -run 'TestSmart|TestRouting|Test.*AutoRout|Test.*Reconcile|TestProbe|TestRefreshAuthCredential|Test.*LeastPressure' \
+            -count=1
+
+      - name: Vet changed routing packages
+        run: |
+          go vet \
+            ./sdk/api/handlers \
+            ./sdk/cliproxy/auth \
+            ./sdk/cliproxy/executor \
+            ./sdk/auth \
+            ./sdk/cliproxy \
+            ./internal/config \
+            ./internal/api \
+            ./internal/api/handlers/management \
+            ./internal/watcher/synthesizer
+
+  focused-routing-race:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Focused routing race tests
+        run: |
+          go test -timeout 45s -race \
+            ./sdk/api/handlers \
+            ./internal/api/handlers/management \
+            ./sdk/cliproxy/auth \
+            -run 'TestSmart|TestRouting|Test.*Reconcile|TestProbe|TestRefreshAuthCredential|Test.*LeastPressure' \
+            -count=1
+
+  linux-arm64-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Refresh models catalog
+        run: bash .github/scripts/refresh-model-catalogs.sh
+      - name: Build Linux arm64 server
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: arm64
         run: |
           go build -o test-output ./cmd/server
           rm -f test-output
+
+  formatting:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify formatting
+        run: |
+          test -z "$(gofmt -l internal sdk cmd)"
+          git diff --check
+
+  account-reconciler:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Verify reconciler and systemd units
+        run: |
+          python -m compileall -q tools/account-reconciler/reconciler.py tools/account-reconciler/tests
+          python -m unittest discover -s tools/account-reconciler/tests -q
+          systemd-analyze verify \
+            tools/account-reconciler/systemd/cliproxy-account-reconciler.service \
+            tools/account-reconciler/systemd/cliproxy-account-reconciler.timer
+
+      - name: Scan changed files for credential-shaped material
+        run: |
+          pattern='(BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY|sk-[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|AIza[0-9A-Za-z_-]{30,}|Bearer [A-Za-z0-9._-]{20,})'
+          if git diff --no-ext-diff "${{ github.event.pull_request.base.sha }}"...HEAD | grep -En "$pattern"; then
+            exit 1
+          fi

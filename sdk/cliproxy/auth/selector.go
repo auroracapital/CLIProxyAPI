@@ -45,6 +45,24 @@ type LeastPressureSelector struct {
 	pressure credentialPressureTracker
 }
 
+// ShadowLeastPressureSelector executes its fallback selector while predicting
+// which eligible credential least-pressure would choose. Only the actual
+// production selection is tracked as in-flight; the prediction never reserves
+// capacity or advances a least-pressure tie cursor.
+type ShadowLeastPressureSelector struct {
+	fallback Selector
+	pressure credentialPressureTracker
+}
+
+// NewShadowLeastPressureSelector creates a prediction-only least-pressure
+// wrapper around the production selector.
+func NewShadowLeastPressureSelector(fallback Selector) *ShadowLeastPressureSelector {
+	if fallback == nil {
+		fallback = &RoundRobinSelector{}
+	}
+	return &ShadowLeastPressureSelector{fallback: fallback}
+}
+
 type credentialPressureTracker struct {
 	mu       sync.Mutex
 	inFlight map[string]int64
@@ -79,6 +97,13 @@ func (s *LeastPressureSelector) tracker() *credentialPressureTracker {
 	return &s.pressure
 }
 
+func (s *ShadowLeastPressureSelector) tracker() *credentialPressureTracker {
+	if s == nil {
+		return nil
+	}
+	return &s.pressure
+}
+
 func recentRequestTotals(auth *Auth, now time.Time) (success, failed int64) {
 	if auth == nil {
 		return 0, 0
@@ -90,8 +115,8 @@ func recentRequestTotals(auth *Auth, now time.Time) (success, failed int64) {
 		if bucket.bucketID != bucketID {
 			continue
 		}
-		success += bucket.success
-		failed += bucket.failed
+		success = saturatingAddInt64(success, bucket.success)
+		failed = saturatingAddInt64(failed, bucket.failed)
 	}
 	return success, failed
 }
@@ -102,12 +127,45 @@ func credentialPressureScore(auth *Auth, inFlight int64, now time.Time) int64 {
 		capacity = credentialweight.Default
 	}
 	// One unit of concurrency pressure is comparable to a 100% recent failure
-	// ratio. A small prior prevents a single historical failure from permanently
-	// dominating an otherwise idle credential.
-	concurrencyPressure := inFlight * 1000 / capacity
+	// ratio. Request volume is capacity-normalized so a bursty but successful seat
+	// is spread before it reaches an upstream admission limit. A small prior keeps
+	// one historical failure from permanently dominating an otherwise idle seat.
+	concurrencyPressure := saturatingMulDiv(inFlight, 1000, capacity)
 	success, failed := recentRequestTotals(auth, now)
-	failurePressure := failed * 1000 / (success + failed + 10)
-	return saturatingAddInt64(concurrencyPressure, failurePressure)
+	total := saturatingAddInt64(success, failed)
+	requestRatePressure := saturatingMulDiv(total, 25, capacity)
+	failurePressure := saturatingMulDiv(failed, 1000, saturatingAddInt64(total, 10))
+	expiryPressure := credentialExpiryPressure(auth, now)
+	return saturatingAddInt64(saturatingAddInt64(concurrencyPressure, requestRatePressure), saturatingAddInt64(failurePressure, expiryPressure))
+}
+
+func credentialExpiryPressure(auth *Auth, now time.Time) int64 {
+	if auth == nil {
+		return 0
+	}
+	expiresAt, okExpiry := auth.ExpirationTime()
+	if !okExpiry || expiresAt.IsZero() {
+		return 0
+	}
+	remaining := expiresAt.Sub(now)
+	if remaining <= 0 {
+		return 1000
+	}
+	const riskWindow = 30 * time.Minute
+	if remaining >= riskWindow {
+		return 0
+	}
+	return int64((riskWindow - remaining) * 1000 / riskWindow)
+}
+
+func saturatingMulDiv(value, multiplier, divisor int64) int64 {
+	if value <= 0 || multiplier <= 0 || divisor <= 0 {
+		return 0
+	}
+	if value > math.MaxInt64/multiplier {
+		return math.MaxInt64 / divisor
+	}
+	return value * multiplier / divisor
 }
 
 func pickLeastPressureAuth(auths []*Auth, tracker *credentialPressureTracker, cursorKey string, predicate func(*Auth) bool, now time.Time) *Auth {
@@ -628,6 +686,72 @@ func (s *LeastPressureSelector) Pick(ctx context.Context, provider, model string
 	return selected, nil
 }
 
+// Pick predicts least pressure without changing that prediction's state, then
+// executes the configured production selector exactly once.
+func (s *ShadowLeastPressureSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	if s == nil || s.fallback == nil {
+		return nil, &Error{Code: "auth_unavailable", Message: "shadow selector is unavailable"}
+	}
+	available, errAvailable := getAvailableAuths(positiveWeightAuths(auths), provider, model, time.Now())
+	if errAvailable != nil {
+		return nil, errAvailable
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
+	tracker := s.tracker()
+	tracker.mu.Lock()
+	predicted := predictLeastPressureAuth(available, tracker, time.Now())
+	tracker.mu.Unlock()
+
+	actual, errPick := s.fallback.Pick(ctx, provider, model, opts, auths)
+	if errPick != nil {
+		return nil, errPick
+	}
+	if actual == nil {
+		return nil, &Error{Code: "auth_unavailable", Message: "production selector returned no auth"}
+	}
+	if pressureReservationRequested(opts) {
+		tracker.mu.Lock()
+		if tracker.inFlight == nil {
+			tracker.inFlight = make(map[string]int64)
+		}
+		tracker.inFlight[actual.ID]++
+		tracker.mu.Unlock()
+		actual.pressureLease = &credentialPressureLease{tracker: tracker, authID: actual.ID}
+	}
+	if opts.RoutingObserver != nil {
+		opts.RoutingObserver.ObserveRouting(cliproxyexecutor.NormalizeRoutingEvent(cliproxyexecutor.RoutingEvent{
+			Stage:          "account_prediction",
+			Mode:           "shadow",
+			Model:          model,
+			Provider:       provider,
+			Outcome:        "predicted",
+			CandidateCount: len(available),
+			Selector:       "shadow_least_pressure",
+			ShadowMatch:    predicted != nil && predicted.ID == actual.ID,
+		}))
+	}
+	return actual, nil
+}
+
+func predictLeastPressureAuth(auths []*Auth, tracker *credentialPressureTracker, now time.Time) *Auth {
+	if tracker == nil {
+		return nil
+	}
+	var selected *Auth
+	bestScore := int64(math.MaxInt64)
+	for _, candidate := range auths {
+		if candidate == nil {
+			continue
+		}
+		score := credentialPressureScore(candidate, tracker.inFlight[candidate.ID], now)
+		if selected == nil || score < bestScore || (score == bestScore && candidate.ID < selected.ID) {
+			selected = candidate
+			bestScore = score
+		}
+	}
+	return selected
+}
+
 func (s *smoothWeightedState) prepare(weights map[string]int64) {
 	if s.current == nil || !weightVectorsEqual(s.weights, weights) {
 		s.current = make(map[string]int64)
@@ -716,7 +840,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
-	if auth.Disabled || auth.Status == StatusDisabled {
+	if auth.Disabled || auth.Status == StatusDisabled || !auth.reconcileReady() {
 		return true, blockReasonDisabled, time.Time{}
 	}
 	if model != "" {
@@ -872,7 +996,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
 				bind(auth.ID)
-				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+				entry.WithFields(log.Fields{"provider": provider, "model": model}).Debug("session-affinity cache hit")
 				return auth, nil
 			}
 		}
@@ -882,7 +1006,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			return nil, err
 		}
 		bind(auth.ID)
-		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		entry.WithFields(log.Fields{"provider": provider, "model": model}).Debug("session-affinity reselected unavailable binding")
 		return auth, nil
 	}
 
@@ -891,7 +1015,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
 					bind(auth.ID)
-					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+					entry.WithFields(log.Fields{"provider": provider, "model": model}).Debug("session-affinity fallback cache hit")
 					return auth, nil
 				}
 			}
@@ -903,7 +1027,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 	bind(auth.ID)
-	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+	entry.WithFields(log.Fields{"provider": provider, "model": model}).Debug("session-affinity new binding")
 	return auth, nil
 }
 

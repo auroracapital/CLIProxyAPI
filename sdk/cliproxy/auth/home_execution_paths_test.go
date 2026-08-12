@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -105,7 +106,7 @@ func TestHomeSelectionEndsAfterExecute(t *testing.T) {
 	}
 }
 
-func TestHomeNonStreamingExecutionLogsSelectedOAuthAuth(t *testing.T) {
+func TestHomeNonStreamingExecutionLogsPrivacySafeSelection(t *testing.T) {
 	previousLevel := log.GetLevel()
 	log.SetLevel(log.DebugLevel)
 	hook := logtest.NewLocal(log.StandardLogger())
@@ -147,11 +148,17 @@ func TestHomeNonStreamingExecutionLogsSelectedOAuthAuth(t *testing.T) {
 				t.Fatalf("execution error = %v", errRun)
 			}
 
-			const expected = "Use OAuth provider=home-execution auth_file=home-auth for model model-a via socks5 proxy"
+			const expected = "selected credential"
 			for _, entry := range hook.AllEntries() {
+				if strings.Contains(entry.Message, "home-auth") || strings.Contains(entry.Message, "socks5://") {
+					t.Fatalf("selection log leaked auth identity or proxy: %#v", entry)
+				}
 				if entry.Level == log.DebugLevel && entry.Message == expected {
 					if got := entry.Data["request_id"]; got != "req-home-log" {
 						t.Fatalf("request_id = %v, want req-home-log", got)
+					}
+					if entry.Data["provider"] != "home-execution" || entry.Data["model"] != "model-a" {
+						t.Fatalf("selection categories = %#v", entry.Data)
 					}
 					return
 				}

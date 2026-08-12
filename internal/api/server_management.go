@@ -163,6 +163,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
+		mgmt.GET("/auth-files/reconcile-status", s.mgmt.GetAuthReconcileStatus)
+		mgmt.POST("/auth-files/reconcile-state", s.mgmt.SetAuthReconcileState)
+		mgmt.POST("/auth-files/refresh", s.mgmt.RefreshAuthCredential)
+		mgmt.POST("/auth-files/probe", s.mgmt.ProbeAuthCredential)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)

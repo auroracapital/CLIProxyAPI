@@ -212,7 +212,7 @@ type QuotaExceeded struct {
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "least-pressure", "weighted-round-robin", "fill-first".
+	// Supported values: "round-robin" (default), "shadow-least-pressure", "least-pressure", "weighted-round-robin", "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
@@ -225,6 +225,33 @@ type RoutingConfig struct {
 	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
 	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
 	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
+
+	// Auto configures opt-in semantic model routing for requests whose model is "auto".
+	Auto AutoRoutingConfig `yaml:"auto,omitempty" json:"auto,omitempty"`
+
+	// Observability independently controls privacy-safe categorical routing events.
+	Observability RoutingObservabilityConfig `yaml:"observability,omitempty" json:"observability,omitempty"`
+}
+
+// RoutingObservabilityConfig controls routing events independently from routing behavior.
+type RoutingObservabilityConfig struct {
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+}
+
+// AutoRoutingConfig controls semantic model routing. Explicit model requests never use it.
+type AutoRoutingConfig struct {
+	// Enabled is the legacy active-mode switch. Mode takes precedence when set.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// Mode controls semantic routing: off, shadow, or active.
+	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
+	// MaxFallbacks limits the ordered model slate, including the primary model.
+	// Values below one use the default of three; values above five are clamped to five.
+	MaxFallbacks int `yaml:"max-fallbacks,omitempty" json:"max-fallbacks,omitempty"`
+	// DefaultModels is the ordered safe fallback slate when classification is ambiguous.
+	DefaultModels []string `yaml:"default-models,omitempty" json:"default-models,omitempty"`
+	// TaskModels optionally overrides the ordered model slate for a task class.
+	// Supported task keys are code, reasoning, research, agent, multimodal, writing, and general.
+	TaskModels map[string][]string `yaml:"task-models,omitempty" json:"task-models,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

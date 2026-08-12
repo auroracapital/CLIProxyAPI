@@ -82,18 +82,24 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 		RequestAfterAuthInterceptor: h.requestAfterAuthInterceptor(afterAuthCapture, lifecycle.requestID(), execOptions.SkipInterceptorPluginID),
 	}
 	opts.Metadata = reqMeta
+	opts.RoutingObserver = h.routingObserver()
 	var interceptErr *interfaces.ErrorMessage
 	req, opts, interceptErr = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, lifecycle.requestID(), req, opts, execOptions.SkipInterceptorPluginID)
 	if interceptErr != nil {
 		lifecycle.completeError(ctx, interceptErr)
 		return nil, nil, interceptErr
 	}
-	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
+	resp, executedModel, err := h.executeModelSlate(ctx, providers, req, opts, routeDecision)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errMsg := executionErrorMessage(err)
 		lifecycle.completeError(ctx, errMsg)
 		return nil, nil, errMsg
+	}
+	if executedModel != "" {
+		normalizedModel = executedModel
+		opts.OriginalRequest = requestWithSelectedModel(opts.OriginalRequest, executedModel)
+		lifecycle.setCommittedModel(executedModel)
 	}
 	executedReq, executedOpts := afterAuthCapture.apply(req, opts)
 	rawResponseHeaders := cloneHeader(resp.Headers)
@@ -146,18 +152,23 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 		RequestAfterAuthInterceptor: h.requestAfterAuthInterceptor(afterAuthCapture, lifecycle.requestID(), execOptions.SkipInterceptorPluginID),
 	}
 	opts.Metadata = reqMeta
+	opts.RoutingObserver = h.routingObserver()
 	var interceptErr *interfaces.ErrorMessage
 	req, opts, interceptErr = h.applyRequestInterceptorsBeforeAuth(ctx, handlerType, originalRequestedModel, lifecycle.requestID(), req, opts, execOptions.SkipInterceptorPluginID)
 	if interceptErr != nil {
 		lifecycle.completeError(ctx, interceptErr)
 		return nil, nil, interceptErr
 	}
-	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
+	resp, executedModel, err := h.executeCountModelSlate(ctx, providers, req, opts, routeDecision)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errMsg := executionErrorMessage(err)
 		lifecycle.completeError(ctx, errMsg)
 		return nil, nil, errMsg
+	}
+	if executedModel != "" {
+		normalizedModel = executedModel
+		lifecycle.setCommittedModel(executedModel)
 	}
 	executedReq, executedOpts := afterAuthCapture.apply(req, opts)
 	rawResponseHeaders := cloneHeader(resp.Headers)

@@ -18,3 +18,15 @@ func TestNormalizedRoutingRuntimeStateLeastPressure(t *testing.T) {
 		t.Fatalf("selector type = %T, want *auth.LeastPressureSelector", newRoutingSelector(state))
 	}
 }
+
+func TestNormalizedRoutingRuntimeStateShadowLeastPressure(t *testing.T) {
+	state := normalizedRoutingRuntimeState(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{Strategy: "shadow-lp"},
+	})
+	if state.strategy != "shadow-least-pressure" {
+		t.Fatalf("strategy = %q, want shadow-least-pressure", state.strategy)
+	}
+	if _, ok := newRoutingSelector(state).(*coreauth.ShadowLeastPressureSelector); !ok {
+		t.Fatalf("selector type = %T, want *auth.ShadowLeastPressureSelector", newRoutingSelector(state))
+	}
+}

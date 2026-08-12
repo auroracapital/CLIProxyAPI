@@ -1,0 +1,42 @@
+[Unit]
+Description=CLIProxy desired-account reconciliation
+After=network-online.target crsproxy.service
+Wants=network-online.target
+Requires=crsproxy.service
+
+[Service]
+Type=oneshot
+User=crsproxy
+Group=crsproxy
+UMask=0077
+StateDirectory=cliproxy-account-reconciler
+StateDirectoryMode=0700
+RuntimeDirectory=cliproxy-account-reconciler
+RuntimeDirectoryMode=0700
+EnvironmentFile=/etc/crsproxy/account-reconciler.env
+ExecStart=/usr/bin/python3 /opt/crsproxy/bin/account-reconciler --apply --inventory /etc/crsproxy/account-inventory.json
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/etc/crsproxy/account-inventory.json /etc/crsproxy/account-reconciler.env /opt/crsproxy/bin/account-reconciler
+ReadWritePaths=/opt/crsproxy/auths /opt/crsproxy/auth-candidates
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

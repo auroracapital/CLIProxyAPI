@@ -200,12 +200,27 @@ quota-exceeded:
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
-  strategy: "round-robin" # round-robin (default), least-pressure, weighted-round-robin, fill-first
+  strategy: "round-robin" # round-robin (default), shadow-least-pressure, least-pressure, weighted-round-robin, fill-first
   # least-pressure atomically reserves the lowest-load credential and uses recent
   # failures as a predictive penalty. Weight represents relative concurrency capacity.
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
   # Non-positive weights exclude the credential while this strategy is active.
   # For OAuth/file credentials, add a top-level numeric "weight" field to the auth JSON.
+  # Semantic routing is opt-in and only applies when the request model is exactly "auto".
+  # Explicit model requests are never remapped.
+  auto:
+    # mode: off records nothing, shadow records the decision without changing dispatch,
+    # and active routes model:auto through the selected slate. Legacy enabled:true maps to active.
+    mode: off
+    max-fallbacks: 3
+    # default-models: ["claude-sonnet-5", "gpt-5.6-terra", "gemini-3.5-flash-low"]
+    # task-models:
+    #   code: ["gpt-5.6-sol", "claude-sonnet-5"]
+    #   reasoning: ["claude-opus-5", "gpt-5.6-sol"]
+  # Privacy-safe routing telemetry is independently reversible and contains no
+  # prompts, headers, auth identifiers, paths, tokens, emails, or upstream bodies.
+  observability:
+    enabled: false
   # Enable universal session-sticky routing for all clients.
   # Explicit Claude Code, Codex, OpenCode, and pi session headers are preferred,
   # followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,

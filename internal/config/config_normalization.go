@@ -32,6 +32,84 @@ func (cfg *Config) NormalizePluginsConfig() {
 	}
 }
 
+// NormalizeAutoRoutingConfig makes semantic routing deterministic across startup
+// and hot reloads. Model spelling remains case-sensitive, but duplicate entries
+// compare case-insensitively because registry identifiers should not appear twice
+// in one fallback slate.
+func (cfg *Config) NormalizeAutoRoutingConfig() {
+	if cfg == nil {
+		return
+	}
+	auto := &cfg.Routing.Auto
+	auto.Mode = strings.ToLower(strings.TrimSpace(auto.Mode))
+	switch auto.Mode {
+	case "off", "shadow", "active":
+	case "":
+		if auto.Enabled {
+			auto.Mode = "active"
+		} else {
+			auto.Mode = "off"
+		}
+	default:
+		auto.Mode = "off"
+	}
+	auto.Enabled = auto.Mode == "active"
+	if auto.MaxFallbacks < 1 {
+		auto.MaxFallbacks = 3
+	} else if auto.MaxFallbacks > 5 {
+		auto.MaxFallbacks = 5
+	}
+	auto.DefaultModels = normalizeAutoRoutingModels(auto.DefaultModels)
+	if len(auto.TaskModels) == 0 {
+		auto.TaskModels = nil
+		return
+	}
+	allowedTasks := map[string]struct{}{
+		"code": {}, "reasoning": {}, "research": {}, "agent": {},
+		"multimodal": {}, "writing": {}, "general": {},
+	}
+	tasks := make(map[string][]string, len(auto.TaskModels))
+	for rawTask, models := range auto.TaskModels {
+		task := strings.ToLower(strings.TrimSpace(rawTask))
+		if _, ok := allowedTasks[task]; !ok {
+			continue
+		}
+		models = normalizeAutoRoutingModels(models)
+		if len(models) > 0 {
+			tasks[task] = models
+		}
+	}
+	if len(tasks) == 0 {
+		auto.TaskModels = nil
+		return
+	}
+	auto.TaskModels = tasks
+}
+
+func normalizeAutoRoutingModels(models []string) []string {
+	if len(models) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(models))
+	out := make([]string, 0, len(models))
+	for _, rawModel := range models {
+		model := strings.TrimSpace(rawModel)
+		key := strings.ToLower(model)
+		if model == "" || key == "auto" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, model)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // SanitizeCodexHeaderDefaults trims surrounding whitespace from the
 // configured Codex header fallback values.
 func (cfg *Config) SanitizeCodexHeaderDefaults() {

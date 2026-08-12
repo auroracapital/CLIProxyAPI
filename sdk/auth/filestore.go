@@ -288,6 +288,7 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 					return nil, errWeight
 				}
 				cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
+				cliproxyauth.HydrateReconcileMetadata(auth, metadata)
 			}
 			return auths, nil
 		}
@@ -348,6 +349,7 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 		auth.Attributes["email"] = email
 	}
 	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
+	cliproxyauth.HydrateReconcileMetadata(auth, metadata)
 	return []*cliproxyauth.Auth{auth}, nil
 }
 

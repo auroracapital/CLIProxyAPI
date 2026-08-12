@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "max_attempts_per_day": 6,
+  "base_backoff_seconds": 300,
+  "max_backoff_seconds": 21600,
+  "probe_payload": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Reply OK."
+      }
+    ]
+  },
+  "seats": [
+    {
+      "auth_index": "replace-with-runtime-auth-index",
+      "provider": "claude",
+      "model": "replace-with-low-cost-probe-model",
+      "canonical_path": "/opt/crsproxy/auths/replace.json",
+      "candidate_path": "/opt/crsproxy/auth-candidates/replace.json",
+      "required_keys": [
+        "refresh_token"
+      ],
+      "expected_fields": {
+        "account_id": "replace-with-expected-account-id"
+      }
+    }
+  ]
+}

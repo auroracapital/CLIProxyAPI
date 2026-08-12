@@ -135,6 +135,12 @@ func (h *BaseAPIHandler) providersForExecution(modelName, originalRequestedModel
 			return nil, "", nativeInteractionsExecutionError()
 		}
 		normalizedModel := strings.TrimSpace(modelName)
+		if routeDecision.AutoRouted {
+			normalizedModel = strings.TrimSpace(routeDecision.Model)
+			if normalizedModel == "" {
+				return nil, "", autoRouteUnavailableError()
+			}
+		}
 		if normalizedModel == "" {
 			normalizedModel = strings.TrimSpace(originalRequestedModel)
 		}
@@ -153,7 +159,20 @@ func (h *BaseAPIHandler) providersForExecution(modelName, originalRequestedModel
 		}
 		return []string{routeDecision.Provider}, normalizedModel, nil
 	}
+	if routeModel := strings.TrimSpace(routeDecision.Model); routeModel != "" {
+		return h.getRequestDetailsWithOptions(routeModel, allowImageModel)
+	}
+	if routeDecision.AutoRouted {
+		return nil, "", autoRouteUnavailableError()
+	}
 	return h.getRequestDetailsWithOptions(modelName, allowImageModel)
+}
+
+func autoRouteUnavailableError() *interfaces.ErrorMessage {
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error:      errors.New(`{"error":{"message":"no compatible model is currently available for auto routing","type":"service_unavailable","code":"auto_route_unavailable"}}`),
+	}
 }
 
 func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowImageModel bool) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
@@ -285,6 +304,13 @@ type modelRouteDecision struct {
 	ExecutorPluginID string
 	Provider         string
 	Model            string
+	Models           []string
+	Providers        map[string][]string
+	TaskClass        string
+	Reason           string
+	ScoreVersion     string
+	AutoRouted       bool
+	ForcedProvider   string
 }
 
 func routeModel(ctx context.Context, host PluginModelRouterHost, req pluginapi.ModelRouteRequest, skipPluginID string) (pluginapi.ModelRouteResponse, bool) {
@@ -323,32 +349,64 @@ func modelRoutersEnabled(host PluginModelRouterHost, skipPluginID string) bool {
 }
 
 func (h *BaseAPIHandler) applyModelRouter(ctx context.Context, handlerType, modelName string, rawJSON []byte, stream bool, execOptions modelExecutionOptions) modelRouteDecision {
-	var decision modelRouteDecision
+	decision := modelRouteDecision{ForcedProvider: strings.ToLower(strings.TrimSpace(execOptions.ForcedProvider))}
 	host := h.modelRouterHost()
-	if host == nil || !modelRoutersEnabled(host, execOptions.SkipRouterPluginID) {
-		return decision
+	if host != nil && modelRoutersEnabled(host, execOptions.SkipRouterPluginID) {
+		meta := requestExecutionMetadata(ctx)
+		meta[coreexecutor.RequestedModelMetadataKey] = modelName
+		addModelExecutionSourceMetadata(meta, execOptions.InternalSource)
+		resp, ok := routeModel(ctx, host, pluginapi.ModelRouteRequest{
+			SourceFormat:   handlerType,
+			RequestedModel: modelName,
+			Stream:         stream,
+			Headers:        modelExecutionHeaders(ctx, execOptions.Headers),
+			Query:          modelExecutionQuery(ctx, execOptions.Query),
+			Body:           cloneBytes(rawJSON),
+			Metadata:       meta,
+		}, execOptions.SkipRouterPluginID)
+		if ok && resp.Handled {
+			switch resp.TargetKind {
+			case pluginapi.ModelRouteTargetSelf, pluginapi.ModelRouteTargetExecutor:
+				decision.ExecutorPluginID = strings.TrimSpace(resp.Target)
+			case pluginapi.ModelRouteTargetProvider:
+				decision.Provider = strings.ToLower(strings.TrimSpace(resp.Target))
+				decision.Model = strings.TrimSpace(resp.TargetModel)
+			}
+			decision.Reason = strings.TrimSpace(resp.Reason)
+			return decision
+		}
 	}
-	meta := requestExecutionMetadata(ctx)
-	meta[coreexecutor.RequestedModelMetadataKey] = modelName
-	addModelExecutionSourceMetadata(meta, execOptions.InternalSource)
-	resp, ok := routeModel(ctx, host, pluginapi.ModelRouteRequest{
-		SourceFormat:   handlerType,
-		RequestedModel: modelName,
-		Stream:         stream,
-		Headers:        modelExecutionHeaders(ctx, execOptions.Headers),
-		Query:          modelExecutionQuery(ctx, execOptions.Query),
-		Body:           cloneBytes(rawJSON),
-		Metadata:       meta,
-	}, execOptions.SkipRouterPluginID)
-	if !ok || !resp.Handled {
-		return decision
-	}
-	switch resp.TargetKind {
-	case pluginapi.ModelRouteTargetSelf, pluginapi.ModelRouteTargetExecutor:
-		decision.ExecutorPluginID = strings.TrimSpace(resp.Target)
-	case pluginapi.ModelRouteTargetProvider:
-		decision.Provider = strings.ToLower(strings.TrimSpace(resp.Target))
-		decision.Model = strings.TrimSpace(resp.TargetModel)
+	if smart, ok := h.smartRoute(modelName, rawJSON); ok {
+		emitSmartRouteDecision(smart, h.routingObserver())
+		if smart.Mode == "shadow" {
+			return decision
+		}
+		decision.AutoRouted = true
+		if decision.ForcedProvider != "" {
+			filteredModels := make([]string, 0, len(smart.Models))
+			filteredProviders := make(map[string][]string, len(smart.Providers))
+			for _, model := range smart.Models {
+				if !containsFold(smart.Providers[model], decision.ForcedProvider) {
+					continue
+				}
+				filteredModels = append(filteredModels, model)
+				filteredProviders[model] = []string{decision.ForcedProvider}
+			}
+			smart.Models = filteredModels
+			smart.Providers = filteredProviders
+		}
+		if len(smart.Models) == 0 {
+			return decision
+		}
+		decision.Model = smart.Models[0]
+		decision.Models = append([]string(nil), smart.Models...)
+		decision.Providers = make(map[string][]string, len(smart.Providers))
+		for model, providers := range smart.Providers {
+			decision.Providers[model] = append([]string(nil), providers...)
+		}
+		decision.TaskClass = smart.TaskClass
+		decision.Reason = smart.Reason
+		decision.ScoreVersion = smart.ScoreVersion
 	}
 	return decision
 }

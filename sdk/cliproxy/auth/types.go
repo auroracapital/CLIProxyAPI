@@ -65,6 +65,14 @@ type Auth struct {
 	StatusMessage string `json:"status_message,omitempty"`
 	// Disabled indicates the auth is intentionally disabled by operator.
 	Disabled bool `json:"disabled"`
+	// ReconcileState is the hub controller's desired-seat lifecycle. It is
+	// independent of Disabled, which remains an explicit operator control.
+	// Empty is backward-compatible and treated as ready.
+	ReconcileState ReconcileState `json:"reconcile_state,omitempty"`
+	// ReconcileReason is a categorical controller reason code, never a raw error.
+	ReconcileReason string `json:"reconcile_reason,omitempty"`
+	// ReconcileNextAttempt is the controller's next bounded recovery time.
+	ReconcileNextAttempt time.Time `json:"reconcile_next_attempt,omitempty"`
 	// Unavailable flags transient provider unavailability (e.g. quota exceeded).
 	Unavailable bool `json:"unavailable"`
 	// ProxyURL overrides the global proxy setting for this auth if provided.
@@ -99,6 +107,81 @@ type Auth struct {
 	recentRequests recentRequestRing        `json:"-"`
 	indexAssigned  bool                     `json:"-"`
 	pressureLease  *credentialPressureLease `json:"-"`
+}
+
+// ReconcileState describes automatic desired-seat recovery without overloading
+// operator enable/disable intent.
+type ReconcileState string
+
+const (
+	ReconcileStateReady         ReconcileState = "ready"
+	ReconcileStateCooling       ReconcileState = "cooling"
+	ReconcileStateRefreshing    ReconcileState = "refreshing"
+	ReconcileStateProbing       ReconcileState = "probing"
+	ReconcileStateAuthRequired  ReconcileState = "auth_required"
+	ReconcileStateMisconfigured ReconcileState = "misconfigured"
+)
+
+func normalizeReconcileState(state ReconcileState) ReconcileState {
+	switch ReconcileState(strings.ToLower(strings.TrimSpace(string(state)))) {
+	case "", ReconcileStateReady:
+		return ReconcileStateReady
+	case ReconcileStateCooling:
+		return ReconcileStateCooling
+	case ReconcileStateRefreshing:
+		return ReconcileStateRefreshing
+	case ReconcileStateProbing:
+		return ReconcileStateProbing
+	case ReconcileStateAuthRequired:
+		return ReconcileStateAuthRequired
+	default:
+		return ReconcileStateMisconfigured
+	}
+}
+
+func (a *Auth) reconcileReady() bool {
+	return a != nil && normalizeReconcileState(a.ReconcileState) == ReconcileStateReady
+}
+
+// HydrateReconcileMetadata loads persisted lifecycle fields from auth-file metadata.
+func HydrateReconcileMetadata(auth *Auth, metadata map[string]any) {
+	if auth == nil {
+		return
+	}
+	if raw, ok := metadata["reconcile_state"].(string); ok {
+		auth.ReconcileState = normalizeReconcileState(ReconcileState(raw))
+	}
+	if raw, ok := metadata["reconcile_reason"].(string); ok {
+		auth.ReconcileReason = sanitizeReconcileReason(raw)
+	}
+	if raw, ok := metadata["reconcile_next_attempt"].(string); ok {
+		if parsed, errParse := time.Parse(time.RFC3339Nano, strings.TrimSpace(raw)); errParse == nil {
+			auth.ReconcileNextAttempt = parsed
+		}
+	}
+}
+
+// SyncReconcileMetadata writes lifecycle fields into the persisted auth-file map.
+func SyncReconcileMetadata(auth *Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.ReconcileState = normalizeReconcileState(auth.ReconcileState)
+	auth.Metadata["reconcile_state"] = string(auth.ReconcileState)
+	if auth.ReconcileReason == "" {
+		delete(auth.Metadata, "reconcile_reason")
+	} else {
+		auth.ReconcileReason = sanitizeReconcileReason(auth.ReconcileReason)
+		auth.Metadata["reconcile_reason"] = auth.ReconcileReason
+	}
+	if auth.ReconcileNextAttempt.IsZero() {
+		delete(auth.Metadata, "reconcile_next_attempt")
+	} else {
+		auth.Metadata["reconcile_next_attempt"] = auth.ReconcileNextAttempt.UTC().Format(time.RFC3339Nano)
+	}
 }
 
 const (

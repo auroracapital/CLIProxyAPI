@@ -1,0 +1,853 @@
+#!/usr/bin/env python3
+"""Hub-only, privacy-safe desired-account reconciliation controller."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import dataclasses
+import datetime as dt
+import fcntl
+import hashlib
+import hmac
+import json
+import logging
+import os
+import random
+import shutil
+import stat
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Iterator
+
+
+ALLOWED_STATES = {
+    "ready",
+    "cooling",
+    "refreshing",
+    "probing",
+    "auth_required",
+    "misconfigured",
+}
+ALLOWED_REASONS = {
+    "none",
+    "attempt_budget_exhausted",
+    "candidate_invalid",
+    "candidate_promoted",
+    "inventory_invalid",
+    "locked",
+    "not_due",
+    "probe_auth_required",
+    "probe_rejected",
+    "probe_retryable",
+    "refresh_failed",
+    "refresh_succeeded",
+    "rollback_completed",
+    "rollback_failed",
+}
+SAFE_OUTCOMES = {
+    "succeeded",
+    "failed",
+    "auth_required",
+    "cooling",
+    "retryable",
+    "rejected",
+    "admission_rejected",
+    "skipped",
+}
+UTC = dt.timezone.utc
+
+
+class ReconcileError(Exception):
+    """A deliberately detail-free controller failure."""
+
+
+class InventoryError(ReconcileError):
+    pass
+
+
+class APIError(ReconcileError):
+    def __init__(self, status: int = 0, outcome: str = ""):
+        super().__init__("API request failed")
+        self.status = status
+        self.outcome = outcome if outcome in SAFE_OUTCOMES else ""
+
+
+class PromotionError(ReconcileError):
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class Seat:
+    auth_index: str
+    provider: str
+    model: str
+    canonical_path: Path | None = None
+    candidate_path: Path | None = None
+    required_keys: tuple[str, ...] = ()
+    expected_fields: tuple[tuple[str, str], ...] = ()
+
+
+@dataclasses.dataclass(frozen=True)
+class Inventory:
+    seats: tuple[Seat, ...]
+    max_attempts_per_day: int = 6
+    base_backoff_seconds: int = 300
+    max_backoff_seconds: int = 21600
+    probe_payload: dict[str, Any] = dataclasses.field(
+        default_factory=lambda: {"messages": [{"role": "user", "content": "Reply OK."}]}
+    )
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        data = {
+            "event": getattr(record, "event", "controller"),
+            "level": record.levelname.lower(),
+        }
+        for key in ("seat_key", "state", "outcome", "reason"):
+            value = getattr(record, key, None)
+            if value:
+                data[key] = value
+        return json.dumps(data, sort_keys=True, separators=(",", ":"))
+
+
+def configure_logging(stream: Any = None) -> logging.Logger:
+    logger = logging.getLogger("cliproxy-account-reconciler")
+    logger.handlers.clear()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(JsonFormatter())
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    return logger
+
+
+def log_event(logger: logging.Logger, event: str, **fields: str) -> None:
+    safe = {"event": event}
+    for key in ("seat_key", "state", "outcome", "reason"):
+        value = fields.get(key, "")
+        if value:
+            safe[key] = value
+    logger.info(event, extra=safe)
+
+
+def _strict_object(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise InventoryError(f"{label} must be an object")
+    return value
+
+
+def load_inventory(path: Path) -> Inventory:
+    try:
+        raw = _strict_object(json.loads(path.read_text(encoding="utf-8")), "inventory")
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise InventoryError("inventory cannot be read") from exc
+    allowed = {
+        "version",
+        "seats",
+        "max_attempts_per_day",
+        "base_backoff_seconds",
+        "max_backoff_seconds",
+        "probe_payload",
+    }
+    if set(raw) - allowed or raw.get("version") != 1:
+        raise InventoryError("inventory version or fields are invalid")
+    rows = raw.get("seats")
+    if not isinstance(rows, list) or not rows:
+        raise InventoryError("inventory seats must be a non-empty array")
+    seats: list[Seat] = []
+    seen_indexes: set[str] = set()
+    seen_candidates: set[Path] = set()
+    seen_canonicals: set[Path] = set()
+    for row in rows:
+        item = _strict_object(row, "seat")
+        if set(item) - {
+            "auth_index",
+            "provider",
+            "model",
+            "canonical_path",
+            "candidate_path",
+            "required_keys",
+            "expected_fields",
+        }:
+            raise InventoryError("seat contains unknown fields")
+        auth_index = item.get("auth_index")
+        provider = item.get("provider")
+        model = item.get("model")
+        if not all(isinstance(x, str) and x.strip() for x in (auth_index, provider, model)):
+            raise InventoryError("seat target is incomplete")
+        auth_index = auth_index.strip()
+        provider = provider.strip().lower()
+        model = model.strip()
+        if auth_index in seen_indexes:
+            raise InventoryError("duplicate auth index")
+        seen_indexes.add(auth_index)
+        canonical_raw = item.get("canonical_path")
+        candidate_raw = item.get("candidate_path")
+        if (canonical_raw is None) != (candidate_raw is None):
+            raise InventoryError("candidate and canonical paths must be paired")
+        canonical = Path(canonical_raw) if isinstance(canonical_raw, str) else None
+        candidate = Path(candidate_raw) if isinstance(candidate_raw, str) else None
+        if canonical is not None:
+            if not canonical.is_absolute() or not candidate or not candidate.is_absolute():
+                raise InventoryError("credential paths must be absolute")
+            # Normalize dot segments without resolving the final component so a
+            # staged symlink remains visible to lstat and is rejected later.
+            canonical = Path(os.path.abspath(canonical))
+            candidate = Path(os.path.abspath(candidate))
+            if canonical == candidate or canonical in seen_canonicals or candidate in seen_candidates:
+                raise InventoryError("ambiguous credential paths")
+            if canonical in seen_candidates or candidate in seen_canonicals:
+                raise InventoryError("overlapping credential paths")
+            seen_canonicals.add(canonical)
+            seen_candidates.add(candidate)
+        required = item.get("required_keys", [])
+        if not isinstance(required, list) or not all(isinstance(k, str) and k for k in required):
+            raise InventoryError("required_keys must be strings")
+        if len(set(required)) != len(required):
+            raise InventoryError("required_keys contains duplicates")
+        expected_raw = item.get("expected_fields", {})
+        if not isinstance(expected_raw, dict) or not all(
+            isinstance(key, str) and key and isinstance(value, str) and value
+            for key, value in expected_raw.items()
+        ):
+            raise InventoryError("expected_fields must contain non-empty strings")
+        if canonical is not None and not expected_raw:
+            raise InventoryError("staged seats require expected identity fields")
+        forbidden_expected = {
+            "access_token",
+            "refresh_token",
+            "token",
+            "disabled",
+            "reconcile_state",
+            "reconcile_reason",
+            "reconcile_next_attempt",
+        }
+        if forbidden_expected.intersection(expected_raw):
+            raise InventoryError("expected_fields contains mutable or secret fields")
+        expected = tuple(sorted(expected_raw.items()))
+        seats.append(Seat(auth_index, provider, model, canonical, candidate, tuple(required), expected))
+    max_attempts = raw.get("max_attempts_per_day", 6)
+    base_backoff = raw.get("base_backoff_seconds", 300)
+    max_backoff = raw.get("max_backoff_seconds", 21600)
+    if not isinstance(max_attempts, int) or not 1 <= max_attempts <= 100:
+        raise InventoryError("max attempts is invalid")
+    if not isinstance(base_backoff, int) or not isinstance(max_backoff, int):
+        raise InventoryError("backoff is invalid")
+    if not 1 <= base_backoff <= max_backoff <= 86400:
+        raise InventoryError("backoff bounds are invalid")
+    probe_payload = raw.get("probe_payload", {"messages": [{"role": "user", "content": "Reply OK."}]})
+    if not isinstance(probe_payload, dict) or not probe_payload:
+        raise InventoryError("probe payload must be a non-empty object")
+    return Inventory(tuple(seats), max_attempts, base_backoff, max_backoff, probe_payload)
+
+
+def validate_complete_inventory(inventory: Inventory, remote: list[dict[str, Any]]) -> None:
+    indexed: dict[str, str] = {}
+    for item in remote:
+        if not isinstance(item, dict):
+            raise InventoryError("remote inventory is malformed")
+        index = item.get("auth_index")
+        provider = item.get("provider")
+        if not isinstance(index, str) or not index or not isinstance(provider, str) or not provider:
+            raise InventoryError("remote inventory is incomplete")
+        if index in indexed:
+            raise InventoryError("remote inventory is ambiguous")
+        indexed[index] = provider.strip().lower()
+    desired = {seat.auth_index: seat.provider for seat in inventory.seats}
+    if desired != indexed:
+        raise InventoryError("desired and runtime inventories differ")
+
+
+def opaque_key(secret: bytes, namespace: str, value: str) -> str:
+    return hmac.new(secret, f"{namespace}\0{value}".encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def load_hmac_key(env_name: str = "CLIPROXY_RECONCILER_HMAC_KEY") -> bytes:
+    value = os.environ.get(env_name, "").encode()
+    if len(value) < 32:
+        raise ReconcileError("HMAC key is missing or too short")
+    return value
+
+
+@contextlib.contextmanager
+def file_lock(path: Path, blocking: bool = False) -> Iterator[bool]:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    acquired = False
+    try:
+        flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        try:
+            fcntl.flock(fd, flags)
+            acquired = True
+        except BlockingIOError:
+            pass
+        yield acquired
+    finally:
+        if acquired:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def backoff_seconds(attempt: int, base: int, maximum: int, rng: random.Random) -> int:
+    cap = min(maximum, base * (2 ** max(0, attempt - 1)))
+    return max(1, int(rng.uniform(cap * 0.5, cap)))
+
+
+def _atomic_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".state-", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(data, out, sort_keys=True, separators=(",", ":"))
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp_name, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_name)
+
+
+class StateStore:
+    def __init__(self, directory: Path, now: Any = None):
+        self.directory = directory
+        self.now = now or (lambda: dt.datetime.now(UTC))
+
+    def path(self, seat_key: str) -> Path:
+        return self.directory / "seats" / f"{seat_key}.json"
+
+    def read(self, seat_key: str) -> dict[str, Any]:
+        today = self.now().date().isoformat()
+        default = {
+            "seat_key": seat_key,
+            "state": "ready",
+            "reason": "none",
+            "outcome": "skipped",
+            "attempt_day": today,
+            "attempts": 0,
+            "next_attempt": "",
+        }
+        try:
+            value = json.loads(self.path(seat_key).read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+            return default
+        if not isinstance(value, dict) or value.get("seat_key") != seat_key:
+            return default
+        if value.get("attempt_day") != today:
+            value["attempt_day"] = today
+            value["attempts"] = 0
+        return {**default, **{key: value.get(key, default[key]) for key in default}}
+
+    def write(self, seat_key: str, state: str, reason: str, outcome: str, attempts: int, next_attempt: str) -> None:
+        if state not in ALLOWED_STATES or reason not in ALLOWED_REASONS or outcome not in SAFE_OUTCOMES:
+            raise ReconcileError("refusing unsafe state value")
+        _atomic_json(
+            self.path(seat_key),
+            {
+                "attempt_day": self.now().date().isoformat(),
+                "attempts": int(attempts),
+                "next_attempt": next_attempt,
+                "outcome": outcome,
+                "reason": reason,
+                "seat_key": seat_key,
+                "state": state,
+                "updated_at": self.now().replace(microsecond=0).isoformat(),
+            },
+        )
+
+
+class APIAdapter:
+    def __init__(self, base_url: str, api_key: str = "", timeout: float = 20.0):
+        if base_url not in {"http://127.0.0.1:8319", "http://[::1]:8319"}:
+            raise ReconcileError("API endpoint must be the pinned loopback service")
+        self.base_url = base_url
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def _request(self, method: str, endpoint: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        data = None if payload is None else json.dumps(payload, separators=(",", ":")).encode()
+        headers = {"Accept": "application/json"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = urllib.request.Request(self.base_url + endpoint, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                if response.status != 200:
+                    raise APIError(response.status)
+                value = json.load(response)
+        except urllib.error.HTTPError as exc:
+            # Extract only the documented categorical outcome. Never retain or
+            # expose the response body itself.
+            outcome = ""
+            try:
+                value = json.load(exc)
+                if isinstance(value, dict) and value.get("outcome") in SAFE_OUTCOMES:
+                    outcome = value["outcome"]
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                pass
+            raise APIError(exc.code, outcome) from None
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+            raise APIError() from None
+        if not isinstance(value, dict):
+            raise APIError()
+        return value
+
+    def status(self) -> list[dict[str, Any]]:
+        value = self._request("GET", "/v0/management/auth-files/reconcile-status")
+        rows = value.get("credentials")
+        if not isinstance(rows, list):
+            raise APIError()
+        return rows
+
+    def set_state(self, auth_index: str, state: str, reason: str = "", next_attempt: str = "") -> None:
+        payload = {"auth_index": auth_index, "state": state, "reason": reason}
+        if next_attempt:
+            payload["next_attempt"] = next_attempt
+        self._request("POST", "/v0/management/auth-files/reconcile-state", payload)
+
+    def refresh(self, auth_index: str) -> str:
+        try:
+            value = self._request("POST", "/v0/management/auth-files/refresh", {"auth_index": auth_index})
+        except APIError as exc:
+            if exc.outcome:
+                return exc.outcome
+            raise
+        return value.get("outcome") if value.get("outcome") in SAFE_OUTCOMES else "failed"
+
+    def probe(self, seat: Seat, payload: dict[str, Any]) -> str:
+        try:
+            value = self._request(
+                "POST",
+                "/v0/management/auth-files/probe",
+                {"auth_index": seat.auth_index, "model": seat.model, "payload": payload, "admit": True},
+            )
+        except APIError as exc:
+            if exc.outcome:
+                return exc.outcome
+            raise
+        return value.get("outcome") if value.get("outcome") in SAFE_OUTCOMES else "failed"
+
+
+def validate_candidate(seat: Seat) -> dict[str, Any]:
+    if seat.candidate_path is None or seat.canonical_path is None:
+        raise PromotionError("candidate is not configured")
+    try:
+        info = seat.candidate_path.lstat()
+        parent_info = seat.canonical_path.parent.stat()
+    except OSError as exc:
+        raise PromotionError("candidate is unavailable") from exc
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise PromotionError("candidate must be a regular file")
+    if stat.S_IMODE(info.st_mode) != 0o600 or info.st_dev != parent_info.st_dev:
+        raise PromotionError("candidate permissions or filesystem are invalid")
+    try:
+        value = json.loads(seat.candidate_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PromotionError("candidate JSON is invalid") from exc
+    if not isinstance(value, dict) or value.get("disabled") is True:
+        raise PromotionError("candidate content is invalid")
+    provider = value.get("provider", value.get("type"))
+    if not isinstance(provider, str) or provider.strip().lower() != seat.provider:
+        raise PromotionError("candidate provider does not match")
+    if any(key not in value or value[key] in (None, "") for key in seat.required_keys):
+        raise PromotionError("candidate is missing required fields")
+    if any(str(value.get(key, "")) != expected for key, expected in seat.expected_fields):
+        raise PromotionError("candidate identity does not match")
+    return value
+
+
+def _copy_fsync(source: Path, destination: Path, exclusive: bool = False) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC | (os.O_EXCL if exclusive else os.O_TRUNC)
+    fd = os.open(destination, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with source.open("rb") as incoming, os.fdopen(fd, "wb", closefd=False) as outgoing:
+            shutil.copyfileobj(incoming, outgoing)
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+    finally:
+        os.close(fd)
+
+
+def promote_candidate(seat: Seat, archive_dir: Path, seat_key: str, now: dt.datetime) -> Path | None:
+    candidate = validate_candidate(seat)
+    assert seat.candidate_path is not None and seat.canonical_path is not None
+    seat.canonical_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent_info = seat.canonical_path.parent.stat()
+    if not stat.S_ISDIR(parent_info.st_mode) or stat.S_IMODE(parent_info.st_mode) & 0o022:
+        raise PromotionError("canonical directory permissions are unsafe")
+    if seat.canonical_path.exists() and seat.canonical_path.stat().st_dev != seat.candidate_path.stat().st_dev:
+        raise PromotionError("canonical and candidate filesystems differ")
+    archive_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    archive: Path | None = None
+    if seat.canonical_path.exists():
+        canonical_info = seat.canonical_path.lstat()
+        if not stat.S_ISREG(canonical_info.st_mode) or stat.S_ISLNK(canonical_info.st_mode):
+            raise PromotionError("canonical must be a regular file")
+        repair_canonical_access(seat.canonical_path)
+        archive = archive_dir / f"{seat_key}-{now.strftime('%Y%m%dT%H%M%S%fZ')}.rollback"
+        _copy_fsync(seat.canonical_path, archive, exclusive=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".candidate-", dir=seat.canonical_path.parent)
+    os.close(fd)
+    temp = Path(temp_name)
+    replaced = False
+    try:
+        candidate["disabled"] = False
+        candidate["reconcile_state"] = "probing"
+        candidate.pop("reconcile_reason", None)
+        candidate.pop("reconcile_next_attempt", None)
+        with temp.open("w", encoding="utf-8") as outgoing:
+            json.dump(candidate, outgoing, sort_keys=True, separators=(",", ":"))
+            outgoing.write("\n")
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+        os.chmod(temp, 0o600)
+        os.replace(temp, seat.canonical_path)
+        replaced = True
+        repair_canonical_access(seat.canonical_path)
+        directory_fd = os.open(seat.canonical_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except (OSError, PromotionError) as exc:
+        if replaced:
+            with contextlib.suppress(OSError, PromotionError):
+                revert_promotion(seat, archive)
+        raise PromotionError("candidate promotion failed") from exc
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temp.unlink()
+    return archive
+
+
+def rollback(seat: Seat, archive: Path | None) -> None:
+    if archive is None or seat.canonical_path is None:
+        raise PromotionError("rollback archive is unavailable")
+    if stat.S_IMODE(archive.stat().st_mode) != 0o600:
+        raise PromotionError("rollback archive permissions are invalid")
+    fd, temp_name = tempfile.mkstemp(prefix=".rollback-", dir=seat.canonical_path.parent)
+    os.close(fd)
+    temp = Path(temp_name)
+    try:
+        _copy_fsync(archive, temp)
+        os.replace(temp, seat.canonical_path)
+        repair_canonical_access(seat.canonical_path)
+        directory_fd = os.open(seat.canonical_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temp.unlink()
+
+
+def revert_promotion(seat: Seat, archive: Path | None) -> None:
+    if archive is not None:
+        rollback(seat, archive)
+        return
+    if seat.canonical_path is None:
+        raise PromotionError("canonical path is unavailable")
+    seat.canonical_path.unlink(missing_ok=True)
+    directory_fd = os.open(seat.canonical_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def repair_canonical_access(path: Path) -> bool:
+    """Ensure canonical credentials stay private and owned by the service user."""
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise PromotionError("canonical must be a regular file")
+    service_uid = os.geteuid()
+    service_gid = os.getegid()
+    if stat.S_IMODE(info.st_mode) == 0o600 and info.st_uid == service_uid and info.st_gid == service_gid:
+        return False
+    fd, temp_name = tempfile.mkstemp(prefix=".access-repair-", dir=path.parent)
+    os.close(fd)
+    temp = Path(temp_name)
+    try:
+        _copy_fsync(path, temp)
+        os.replace(temp, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as exc:
+        raise PromotionError("canonical access repair failed") from exc
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temp.unlink()
+    repaired = path.stat()
+    if stat.S_IMODE(repaired.st_mode) != 0o600 or repaired.st_uid != service_uid or repaired.st_gid != service_gid:
+        raise PromotionError("canonical access repair did not persist")
+    return True
+
+
+class Controller:
+    def __init__(
+        self,
+        inventory: Inventory,
+        api: APIAdapter,
+        state_dir: Path,
+        runtime_dir: Path,
+        hmac_key: bytes,
+        apply: bool = False,
+        logger: logging.Logger | None = None,
+        now: Any = None,
+        rng: random.Random | None = None,
+    ):
+        self.inventory = inventory
+        self.api = api
+        self.state_dir = state_dir
+        self.runtime_dir = runtime_dir
+        self.hmac_key = hmac_key
+        self.apply = apply
+        self.logger = logger or configure_logging()
+        self.now = now or (lambda: dt.datetime.now(UTC))
+        self.rng = rng or random.SystemRandom()
+        self.store = StateStore(state_dir, self.now)
+
+    def run(self) -> int:
+        with file_lock(self.runtime_dir / "locks" / "global.lock") as global_acquired:
+            if not global_acquired:
+                log_event(self.logger, "controller_skipped", reason="locked")
+                return 0
+            remote = self.api.status()
+            validate_complete_inventory(self.inventory, remote)
+            by_index = {row["auth_index"]: row for row in remote}
+            failures = 0
+            for seat in self.inventory.seats:
+                if not self._reconcile_locked(seat, by_index[seat.auth_index]):
+                    failures += 1
+            return 1 if failures else 0
+
+    def _reconcile_locked(self, seat: Seat, remote: dict[str, Any]) -> bool:
+        seat_key = opaque_key(self.hmac_key, "seat", seat.auth_index)
+        provider_key = opaque_key(self.hmac_key, "provider", seat.provider)
+        with file_lock(self.runtime_dir / "locks" / f"provider-{provider_key}.lock") as provider_acquired:
+            if not provider_acquired:
+                log_event(self.logger, "seat_skipped", seat_key=seat_key, reason="locked")
+                return True
+            with file_lock(self.runtime_dir / "locks" / f"seat-{seat_key}.lock") as seat_acquired:
+                if not seat_acquired:
+                    log_event(self.logger, "seat_skipped", seat_key=seat_key, reason="locked")
+                    return True
+                return self._reconcile(seat, remote, seat_key)
+
+    def _reconcile(self, seat: Seat, remote: dict[str, Any], seat_key: str) -> bool:
+        persisted = self.store.read(seat_key)
+        state = remote.get("state") if remote.get("state") in ALLOWED_STATES else "misconfigured"
+        candidate_exists = bool(seat.candidate_path and seat.candidate_path.exists())
+        if not self.apply:
+            log_event(self.logger, "seat_dry_run", seat_key=seat_key, state=state, outcome="skipped")
+            return True
+        if seat.canonical_path and seat.canonical_path.exists():
+            try:
+                access_repaired = repair_canonical_access(seat.canonical_path)
+                if access_repaired:
+                    self._wait_for_reload(seat.auth_index, remote.get("updated_at"))
+            except (OSError, PromotionError, APIError):
+                return self._fail(seat, seat_key, int(persisted.get("attempts", 0)), "candidate_invalid", "misconfigured", "failed")
+        if state == "ready" and not candidate_exists:
+            self._record(seat_key, "ready", "none", "skipped", persisted["attempts"], "")
+            return True
+        if state == "misconfigured" and not candidate_exists:
+            self._record(seat_key, state, "none", "skipped", persisted["attempts"], "")
+            return False
+        if state == "auth_required" and not candidate_exists:
+            self._record(seat_key, state, "none", "skipped", persisted["attempts"], "")
+            return True
+        next_attempt = _parse_time(persisted.get("next_attempt", ""))
+        if next_attempt and self.now() < next_attempt and not candidate_exists:
+            log_event(self.logger, "seat_skipped", seat_key=seat_key, state=state, reason="not_due")
+            return True
+        attempts = int(persisted.get("attempts", 0))
+        if attempts >= self.inventory.max_attempts_per_day:
+            try:
+                self.api.set_state(seat.auth_index, "auth_required", "attempt_budget_exhausted")
+            except APIError:
+                return self._record_local_failure(
+                    seat_key,
+                    attempts,
+                    "attempt_budget_exhausted",
+                    "auth_required",
+                    "failed",
+                )
+            self._record(seat_key, "auth_required", "attempt_budget_exhausted", "skipped", attempts, "")
+            return True
+        attempts += 1
+        archive: Path | None = None
+        promoted = False
+        promoted_updated_at: Any = remote.get("updated_at")
+        if candidate_exists:
+            try:
+                archive = promote_candidate(seat, self.state_dir / "rollback", seat_key, self.now())
+                promoted = True
+                promoted_updated_at = self._wait_for_reload(seat.auth_index, remote.get("updated_at"))
+            except (PromotionError, APIError):
+                if promoted and not self._rollback_and_reload(seat, archive, remote.get("updated_at")):
+                    return self._record_local_failure(
+                        seat_key,
+                        attempts,
+                        "rollback_failed",
+                        "misconfigured",
+                        "failed",
+                    )
+                return self._fail(seat, seat_key, attempts, "candidate_invalid", "misconfigured", "failed")
+        try:
+            self.api.set_state(seat.auth_index, "refreshing", "candidate_promoted" if candidate_exists else "")
+            refresh_outcome = self.api.refresh(seat.auth_index)
+            if refresh_outcome != "succeeded":
+                if promoted and not self._rollback_and_reload(seat, archive, promoted_updated_at):
+                    return self._fail(seat, seat_key, attempts, "rollback_failed", "misconfigured", "failed")
+                terminal = refresh_outcome == "auth_required" or attempts >= self.inventory.max_attempts_per_day
+                return self._fail(
+                    seat,
+                    seat_key,
+                    attempts,
+                    "probe_auth_required" if terminal else "refresh_failed",
+                    "auth_required" if terminal else "cooling",
+                    refresh_outcome,
+                )
+            self.api.set_state(seat.auth_index, "probing", "refresh_succeeded")
+            probe_outcome = self.api.probe(seat, self.inventory.probe_payload)
+            if probe_outcome == "succeeded":
+                self._record(seat_key, "ready", "none", "succeeded", attempts, "")
+                if candidate_exists and seat.candidate_path:
+                    seat.candidate_path.unlink(missing_ok=True)
+                return True
+            if promoted and not self._rollback_and_reload(seat, archive, promoted_updated_at):
+                return self._fail(seat, seat_key, attempts, "rollback_failed", "misconfigured", "failed")
+            if probe_outcome == "auth_required":
+                return self._fail(seat, seat_key, attempts, "probe_auth_required", "auth_required", probe_outcome)
+            return self._fail(seat, seat_key, attempts, "probe_rejected" if probe_outcome == "rejected" else "probe_retryable", "cooling", probe_outcome)
+        except (APIError, PromotionError):
+            if promoted and not self._rollback_and_reload(seat, archive, promoted_updated_at):
+                return self._fail(seat, seat_key, attempts, "rollback_failed", "misconfigured", "failed")
+            return self._fail(seat, seat_key, attempts, "probe_retryable", "cooling", "retryable")
+
+    def _wait_for_reload(self, auth_index: str, previous_updated_at: Any) -> Any:
+        """Wait briefly for the file watcher to observe an atomic promotion."""
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            rows = self.api.status()
+            matches = [row for row in rows if row.get("auth_index") == auth_index]
+            if len(matches) != 1:
+                raise PromotionError("promoted credential identity changed")
+            if not isinstance(previous_updated_at, str) or not previous_updated_at or matches[0].get("updated_at") != previous_updated_at:
+                return matches[0].get("updated_at")
+            time.sleep(0.2)
+        raise PromotionError("promoted credential was not reloaded")
+
+    def _rollback_and_reload(self, seat: Seat, archive: Path | None, promoted_updated_at: Any) -> bool:
+        try:
+            revert_promotion(seat, archive)
+            self._wait_for_reload(seat.auth_index, promoted_updated_at)
+            return True
+        except (OSError, PromotionError, APIError):
+            return False
+
+    def _fail(self, seat: Seat, seat_key: str, attempts: int, reason: str, state: str, outcome: str) -> bool:
+        delay = backoff_seconds(attempts, self.inventory.base_backoff_seconds, self.inventory.max_backoff_seconds, self.rng)
+        next_attempt = "" if state in {"auth_required", "misconfigured"} else (self.now() + dt.timedelta(seconds=delay)).replace(microsecond=0).isoformat()
+        try:
+            self.api.set_state(seat.auth_index, state, reason, next_attempt)
+        except APIError:
+            return self._record_local_failure(seat_key, attempts, reason, state, "failed", next_attempt)
+        self._record(seat_key, state, reason, outcome if outcome in SAFE_OUTCOMES else "failed", attempts, next_attempt)
+        return False
+
+    def _record_local_failure(
+        self,
+        seat_key: str,
+        attempts: int,
+        reason: str,
+        intended_state: str,
+        outcome: str,
+        next_attempt: str = "",
+    ) -> bool:
+        # The remote lifecycle did not commit. Preserve the last confirmed local
+        # state and record only the failed outcome so a local file cannot falsely
+        # claim that the scheduler transitioned the credential.
+        previous = self.store.read(seat_key)
+        state = previous.get("state") if previous.get("state") in ALLOWED_STATES else "misconfigured"
+        self._record(seat_key, state, reason, outcome, attempts, next_attempt)
+        log_event(
+            self.logger,
+            "remote_state_uncommitted",
+            seat_key=seat_key,
+            state=intended_state,
+            outcome=outcome,
+            reason=reason,
+        )
+        return False
+
+    def _record(self, seat_key: str, state: str, reason: str, outcome: str, attempts: int, next_attempt: str) -> None:
+        self.store.write(seat_key, state, reason, outcome, attempts, next_attempt)
+        log_event(self.logger, "seat_reconciled", seat_key=seat_key, state=state, outcome=outcome, reason=reason)
+
+
+def _parse_time(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Reconcile the declared hub credential pool")
+    parser.add_argument("--inventory", type=Path, default=Path("/etc/crsproxy/account-inventory.json"))
+    parser.add_argument("--state-directory", type=Path, default=Path(os.environ.get("STATE_DIRECTORY", "/var/lib/cliproxy-account-reconciler")))
+    parser.add_argument("--runtime-directory", type=Path, default=Path(os.environ.get("RUNTIME_DIRECTORY", "/run/cliproxy-account-reconciler")))
+    parser.add_argument("--base-url", default="http://127.0.0.1:8319")
+    parser.add_argument("--apply", action="store_true", help="perform mutations; the default is dry-run")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    logger = configure_logging()
+    try:
+        args = parse_args(argv)
+        inventory = load_inventory(args.inventory)
+        api = APIAdapter(args.base_url, os.environ.get("CLIPROXY_RECONCILER_API_KEY", ""))
+        controller = Controller(
+            inventory,
+            api,
+            args.state_directory,
+            args.runtime_directory,
+            load_hmac_key(),
+            apply=args.apply,
+            logger=logger,
+        )
+        return controller.run()
+    except InventoryError:
+        log_event(logger, "controller_failed", reason="inventory_invalid")
+        return 2
+    except ReconcileError:
+        log_event(logger, "controller_failed", reason="probe_retryable")
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

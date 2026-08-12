@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -65,6 +66,7 @@ type requestLifecycleSkipHost interface {
 
 type requestLifecycleTracker struct {
 	once         sync.Once
+	mu           sync.Mutex
 	ctx          context.Context
 	host         PluginInterceptorHost
 	skipPluginID string
@@ -95,7 +97,18 @@ func (t *requestLifecycleTracker) requestID() string {
 	if t == nil {
 		return ""
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	return t.completion.RequestID
+}
+
+func (t *requestLifecycleTracker) setCommittedModel(model string) {
+	if t == nil || strings.TrimSpace(model) == "" {
+		return
+	}
+	t.mu.Lock()
+	t.completion.Model = strings.TrimSpace(model)
+	t.mu.Unlock()
 }
 
 func (t *requestLifecycleTracker) complete(outcome pluginapi.RequestCompletionOutcome, statusCode int, err error) {
@@ -103,7 +116,9 @@ func (t *requestLifecycleTracker) complete(outcome pluginapi.RequestCompletionOu
 		return
 	}
 	t.once.Do(func() {
+		t.mu.Lock()
 		completion := t.completion
+		t.mu.Unlock()
 		completion.Outcome = outcome
 		completion.StatusCode = statusCode
 		completion.CompletedAt = time.Now()

@@ -198,6 +198,7 @@ func (b *Builder) Build() (*Service, error) {
 		return nil, fmt.Errorf("cliproxy: validate credential weights: %w", errValidate)
 	}
 	b.cfg.NormalizePluginsConfig()
+	b.cfg.NormalizeAutoRoutingConfig()
 	if errResolvePluginsDir := b.cfg.ResolvePluginsDir(); errResolvePluginsDir != nil && b.cfg.Plugins.Enabled {
 		return nil, fmt.Errorf("cliproxy: %w", errResolvePluginsDir)
 	}

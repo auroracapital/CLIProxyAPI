@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -310,6 +309,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 
 		entry := logEntryWithRequestID(ctx)
+		m.emitAccountRoutingEvent(opts.RoutingObserver, "account_selection", provider, routeModel, "selected", len(attempted), len(providers))
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
@@ -452,6 +452,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 
 		entry := logEntryWithRequestID(ctx)
+		m.emitAccountRoutingEvent(opts.RoutingObserver, "account_selection", provider, routeModel, "selected", len(attempted), len(providers))
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
@@ -632,6 +633,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 
 		entry := logEntryWithRequestID(ctx)
+		m.emitAccountRoutingEvent(opts.RoutingObserver, "account_selection", provider, routeModel, "selected", len(attempted), len(providers))
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		if selection != nil {
 			if errRuntimeAuth := m.bindHomeSelectionRuntimeAuth(ctx, opts, selection); errRuntimeAuth != nil {
@@ -752,6 +754,29 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		return wrapPressureStream(ctx, streamResult, lease), nil
 	}
+}
+
+func (m *Manager) emitAccountRoutingEvent(observer cliproxyexecutor.RoutingObserver, stage, provider, model, outcome string, attempt, candidates int) {
+	if observer == nil {
+		return
+	}
+	selector := "custom"
+	switch m.Selector().(type) {
+	case *LeastPressureSelector:
+		selector = "least_pressure"
+	case *ShadowLeastPressureSelector:
+		selector = "shadow_least_pressure"
+	case *RoundRobinSelector:
+		selector = "round_robin"
+	case *WeightedRoundRobinSelector:
+		selector = "weighted_round_robin"
+	case *FillFirstSelector:
+		selector = "fill_first"
+	}
+	observer.ObserveRouting(cliproxyexecutor.RoutingEvent{
+		Stage: stage, Mode: "active", Provider: provider, Model: model,
+		Outcome: outcome, Attempt: attempt, CandidateCount: candidates, Selector: selector,
+	})
 }
 
 func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel string) cliproxyexecutor.Options {
@@ -1202,50 +1227,11 @@ func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model 
 	if entry == nil || auth == nil {
 		return
 	}
-	accountType, accountInfo := auth.AccountInfo()
-	proxyInfo := auth.ProxyInfo()
-	suffix := ""
-	if proxyInfo != "" {
-		suffix = " " + proxyInfo
-	}
-	switch accountType {
-	case "api_key":
-		entry.Debugf("Use API key %s for model %s%s", util.HideAPIKey(accountInfo), model, suffix)
-	case "oauth":
-		ident := formatOauthIdentity(auth, provider, accountInfo)
-		entry.Debugf("Use OAuth %s for model %s%s", ident, model, suffix)
-	}
-}
-
-func formatOauthIdentity(auth *Auth, provider string, accountInfo string) string {
-	if auth == nil {
-		return ""
-	}
-	// Prefer the auth's provider when available.
-	providerName := strings.TrimSpace(auth.Provider)
+	providerName := strings.ToLower(strings.TrimSpace(provider))
 	if providerName == "" {
-		providerName = strings.TrimSpace(provider)
+		providerName = strings.ToLower(strings.TrimSpace(auth.Provider))
 	}
-	// Only log the basename to avoid leaking host paths.
-	// FileName may be unset for some auth backends; fall back to ID.
-	authFile := strings.TrimSpace(auth.FileName)
-	if authFile == "" {
-		authFile = strings.TrimSpace(auth.ID)
-	}
-	if authFile != "" {
-		authFile = filepath.Base(authFile)
-	}
-	parts := make([]string, 0, 3)
-	if providerName != "" {
-		parts = append(parts, "provider="+providerName)
-	}
-	if authFile != "" {
-		parts = append(parts, "auth_file="+authFile)
-	}
-	if len(parts) == 0 {
-		return accountInfo
-	}
-	return strings.Join(parts, " ")
+	entry.WithFields(log.Fields{"provider": providerName, "model": model}).Debug("selected credential")
 }
 
 // InjectCredentials delegates per-provider HTTP request preparation when supported.

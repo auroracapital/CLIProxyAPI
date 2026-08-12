@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"sync"
 	"testing"
@@ -154,6 +155,8 @@ func TestLeastPressureStreamLeaseEndsOnCompletionAndCancellation(t *testing.T) {
 func TestLeastPressureActiveStreamPushesNextStreamToAnotherCredential(t *testing.T) {
 	streamA := make(chan cliproxyexecutor.StreamChunk, 1)
 	streamB := make(chan cliproxyexecutor.StreamChunk, 1)
+	streamA <- cliproxyexecutor.StreamChunk{Payload: []byte("started")}
+	streamB <- cliproxyexecutor.StreamChunk{Payload: []byte("started")}
 	executor := &leastPressureExecutor{streams: map[string]chan cliproxyexecutor.StreamChunk{"auth-a": streamA, "auth-b": streamB}}
 	manager := newLeastPressureManager(t, executor)
 
@@ -235,6 +238,40 @@ func TestLeastPressurePrefersCapacityAndRecentSuccess(t *testing.T) {
 	}
 }
 
+func TestLeastPressurePredictsBurstAndRefreshExpiryRisk(t *testing.T) {
+	now := time.Now()
+	steady := &Auth{ID: "steady"}
+	bursty := &Auth{ID: "bursty"}
+	for index := 0; index < 20; index++ {
+		bursty.recordRecentRequest(now, true)
+	}
+	tracker := &credentialPressureTracker{}
+	tracker.mu.Lock()
+	picked := pickLeastPressureAuth([]*Auth{bursty, steady}, tracker, "burst", nil, now)
+	tracker.mu.Unlock()
+	if picked == nil || picked.ID != steady.ID {
+		t.Fatalf("burst selection = %#v, want steady", picked)
+	}
+
+	fresh := &Auth{ID: "fresh", Metadata: map[string]any{"expires_at": now.Add(time.Hour).Unix()}}
+	expiring := &Auth{ID: "expiring", Metadata: map[string]any{"expires_at": now.Add(5 * time.Minute).Unix()}}
+	tracker.mu.Lock()
+	picked = pickLeastPressureAuth([]*Auth{expiring, fresh}, tracker, "expiry", nil, now)
+	tracker.mu.Unlock()
+	if picked == nil || picked.ID != fresh.ID {
+		t.Fatalf("expiry selection = %#v, want fresh", picked)
+	}
+}
+
+func TestLeastPressureScoreSaturatesWithoutOverflow(t *testing.T) {
+	auth := &Auth{ID: "saturated"}
+	auth.recentRequests.buckets[0] = recentRequestBucket{bucketID: recentRequestBucketID(time.Now()), success: math.MaxInt64, failed: math.MaxInt64}
+	score := credentialPressureScore(auth, math.MaxInt64, time.Now())
+	if score < 0 {
+		t.Fatalf("overflowed pressure score = %d", score)
+	}
+}
+
 func TestLeastPressureExcludesNonPositiveCapacity(t *testing.T) {
 	selector := &LeastPressureSelector{}
 	disabledByCapacity := &Auth{ID: "zero", Provider: "gemini", Status: StatusActive, Attributes: map[string]string{AttributeWeight: "0"}}
@@ -262,4 +299,268 @@ func TestLeastPressureStreamPrepareCancellationReleasesLease(t *testing.T) {
 	if leaked != 0 {
 		t.Fatalf("in-flight reservations leaked after canceled stream prepare: %d", leaked)
 	}
+}
+
+func TestLeastPressureMixedProviderExcludesNonPositiveCapacity(t *testing.T) {
+	manager := NewManager(nil, &LeastPressureSelector{}, nil)
+	geminiExec := &leastPressureExecutor{}
+	manager.RegisterExecutor(geminiExec)
+	otherExec := &namedLeastPressureExecutor{id: "claude"}
+	manager.RegisterExecutor(otherExec)
+	model := "shared-pressure-model"
+	for _, auth := range []*Auth{
+		{ID: "gemini-zero", Provider: "gemini", Status: StatusActive, Attributes: map[string]string{AttributeWeight: "0"}},
+		{ID: "claude-ready", Provider: "claude", Status: StatusActive},
+	} {
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+	}
+	auth, _, provider, errPick := manager.pickNextMixed(context.Background(), []string{"gemini", "claude"}, model, requestPressureReservation(cliproxyexecutor.Options{}), nil)
+	if errPick != nil {
+		t.Fatal(errPick)
+	}
+	defer releaseCredentialPressure(auth)
+	if auth.ID != "claude-ready" || provider != "claude" {
+		t.Fatalf("auth=%q provider=%q, zero-capacity mixed candidate was admitted", auth.ID, provider)
+	}
+}
+
+func TestLeastPressureMixedProviderChoosesLowerPressure(t *testing.T) {
+	manager := NewManager(nil, &LeastPressureSelector{}, nil)
+	manager.RegisterExecutor(&leastPressureExecutor{})
+	manager.RegisterExecutor(&namedLeastPressureExecutor{id: "claude"})
+	model := "mixed-lower-pressure-model"
+	for _, auth := range []*Auth{
+		{ID: "gemini-busy", Provider: "gemini", Status: StatusActive},
+		{ID: "claude-idle", Provider: "claude", Status: StatusActive},
+	} {
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+	}
+	manager.scheduler.pressure.mu.Lock()
+	if manager.scheduler.pressure.inFlight == nil {
+		manager.scheduler.pressure.inFlight = make(map[string]int64)
+	}
+	manager.scheduler.pressure.inFlight["gemini-busy"] = 3
+	manager.scheduler.pressure.mu.Unlock()
+	picked, _, provider, errPick := manager.pickNextMixed(context.Background(), []string{"gemini", "claude"}, model, requestPressureReservation(cliproxyexecutor.Options{}), nil)
+	if errPick != nil {
+		t.Fatal(errPick)
+	}
+	defer releaseCredentialPressure(picked)
+	if picked.ID != "claude-idle" || provider != "claude" {
+		t.Fatalf("picked=%q provider=%q, want idle Claude credential", picked.ID, provider)
+	}
+}
+
+func TestLeastPressureRespectsPriorityBeforePressure(t *testing.T) {
+	selector := &LeastPressureSelector{}
+	busyHigh := &Auth{ID: "busy-high", Provider: "gemini", Status: StatusActive, Attributes: map[string]string{"priority": "10"}}
+	idleLow := &Auth{ID: "idle-low", Provider: "gemini", Status: StatusActive, Attributes: map[string]string{"priority": "0"}}
+	selector.pressure.inFlight = map[string]int64{busyHigh.ID: 100}
+	picked, errPick := selector.Pick(context.Background(), "gemini", "model", cliproxyexecutor.Options{}, []*Auth{idleLow, busyHigh})
+	if errPick != nil {
+		t.Fatal(errPick)
+	}
+	if picked.ID != busyHigh.ID {
+		t.Fatalf("picked=%q, want higher-priority credential despite pressure", picked.ID)
+	}
+}
+
+func TestLeastPressureExcludesCooldownUnavailableAndDisabled(t *testing.T) {
+	selector := &LeastPressureSelector{}
+	model := "model"
+	now := time.Now()
+	auths := []*Auth{
+		{ID: "disabled", Provider: "gemini", Status: StatusActive, Disabled: true},
+		{ID: "unavailable", Provider: "gemini", Status: StatusActive, Unavailable: true},
+		{ID: "cooling", Provider: "gemini", Status: StatusActive, ModelStates: map[string]*ModelState{model: {Status: StatusActive, Unavailable: true, NextRetryAfter: now.Add(time.Hour)}}},
+		{ID: "ready", Provider: "gemini", Status: StatusActive},
+	}
+	picked, errPick := selector.Pick(context.Background(), "gemini", model, cliproxyexecutor.Options{}, auths)
+	if errPick != nil {
+		t.Fatal(errPick)
+	}
+	if picked.ID != "ready" {
+		t.Fatalf("picked=%q, want only ready credential", picked.ID)
+	}
+}
+
+func TestLeastPressureEqualScoreTieRotationIsFair(t *testing.T) {
+	selector := &LeastPressureSelector{}
+	auths := []*Auth{
+		{ID: "auth-a", Provider: "gemini", Status: StatusActive},
+		{ID: "auth-b", Provider: "gemini", Status: StatusActive},
+		{ID: "auth-c", Provider: "gemini", Status: StatusActive},
+	}
+	counts := make(map[string]int)
+	for index := 0; index < 300; index++ {
+		picked, errPick := selector.Pick(context.Background(), "gemini", "model", cliproxyexecutor.Options{}, auths)
+		if errPick != nil {
+			t.Fatal(errPick)
+		}
+		counts[picked.ID]++
+	}
+	for _, auth := range auths {
+		if counts[auth.ID] != 100 {
+			t.Fatalf("counts=%#v, want exact equal-score rotation", counts)
+		}
+	}
+}
+
+type routingEventCapture struct {
+	mu     sync.Mutex
+	events []cliproxyexecutor.RoutingEvent
+}
+
+func (c *routingEventCapture) ObserveRouting(event cliproxyexecutor.RoutingEvent) {
+	c.mu.Lock()
+	c.events = append(c.events, event)
+	c.mu.Unlock()
+}
+
+func TestShadowLeastPressurePredictsWithoutChangingProductionSelection(t *testing.T) {
+	fallback := &RoundRobinSelector{}
+	selector := NewShadowLeastPressureSelector(fallback)
+	busy := &Auth{ID: "auth-a", Provider: "gemini", Status: StatusActive}
+	idle := &Auth{ID: "auth-b", Provider: "gemini", Status: StatusActive}
+	selector.pressure.inFlight = map[string]int64{busy.ID: 10}
+	observer := &routingEventCapture{}
+	opts := cliproxyexecutor.Options{RoutingObserver: observer}
+
+	first, errFirst := selector.Pick(context.Background(), "gemini", "model", opts, []*Auth{busy, idle})
+	if errFirst != nil {
+		t.Fatal(errFirst)
+	}
+	second, errSecond := selector.Pick(context.Background(), "gemini", "model", opts, []*Auth{busy, idle})
+	if errSecond != nil {
+		t.Fatal(errSecond)
+	}
+	if first.ID != busy.ID || second.ID != idle.ID {
+		t.Fatalf("production round-robin changed: first=%q second=%q", first.ID, second.ID)
+	}
+	if len(selector.pressure.inFlight) != 1 || selector.pressure.inFlight[busy.ID] != 10 {
+		t.Fatalf("shadow prediction mutated in-flight state: %#v", selector.pressure.inFlight)
+	}
+	if len(selector.pressure.cursors) != 0 {
+		t.Fatalf("shadow prediction mutated tie cursors: %#v", selector.pressure.cursors)
+	}
+	observer.mu.Lock()
+	events := append([]cliproxyexecutor.RoutingEvent(nil), observer.events...)
+	observer.mu.Unlock()
+	if len(events) != 2 || events[0].Stage != "account_prediction" || events[0].ShadowMatch || !events[1].ShadowMatch {
+		t.Fatalf("shadow events = %#v", events)
+	}
+}
+
+func TestShadowLeastPressureReservationTracksActualNotPrediction(t *testing.T) {
+	selector := NewShadowLeastPressureSelector(&RoundRobinSelector{})
+	busy := &Auth{ID: "auth-a", Provider: "gemini", Status: StatusActive}
+	idle := &Auth{ID: "auth-b", Provider: "gemini", Status: StatusActive}
+	selector.pressure.inFlight = map[string]int64{busy.ID: 10}
+	selected, errPick := selector.Pick(context.Background(), "gemini", "model", requestPressureReservation(cliproxyexecutor.Options{}), []*Auth{busy, idle})
+	if errPick != nil {
+		t.Fatal(errPick)
+	}
+	if selected.ID != busy.ID || selector.pressure.inFlight[busy.ID] != 11 || selector.pressure.inFlight[idle.ID] != 0 {
+		t.Fatalf("selected=%q pressure=%#v", selected.ID, selector.pressure.inFlight)
+	}
+	releaseCredentialPressure(selected)
+	if selector.pressure.inFlight[busy.ID] != 10 {
+		t.Fatalf("actual reservation did not release: %#v", selector.pressure.inFlight)
+	}
+}
+
+func TestLeastPressureConcurrentLoadIsDistributedAndLeakFree(t *testing.T) {
+	manager := newLeastPressureManager(t, &leastPressureExecutor{})
+	var wait sync.WaitGroup
+	var countsMu sync.Mutex
+	counts := make(map[string]int)
+	errorsCh := make(chan error, 300)
+	for index := 0; index < 300; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			picked, _, errPick := manager.pickNext(context.Background(), "gemini", "gemini-test", requestPressureReservation(cliproxyexecutor.Options{}), nil)
+			if errPick != nil {
+				errorsCh <- errPick
+				return
+			}
+			countsMu.Lock()
+			counts[picked.ID]++
+			countsMu.Unlock()
+			releaseCredentialPressure(picked)
+		}()
+	}
+	wait.Wait()
+	close(errorsCh)
+	for errConcurrent := range errorsCh {
+		t.Fatal(errConcurrent)
+	}
+	if counts["auth-a"] == 0 || counts["auth-b"] == 0 {
+		t.Fatalf("load was not distributed: %#v", counts)
+	}
+	manager.scheduler.pressure.mu.Lock()
+	leaked := len(manager.scheduler.pressure.inFlight)
+	manager.scheduler.pressure.mu.Unlock()
+	if leaked != 0 {
+		t.Fatalf("in-flight reservations leaked after load: %d", leaked)
+	}
+}
+
+func TestLeastPressureStreamBootstrapFailureReleasesEveryLease(t *testing.T) {
+	executor := &leastPressureExecutor{streams: map[string]chan cliproxyexecutor.StreamChunk{}}
+	manager := newLeastPressureManager(t, executor)
+	_, errStream := manager.ExecuteStream(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{Model: "gemini-test"}, cliproxyexecutor.Options{Stream: true})
+	if errStream == nil {
+		t.Fatal("expected invalid stream error")
+	}
+	manager.scheduler.pressure.mu.Lock()
+	leaked := len(manager.scheduler.pressure.inFlight)
+	manager.scheduler.pressure.mu.Unlock()
+	if leaked != 0 {
+		t.Fatalf("in-flight reservations leaked after bootstrap failures: %d", leaked)
+	}
+}
+
+func TestLeastPressureSelectorRollbackRestoresRoundRobin(t *testing.T) {
+	manager := newLeastPressureManager(t, &leastPressureExecutor{})
+	if _, ok := manager.Selector().(*LeastPressureSelector); !ok {
+		t.Fatalf("initial selector = %T", manager.Selector())
+	}
+	manager.SetSelector(&RoundRobinSelector{})
+	if _, ok := manager.Selector().(*RoundRobinSelector); !ok {
+		t.Fatalf("rolled-back selector = %T", manager.Selector())
+	}
+	if manager.scheduler.strategy != schedulerStrategyRoundRobin || manager.scheduler.pressure != nil {
+		t.Fatalf("scheduler rollback strategy=%v pressure=%#v", manager.scheduler.strategy, manager.scheduler.pressure)
+	}
+	first, _, errFirst := manager.pickNext(context.Background(), "gemini", "gemini-test", cliproxyexecutor.Options{}, nil)
+	second, _, errSecond := manager.pickNext(context.Background(), "gemini", "gemini-test", cliproxyexecutor.Options{}, nil)
+	if errFirst != nil || errSecond != nil || first.ID == second.ID {
+		t.Fatalf("round-robin after rollback first=%#v second=%#v errors=(%v,%v)", first, second, errFirst, errSecond)
+	}
+}
+
+type namedLeastPressureExecutor struct{ id string }
+
+func (e *namedLeastPressureExecutor) Identifier() string { return e.id }
+func (*namedLeastPressureExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+func (*namedLeastPressureExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+func (*namedLeastPressureExecutor) Refresh(context.Context, *Auth) (*Auth, error) { return nil, nil }
+func (*namedLeastPressureExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+func (*namedLeastPressureExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
 }

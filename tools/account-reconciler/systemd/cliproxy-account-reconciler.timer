@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically reconcile CLIProxy desired accounts
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+RandomizedDelaySec=5min
+AccuracySec=30s
+Persistent=true
+Unit=cliproxy-account-reconciler.service
+
+[Install]
+WantedBy=timers.target

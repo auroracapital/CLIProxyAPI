@@ -12,10 +12,12 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -287,6 +289,11 @@ type BaseAPIHandler struct {
 	// ModelRouterHost optionally routes matching requests to a plugin executor, the router's own
 	// executor, or a built-in provider before model-to-provider resolution and auth selection.
 	ModelRouterHost PluginModelRouterHost
+
+	// RoutingObserver receives privacy-safe categorical routing decisions.
+	RoutingObserver  coreexecutor.RoutingObserver
+	autoRouting      atomic.Pointer[internalconfig.AutoRoutingConfig]
+	routingTelemetry atomic.Pointer[bool]
 }
 
 // NewBaseAPIHandlers creates a new API handlers instance.
@@ -299,10 +306,14 @@ type BaseAPIHandler struct {
 // Returns:
 //   - *BaseAPIHandler: A new API handlers instance
 func NewBaseAPIHandlers(cfg *config.SDKConfig, authManager *coreauth.Manager) *BaseAPIHandler {
-	return &BaseAPIHandler{
-		Cfg:         cfg,
-		AuthManager: authManager,
+	handler := &BaseAPIHandler{
+		Cfg:             cfg,
+		AuthManager:     authManager,
+		RoutingObserver: defaultRoutingLogObserver,
 	}
+	handler.storeAutoRoutingConfig(cfg)
+	handler.storeRoutingTelemetryConfig(cfg)
+	return handler
 }
 
 // UpdateClients updates the handlers' client list and configuration.
@@ -311,7 +322,70 @@ func NewBaseAPIHandlers(cfg *config.SDKConfig, authManager *coreauth.Manager) *B
 // Parameters:
 //   - clients: The new slice of AI service clients
 //   - cfg: The new application configuration
-func (h *BaseAPIHandler) UpdateClients(cfg *config.SDKConfig) { h.Cfg = cfg }
+func (h *BaseAPIHandler) UpdateClients(cfg *config.SDKConfig) {
+	if h == nil {
+		return
+	}
+	h.storeAutoRoutingConfig(cfg)
+	h.storeRoutingTelemetryConfig(cfg)
+	h.Cfg = cfg
+}
+
+func (h *BaseAPIHandler) storeRoutingTelemetryConfig(cfg *config.SDKConfig) {
+	enabled := cfg != nil && cfg.RoutingObservability.Enabled
+	h.routingTelemetry.Store(&enabled)
+}
+
+func (h *BaseAPIHandler) routingObserver() coreexecutor.RoutingObserver {
+	if h == nil {
+		return nil
+	}
+	enabled := h.routingTelemetry.Load()
+	if enabled == nil || !*enabled {
+		return nil
+	}
+	return h.RoutingObserver
+}
+
+func (h *BaseAPIHandler) storeAutoRoutingConfig(cfg *config.SDKConfig) {
+	if h == nil {
+		return
+	}
+	auto := internalconfig.AutoRoutingConfig{}
+	if cfg != nil {
+		auto = cloneAutoRoutingConfig(cfg.AutoRouting)
+	}
+	h.autoRouting.Store(&auto)
+}
+
+func (h *BaseAPIHandler) autoRoutingConfig() internalconfig.AutoRoutingConfig {
+	if h == nil {
+		return internalconfig.AutoRoutingConfig{}
+	}
+	if auto := h.autoRouting.Load(); auto != nil {
+		return cloneAutoRoutingConfig(*auto)
+	}
+	return internalconfig.AutoRoutingConfig{}
+}
+
+func cloneAutoRoutingConfig(src internalconfig.AutoRoutingConfig) internalconfig.AutoRoutingConfig {
+	out := src
+	out.DefaultModels = append([]string(nil), src.DefaultModels...)
+	if len(src.TaskModels) > 0 {
+		out.TaskModels = make(map[string][]string, len(src.TaskModels))
+		for task, models := range src.TaskModels {
+			out.TaskModels[task] = append([]string(nil), models...)
+		}
+	}
+	return out
+}
+
+// SetRoutingObserver replaces the categorical routing observer. Nil disables it.
+func (h *BaseAPIHandler) SetRoutingObserver(observer coreexecutor.RoutingObserver) {
+	if h != nil {
+		h.RoutingObserver = observer
+	}
+}
 
 // SetPluginHost configures the optional plugin interceptor host.
 func (h *BaseAPIHandler) SetPluginHost(host PluginInterceptorHost) {

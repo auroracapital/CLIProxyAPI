@@ -46,6 +46,8 @@ func effectiveSDKConfig(cfg *config.Config) *config.SDKConfig {
 	}
 	sdkCfg := cfg.SDKConfig
 	sdkCfg.CodexOptimizeMultiAgentV2 = cfg.Codex.OptimizeMultiAgentV2
+	sdkCfg.AutoRouting = cfg.Routing.Auto
+	sdkCfg.RoutingObservability = cfg.Routing.Observability
 	if cfg.CommercialMode {
 		sdkCfg.RequestLog = false
 	}

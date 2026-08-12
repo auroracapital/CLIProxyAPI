@@ -40,6 +40,8 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	}
 
 	switch strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy)) {
+	case "shadow-least-pressure", "shadowleastpressure", "shadow-lp":
+		state.strategy = "shadow-least-pressure"
 	case "least-pressure", "leastpressure", "least-loaded", "leastloaded", "lp":
 		state.strategy = "least-pressure"
 	case "weighted-round-robin", "weightedroundrobin", "wrr":
@@ -59,6 +61,8 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	var selector coreauth.Selector
 	switch state.strategy {
+	case "shadow-least-pressure":
+		selector = &coreauth.RoundRobinSelector{}
 	case "least-pressure":
 		selector = &coreauth.LeastPressureSelector{}
 	case "weighted-round-robin":
@@ -73,6 +77,9 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 			Fallback: selector,
 			TTL:      state.sessionAffinityTTL,
 		})
+	}
+	if state.strategy == "shadow-least-pressure" {
+		selector = coreauth.NewShadowLeastPressureSelector(selector)
 	}
 	return selector
 }

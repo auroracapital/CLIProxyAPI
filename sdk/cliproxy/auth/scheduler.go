@@ -333,7 +333,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
 	}
 
-	predicate := scheduledAuthPredicate(eligibility, tried, "", strategy == schedulerStrategyWeightedRoundRobin)
+	predicate := scheduledAuthPredicate(eligibility, tried, "", strategy == schedulerStrategyWeightedRoundRobin || strategy == schedulerStrategyLeastPressure)
 	candidateShards := make([]*modelScheduler, len(normalized))
 	bestPriority := 0
 	hasCandidate := false
@@ -575,7 +575,7 @@ func (s *authScheduler) upsertAuthLocked(auth *Auth, now time.Time) {
 	}
 	authID := strings.TrimSpace(auth.ID)
 	providerKey := executorKeyFromAuth(auth)
-	if authID == "" || providerKey == "" || auth.Disabled {
+	if authID == "" || providerKey == "" || auth.Disabled || !auth.reconcileReady() {
 		s.removeAuthLocked(authID)
 		return
 	}

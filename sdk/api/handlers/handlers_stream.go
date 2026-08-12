@@ -316,6 +316,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		RequestAfterAuthInterceptor: h.requestAfterAuthInterceptor(afterAuthCapture, lifecycle.requestID(), execOptions.SkipInterceptorPluginID),
 	}
 	opts.Metadata = reqMeta
+	opts.RoutingObserver = h.routingObserver()
 	var interceptErr *interfaces.ErrorMessage
 	req, opts, interceptErr = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, lifecycle.requestID(), req, opts, execOptions.SkipInterceptorPluginID)
 	if interceptErr != nil {
@@ -325,7 +326,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		close(errChan)
 		return nil, nil, errChan
 	}
-	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+	streamResult, executedModel, err := h.executeStreamModelSlate(ctx, providers, req, opts, routeDecision)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errMsg := executionErrorMessage(err)
@@ -334,6 +335,11 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		errChan <- errMsg
 		close(errChan)
 		return nil, nil, errChan
+	}
+	if executedModel != "" {
+		normalizedModel = executedModel
+		opts.OriginalRequest = requestWithSelectedModel(opts.OriginalRequest, executedModel)
+		lifecycle.setCommittedModel(executedModel)
 	}
 	if streamResult == nil {
 		errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("auth manager returned nil stream")}
@@ -508,7 +514,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	}
 
 	maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
-	if h.AuthManager.HomeEnabled() {
+	// The smart slate and auth manager already own all pre-output retry decisions.
+	// Re-entering the raw manager here would escape the committed model/provider slate.
+	if h.AuthManager.HomeEnabled() || routeDecision.AutoRouted {
 		maxBootstrapRetries = 0
 	}
 	for bootstrapRetries := 0; !streamCanceledBeforeRead; {

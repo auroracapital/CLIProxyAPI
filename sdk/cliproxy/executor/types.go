@@ -161,6 +161,8 @@ type Options struct {
 	RequestAfterAuthInterceptor RequestAfterAuthInterceptor
 	// ExecutionLifecycle owns Home-dispatched execution resources. Executors must not add it to request metadata.
 	ExecutionLifecycle ExecutionLifecycle
+	// RoutingObserver receives categorical routing events outside generic metadata.
+	RoutingObserver RoutingObserver
 }
 
 // ResponseFormatOrSource returns the response target format for an execution.
