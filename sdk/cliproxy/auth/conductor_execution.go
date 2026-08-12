@@ -295,12 +295,18 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, requestPressureReservation(pickOpts), tried)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
 			}
 			return cliproxyexecutor.Response{}, errPick
+		}
+		lease := takeCredentialPressureLease(auth)
+		releasePressure := func() {
+			if lease != nil {
+				lease.Release()
+			}
 		}
 
 		entry := logEntryWithRequestID(ctx)
@@ -317,12 +323,14 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
+			releasePressure()
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			releasePressure()
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
 				return cliproxyexecutor.Response{}, errCancel
 			}
@@ -344,6 +352,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			var errIntercept error
 			execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			if errIntercept != nil {
+				releasePressure()
 				return cliproxyexecutor.Response{}, errIntercept
 			}
 			if !restoreExecutionModel {
@@ -352,6 +361,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					releasePressure()
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
@@ -360,12 +370,14 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
 					if errExec != nil {
 						if errCtx := execCtx.Err(); errCtx != nil {
+							releasePressure()
 							return cliproxyexecutor.Response{}, errCtx
 						}
 					}
 				}
 			}
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errExec); errCancel != nil {
+				releasePressure()
 				return cliproxyexecutor.Response{}, errCancel
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
@@ -376,17 +388,20 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
+					releasePressure()
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			releasePressure()
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			return resp, nil
 		}
 		if authErr != nil {
+			releasePressure()
 			if isRequestInvalidError(authErr) {
 				return cliproxyexecutor.Response{}, authErr
 			}
@@ -422,12 +437,18 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, requestPressureReservation(pickOpts), tried)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
 			}
 			return cliproxyexecutor.Response{}, errPick
+		}
+		lease := takeCredentialPressureLease(auth)
+		releasePressure := func() {
+			if lease != nil {
+				lease.Release()
+			}
 		}
 
 		entry := logEntryWithRequestID(ctx)
@@ -444,12 +465,14 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
+			releasePressure()
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			releasePressure()
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
 				return cliproxyexecutor.Response{}, errCancel
 			}
@@ -471,6 +494,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			var errIntercept error
 			execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			if errIntercept != nil {
+				releasePressure()
 				return cliproxyexecutor.Response{}, errIntercept
 			}
 			if !restoreExecutionModel {
@@ -479,6 +503,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					releasePressure()
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
@@ -487,12 +512,14 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					resp, errExec = executor.CountTokens(execCtx, auth, execReq, execOpts)
 					if errExec != nil {
 						if errCtx := execCtx.Err(); errCtx != nil {
+							releasePressure()
 							return cliproxyexecutor.Response{}, errCtx
 						}
 					}
 				}
 			}
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errExec); errCancel != nil {
+				releasePressure()
 				return cliproxyexecutor.Response{}, errCancel
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
@@ -511,17 +538,20 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					m.MarkResult(execCtx, result)
 				}
 				if isRequestInvalidError(errExec) {
+					releasePressure()
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			releasePressure()
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			return resp, nil
 		}
 		if authErr != nil {
+			releasePressure()
 			if isRequestInvalidError(authErr) {
 				return cliproxyexecutor.Response{}, authErr
 			}
@@ -573,7 +603,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				provider = selection.Provider
 			}
 		} else {
-			auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+			auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, requestPressureReservation(pickOpts), tried)
 		}
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
@@ -581,7 +611,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return nil, errPick
 		}
+		lease := takeCredentialPressureLease(auth)
 		if auth == nil || executor == nil {
+			if lease != nil {
+				lease.Release()
+			}
 			if selection != nil {
 				selection.End("missing_execution_target")
 			}
@@ -629,6 +663,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			aliasResult.OriginalAlias = responseAlias
 		}
 		if len(models) == 0 {
+			if lease != nil {
+				lease.Release()
+			}
 			if selection != nil {
 				releaseAttempt()
 				if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "no_execution_models"); errEnd != nil {
@@ -647,6 +684,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if errPrepare != nil {
 			if selection == nil {
 				if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
+					if lease != nil {
+						lease.Release()
+					}
 					return nil, errCancel
 				}
 			}
@@ -658,6 +698,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				m.MarkResult(execCtx, result)
 			}
 			lastErr = errPrepare
+			if lease != nil {
+				lease.Release()
+			}
 			if selection != nil {
 				if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "prepare_failed"); errEnd != nil {
 					return nil, errEnd
@@ -680,6 +723,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil, unauthorizedRefreshTried)
 		if errStream != nil {
+			if lease != nil {
+				lease.Release()
+			}
 			if selection != nil {
 				releaseAttempt()
 				if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "stream_start_failed"); errEnd != nil {
@@ -704,7 +750,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return wrapHomeStream(ctx, streamResult, selection, releaseAttempt), nil
 		}
-		return streamResult, nil
+		return wrapPressureStream(ctx, streamResult, lease), nil
 	}
 }
 

@@ -20,6 +20,7 @@ const (
 	schedulerStrategyRoundRobin         schedulerStrategy = 1
 	schedulerStrategyFillFirst          schedulerStrategy = 2
 	schedulerStrategyWeightedRoundRobin schedulerStrategy = 3
+	schedulerStrategyLeastPressure      schedulerStrategy = 4
 )
 
 // scheduledState describes how an auth currently participates in a model shard.
@@ -40,6 +41,7 @@ type authScheduler struct {
 	authProviders       map[string]string
 	mixedCursors        map[string]int
 	mixedWeightedStates map[string]*smoothWeightedState
+	pressure            *credentialPressureTracker
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -147,12 +149,17 @@ func normalizeCursor(cursor, size int) int {
 
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
 func newAuthScheduler(selector Selector) *authScheduler {
+	var pressure *credentialPressureTracker
+	if leastPressure, ok := selector.(*LeastPressureSelector); ok {
+		pressure = leastPressure.tracker()
+	}
 	return &authScheduler{
 		strategy:            selectorStrategy(selector),
 		providers:           make(map[string]*providerScheduler),
 		authProviders:       make(map[string]string),
 		mixedCursors:        make(map[string]int),
 		mixedWeightedStates: make(map[string]*smoothWeightedState),
+		pressure:            pressure,
 	}
 }
 
@@ -163,6 +170,8 @@ func selectorStrategy(selector Selector) schedulerStrategy {
 		return schedulerStrategyFillFirst
 	case *WeightedRoundRobinSelector:
 		return schedulerStrategyWeightedRoundRobin
+	case *LeastPressureSelector:
+		return schedulerStrategyLeastPressure
 	case nil, *RoundRobinSelector:
 		return schedulerStrategyRoundRobin
 	default:
@@ -178,6 +187,11 @@ func (s *authScheduler) setSelector(selector Selector) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.strategy = selectorStrategy(selector)
+	if leastPressure, ok := selector.(*LeastPressureSelector); ok {
+		s.pressure = leastPressure.tracker()
+	} else {
+		s.pressure = nil
+	}
 	clear(s.mixedCursors)
 	clear(s.mixedWeightedStates)
 }
@@ -251,8 +265,8 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 	if shard == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin)
-	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
+	predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin || strategy == schedulerStrategyLeastPressure)
+	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate, s.pressure, providerKey+":"+modelKey, pressureReservationRequested(opts)); picked != nil {
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
@@ -312,8 +326,8 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
 		shard := providerState.ensureModelLocked(modelKey, time.Now())
-		predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin)
-		if picked := shard.pickReadyLocked(false, strategy, predicate); picked != nil {
+		predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin || strategy == schedulerStrategyLeastPressure)
+		if picked := shard.pickReadyLocked(false, strategy, predicate, s.pressure, providerKey+":"+modelKey, pressureReservationRequested(opts)); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -353,10 +367,27 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			if shard == nil {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate)
+			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate, s.pressure, providerKey+":"+modelKey, pressureReservationRequested(opts))
 			if picked != nil {
 				return picked, providerKey, nil
 			}
+		}
+		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
+	}
+
+	if strategy == schedulerStrategyLeastPressure {
+		entries := make([]*scheduledAuth, 0)
+		for _, shard := range candidateShards {
+			if shard == nil {
+				continue
+			}
+			if bucket := shard.readyByPriority[bestPriority]; bucket != nil {
+				entries = append(entries, bucket.all.flat...)
+			}
+		}
+		picked := pickLeastPressureScheduled(entries, s.pressure, strings.Join(normalized, ",")+":"+modelKey, predicate, time.Now(), pressureReservationRequested(opts))
+		if picked != nil && picked.meta != nil {
+			return picked.auth, picked.meta.providerKey, nil
 		}
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
 	}
@@ -443,7 +474,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		if shard == nil {
 			continue
 		}
-		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate)
+		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate, nil, "", false)
 		if picked == nil {
 			continue
 		}
@@ -784,7 +815,7 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 }
 
 // pickReadyLocked selects the next ready auth from the highest available priority bucket.
-func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool, pressure *credentialPressureTracker, cursorKey string, reserve bool) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -793,7 +824,7 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 	if !okPriority {
 		return nil
 	}
-	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
+	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate, pressure, cursorKey, reserve)
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.
@@ -829,7 +860,7 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 
 // pickReadyAtPriorityLocked selects the next ready auth from a specific priority bucket.
 // The caller must ensure expired entries are already promoted when needed.
-func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool, pressure *credentialPressureTracker, cursorKey string, reserve bool) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -847,6 +878,8 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		picked = view.pickFirst(predicate)
 	case schedulerStrategyWeightedRoundRobin:
 		picked = view.pickWeighted(predicate)
+	case schedulerStrategyLeastPressure:
+		picked = pickLeastPressureScheduled(view.flat, pressure, cursorKey, predicate, time.Now(), reserve)
 	default:
 		picked = view.pickRoundRobin(predicate)
 	}
@@ -854,6 +887,31 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		return nil
 	}
 	return picked.auth
+}
+
+func pickLeastPressureScheduled(entries []*scheduledAuth, tracker *credentialPressureTracker, cursorKey string, predicate func(*scheduledAuth) bool, now time.Time, reserve bool) *scheduledAuth {
+	if tracker == nil {
+		return nil
+	}
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	auths := make([]*Auth, 0, len(entries))
+	byID := make(map[string]*scheduledAuth, len(entries))
+	for _, entry := range entries {
+		if entry == nil || entry.auth == nil || (predicate != nil && !predicate(entry)) {
+			continue
+		}
+		auths = append(auths, entry.auth)
+		byID[entry.auth.ID] = entry
+	}
+	selected := pickLeastPressureAuth(auths, tracker, cursorKey, nil, now)
+	if selected == nil {
+		return nil
+	}
+	if reserve {
+		tracker.inFlight[selected.ID]++
+	}
+	return byID[selected.ID]
 }
 
 func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int, predicate func(*scheduledAuth) bool) int {

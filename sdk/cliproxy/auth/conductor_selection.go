@@ -42,7 +42,7 @@ func (m *Manager) hasPluginScheduler() bool {
 
 func isBuiltInSelector(selector Selector) bool {
 	switch selector.(type) {
-	case *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector:
+	case *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector, *LeastPressureSelector:
 		return true
 	default:
 		return false
@@ -1071,7 +1071,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.Lock()
 		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
 			current.EnsureIndex()
-			authCopy = current.Clone()
+			indexed := current.Clone()
+			indexed.pressureLease = authCopy.pressureLease
+			authCopy = indexed
 		}
 		m.mu.Unlock()
 	}
@@ -1286,11 +1288,16 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
 	authCopy := selected.Clone()
+	if _, ok := m.selector.(*LeastPressureSelector); ok && pressureReservationRequested(opts) {
+		attachCredentialPressureLease(authCopy, m.scheduler.pressure)
+	}
 	if !selected.indexAssigned {
 		m.mu.Lock()
 		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
 			current.EnsureIndex()
-			authCopy = current.Clone()
+			indexed := current.Clone()
+			indexed.pressureLease = authCopy.pressureLease
+			authCopy = indexed
 		}
 		m.mu.Unlock()
 	}
@@ -1396,7 +1403,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.Lock()
 		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
 			current.EnsureIndex()
-			authCopy = current.Clone()
+			indexed := current.Clone()
+			indexed.pressureLease = authCopy.pressureLease
+			authCopy = indexed
 		}
 		m.mu.Unlock()
 	}
@@ -1475,6 +1484,9 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	authCopy := selected.Clone()
+	if _, ok := m.selector.(*LeastPressureSelector); ok && pressureReservationRequested(opts) {
+		attachCredentialPressureLease(authCopy, m.scheduler.pressure)
+	}
 	if !selected.indexAssigned {
 		m.mu.Lock()
 		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {

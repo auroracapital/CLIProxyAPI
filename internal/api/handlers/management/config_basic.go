@@ -282,6 +282,8 @@ func (h *Handler) PutForceModelPrefix(c *gin.Context) {
 func normalizeRoutingStrategy(strategy string) (string, bool) {
 	normalized := strings.ToLower(strings.TrimSpace(strategy))
 	switch normalized {
+	case "least-pressure", "leastpressure", "least-loaded", "leastloaded", "lp":
+		return "least-pressure", true
 	case "", "round-robin", "roundrobin", "rr":
 		return "round-robin", true
 	case "weighted-round-robin", "weightedroundrobin", "wrr":

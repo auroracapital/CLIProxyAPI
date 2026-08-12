@@ -71,6 +71,39 @@ func streamErrorResult(headers http.Header, err error) *cliproxyexecutor.StreamR
 	}
 }
 
+func wrapPressureStream(ctx context.Context, result *cliproxyexecutor.StreamResult, lease *credentialPressureLease) *cliproxyexecutor.StreamResult {
+	if lease == nil {
+		return result
+	}
+	if result == nil || result.Chunks == nil {
+		lease.Release()
+		return result
+	}
+	out := make(chan cliproxyexecutor.StreamChunk)
+	go func() {
+		defer close(out)
+		defer lease.Release()
+		for {
+			select {
+			case <-ctx.Done():
+				discardStreamChunks(result.Chunks)
+				return
+			case chunk, ok := <-result.Chunks:
+				if !ok {
+					return
+				}
+				select {
+				case <-ctx.Done():
+					discardStreamChunks(result.Chunks)
+					return
+				case out <- chunk:
+				}
+			}
+		}
+	}()
+	return &cliproxyexecutor.StreamResult{Headers: result.Headers, Chunks: out}
+}
+
 func validateStreamResult(result *cliproxyexecutor.StreamResult, err error) (*cliproxyexecutor.StreamResult, error) {
 	if err != nil {
 		return result, err

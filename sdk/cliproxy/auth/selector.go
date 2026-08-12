@@ -37,12 +37,167 @@ type WeightedRoundRobinSelector struct {
 	maxKeys int
 }
 
+// LeastPressureSelector chooses the credential with the lowest observed pressure.
+// Pressure combines current in-flight executions, configured credential weight as
+// capacity, and the recent failure ratio. Manager execution paths reserve the
+// selected credential atomically; direct Pick calls remain observation-only.
+type LeastPressureSelector struct {
+	pressure credentialPressureTracker
+}
+
+type credentialPressureTracker struct {
+	mu       sync.Mutex
+	inFlight map[string]int64
+	cursors  map[string]int
+}
+
+type credentialPressureLease struct {
+	tracker *credentialPressureTracker
+	authID  string
+	once    sync.Once
+}
+
+func (l *credentialPressureLease) Release() {
+	if l == nil || l.tracker == nil || l.authID == "" {
+		return
+	}
+	l.once.Do(func() {
+		l.tracker.mu.Lock()
+		defer l.tracker.mu.Unlock()
+		if current := l.tracker.inFlight[l.authID]; current > 1 {
+			l.tracker.inFlight[l.authID] = current - 1
+		} else {
+			delete(l.tracker.inFlight, l.authID)
+		}
+	})
+}
+
+func (s *LeastPressureSelector) tracker() *credentialPressureTracker {
+	if s == nil {
+		return nil
+	}
+	return &s.pressure
+}
+
+func recentRequestTotals(auth *Auth, now time.Time) (success, failed int64) {
+	if auth == nil {
+		return 0, 0
+	}
+	currentBucketID := recentRequestBucketID(now)
+	for i := 0; i < recentRequestBucketCount; i++ {
+		bucketID := currentBucketID - int64(i)
+		bucket := auth.recentRequests.buckets[recentRequestBucketIndex(bucketID)]
+		if bucket.bucketID != bucketID {
+			continue
+		}
+		success += bucket.success
+		failed += bucket.failed
+	}
+	return success, failed
+}
+
+func credentialPressureScore(auth *Auth, inFlight int64, now time.Time) int64 {
+	capacity := authWeight(auth)
+	if capacity <= 0 {
+		capacity = credentialweight.Default
+	}
+	// One unit of concurrency pressure is comparable to a 100% recent failure
+	// ratio. A small prior prevents a single historical failure from permanently
+	// dominating an otherwise idle credential.
+	concurrencyPressure := inFlight * 1000 / capacity
+	success, failed := recentRequestTotals(auth, now)
+	failurePressure := failed * 1000 / (success + failed + 10)
+	return saturatingAddInt64(concurrencyPressure, failurePressure)
+}
+
+func pickLeastPressureAuth(auths []*Auth, tracker *credentialPressureTracker, cursorKey string, predicate func(*Auth) bool, now time.Time) *Auth {
+	if tracker == nil {
+		return nil
+	}
+	if tracker.inFlight == nil {
+		tracker.inFlight = make(map[string]int64)
+	}
+	if tracker.cursors == nil {
+		tracker.cursors = make(map[string]int)
+	}
+	if _, exists := tracker.cursors[cursorKey]; !exists && len(tracker.cursors) >= 4096 {
+		tracker.cursors = make(map[string]int)
+	}
+	bestScore := int64(math.MaxInt64)
+	ties := make([]*Auth, 0, len(auths))
+	for _, candidate := range auths {
+		if candidate == nil || (predicate != nil && !predicate(candidate)) {
+			continue
+		}
+		score := credentialPressureScore(candidate, tracker.inFlight[candidate.ID], now)
+		switch {
+		case score < bestScore:
+			bestScore = score
+			ties = append(ties[:0], candidate)
+		case score == bestScore:
+			ties = append(ties, candidate)
+		}
+	}
+	if len(ties) == 0 {
+		return nil
+	}
+	cursor := tracker.cursors[cursorKey]
+	index := normalizeCursor(cursor, len(ties))
+	tracker.cursors[cursorKey] = cursor + 1
+	return ties[index]
+}
+
 type smoothWeightedState struct {
 	current map[string]int64
 	weights map[string]int64
 }
 
 type weightedSelectorStateModelKey struct{}
+
+func requestPressureReservation(opts cliproxyexecutor.Options) cliproxyexecutor.Options {
+	if len(opts.Metadata) == 0 {
+		opts.Metadata = make(map[string]any)
+	} else {
+		copyMetadata := make(map[string]any, len(opts.Metadata)+1)
+		for key, value := range opts.Metadata {
+			copyMetadata[key] = value
+		}
+		opts.Metadata = copyMetadata
+	}
+	opts.Metadata[pressureReservationMetadataKey] = true
+	return opts
+}
+
+const pressureReservationMetadataKey = "cliproxy_internal_pressure_reservation"
+
+func pressureReservationRequested(opts cliproxyexecutor.Options) bool {
+	requested, _ := opts.Metadata[pressureReservationMetadataKey].(bool)
+	return requested
+}
+
+func attachCredentialPressureLease(auth *Auth, tracker *credentialPressureTracker) {
+	if auth == nil || tracker == nil || auth.ID == "" {
+		return
+	}
+	auth.pressureLease = &credentialPressureLease{tracker: tracker, authID: auth.ID}
+}
+
+func releaseCredentialPressure(auth *Auth) {
+	if auth == nil || auth.pressureLease == nil {
+		return
+	}
+	auth.pressureLease.Release()
+	auth.pressureLease = nil
+}
+
+func takeCredentialPressureLease(auth *Auth) *credentialPressureLease {
+	if auth == nil {
+		return nil
+	}
+	lease := auth.pressureLease
+	auth.pressureLease = nil
+	return lease
+}
 
 func withWeightedSelectorStateModel(ctx context.Context, selector Selector, routeModel string) context.Context {
 	if _, ok := selector.(*WeightedRoundRobinSelector); !ok || strings.TrimSpace(routeModel) == "" {
@@ -448,6 +603,29 @@ func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model s
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available with positive weight"}
 	}
 	return picked, nil
+}
+
+// Pick selects the least-pressured available credential without reserving it.
+// Manager execution paths use the scheduler's atomic reserve variant instead.
+func (s *LeastPressureSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	_ = opts
+	available, errAvailable := getAvailableAuths(positiveWeightAuths(auths), provider, model, time.Now())
+	if errAvailable != nil {
+		return nil, errAvailable
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
+	tracker := s.tracker()
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	selected := pickLeastPressureAuth(available, tracker, provider+":"+canonicalModelKey(model), nil, time.Now())
+	if selected == nil {
+		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+	}
+	if pressureReservationRequested(opts) {
+		tracker.inFlight[selected.ID]++
+		selected.pressureLease = &credentialPressureLease{tracker: tracker, authID: selected.ID}
+	}
+	return selected, nil
 }
 
 func (s *smoothWeightedState) prepare(weights map[string]int64) {
