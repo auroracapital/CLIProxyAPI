@@ -385,23 +385,26 @@ Only one owner edits a given file set at a time. The primary agent owns integrat
 
 Current verified evidence, 2026-08-13:
 
-- Exact head `01ac81b3` passes `go test ./... -count=1`, repository-wide `go vet ./...`, and focused race tests for `sdk/api/handlers`, `sdk/cliproxy/auth`, and `internal/pluginhost`.
-- The controller compiles and 89 reconciler tests, 44 schema-v3 verifier tests, and seven endpoint-artifact tests pass, including delayed watcher publication, candidate token rotation, generation-fenced rollback/restaging, response-loss recovery, failed-refresh mutation handling, automatic rollback-failure recovery, and two-run first-install recovery.
+- Exact code head `01ac81b3` passes `go test ./... -count=1`, repository-wide `go vet ./...`, and focused race tests for `sdk/api/handlers`, `sdk/cliproxy/auth`, and `internal/pluginhost`; subsequent heads change only Python tooling, units, workflow coverage, and documentation.
+- The controller and operations tooling compile and 93 reconciler/staging tests, 47 schema-v3 verifier/canary tests, and seven endpoint-artifact tests pass, including delayed watcher publication, candidate token rotation, generation-fenced rollback/restaging, response-loss recovery, failed-refresh mutation handling, automatic rollback-failure recovery, and two-run first-install recovery.
 - Durable reconcile mutations use opaque HMAC generations and compare-and-swap; status fails closed without a generation-capable file store, probe endpoints cannot admit directly, and committed-but-unpublished CAS results are explicit.
 - File credential saves/deletes participate in the shared per-seat lock protocol; atomic writes fsync the file and directory, reject symlink-substituted staging, and watcher deletes retain a runtime seat only after validating the authoritative replacement generation/provider.
 - Formatting, `git diff --check`, workflow YAML parsing, and changed-file credential-pattern scan pass.
 - A static `linux/arm64` server build from exact head `01ac81b3` succeeds with SHA-256 `fdcdf95707c8f1e58a6fa2fdde9c4304c1e64072a3493eed61b108b4134e7b12`.
 - The combined focused Go, vet, reconciler, verifier, and artifact critical path completes locally in 20 seconds, below the one-minute target.
-- Gitleaks scans all 37 feature commits with zero findings.
+- Gitleaks scans all feature commits and current deltas with zero findings.
 - The service and timer templates pass `systemd-analyze verify` on the arm64 hub with systemd 255.
 - Live topology remains nginx `:8317` to loopback CLIProxyAPI `:8319`; the Mac has no local CLIProxy/crsproxy listener or refresh process.
 - The live hub runs `v7.2.130-smart-router.12` (`ec71bc70`) at both base and front paths with SHA-256 `d4a386a31afb4f59ee0d4739d64df53531bc8b37369270dc3b02f1a4f0bff939`. nginx, crsproxy, and the separate auto-router are active; `:8317` rejects `model:auto`, and `:8321` rejects named models.
 - The account reconciler from exact head `01ac81b3` is deployed with SHA-256 `0da01c916d480d7746c580e0c9fc0877ad6c11137d6955af72723cce5b92eee4`. Its timer is enabled and active, and a real single-seat canary produced the complete `refresh -> probe -> readmission` journal chain without a manual toggle.
+- The exact-identity credential stager from `b251f67c` is deployed with SHA-256 `1971b93367eecf356345ff9b2e74ebae7f825bf0c2e25e7a79d22e805f036c36`; it joins the reconciler's path lock and can replace a stale candidate only after both credentials validate as the same unique inventory seat.
 - Exactly-once account-attempt telemetry now pairs one `account_selection/selected` event with one terminal `account_attempt` event across ordinary, count, stream, pooled-model, Home, retry, rejection, cancellation, and panic paths. Request faults and cancellations are excluded from recent/total failure pressure.
 - A protected, privacy-safe `/v0/management/routing-pressure` endpoint exposes only active opaque seat buckets and capacity-normalized in-flight pressure. The strengthened fault fixture proves a live one-seat/one-lease/1000-milli snapshot during a held cancellation and zero residual leases afterward.
 - The exact deployed binary passed eight loopback-only fault cases: 429 with `Retry-After`, 503, timeout, cancellation, stream bootstrap failure, post-payload terminal error, invalid/policy rejection, and model/provider fallback. The result proves distinct-account retries, safe fallback, zero cancellation retry, zero post-output replay, and zero leaked leases.
 - A front-only rollback rehearsal stopped `cliproxy-auto-router.service`: `:8321` returned 502 while explicit-model `:8317` remained 200; restarting the front restored both endpoints to 200.
 - A disposable schema-v3 preflight passes every integrity, topology, telemetry, reconciler, journal, and single-owner check except `all_desired_accounts_ready`; the declarative pool is currently six ready and fourteen `auth_required` seats.
+- The hash-bound soak traffic generator is deployed with SHA-256 `93567774901c501a3c3ef0f558d51285bf47e0f05f849a133c75c3248e3ce562`; its hardened systemd one-shot succeeds and selects `gpt-5.6-sol`. The verifier is SHA-256 `c5fbf32f66363cbd915cb66cc95bfae9968576b2c27a67dca5b5e7a4ff233c65` and fails closed if the five-minute canary timer stops, fails, is disabled, or drifts.
+- Both the canary and production-soak timers remain deliberately disabled and inactive until the complete pool is ready. The current disposable preflight fails only `all_desired_accounts_ready`, `canary_timer_active`, and `canary_timer_enabled`.
 
 Remaining production evidence:
 
