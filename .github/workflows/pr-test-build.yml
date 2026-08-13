@@ -88,6 +88,7 @@ jobs:
           done
           test -x tools/smart-router/verify_active_fault_fixture.sh
           test -x tools/smart-router/verify_active_fault_fixture_inside.sh
+          python3 -m py_compile tools/smart-router/verify_production_soak.py
       - name: Build and run loopback-only active fault fixture
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o test-output ./cmd/server
@@ -142,10 +143,13 @@ jobs:
       - name: Verify reconciler and systemd units
         run: |
           python -m compileall -q tools/account-reconciler/reconciler.py tools/account-reconciler/tests
+          python -m py_compile tools/smart-router/verify_production_soak.py
           python -m unittest discover -s tools/account-reconciler/tests -q
           systemd-analyze verify \
             tools/account-reconciler/systemd/cliproxy-account-reconciler.service \
-            tools/account-reconciler/systemd/cliproxy-account-reconciler.timer
+            tools/account-reconciler/systemd/cliproxy-account-reconciler.timer \
+            tools/smart-router/systemd/cliproxy-smart-router-soak.service \
+            tools/smart-router/systemd/cliproxy-smart-router-soak.timer
 
       - name: Scan changed files for credential-shaped material
         run: |
