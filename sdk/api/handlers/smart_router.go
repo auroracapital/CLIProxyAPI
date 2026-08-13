@@ -73,7 +73,7 @@ type smartRouteMessage struct {
 
 var smartTaskKeywords = map[string][]string{
 	smartTaskCode: {
-		"bug", "debug", "code", "compile", "compiler", "function", "class", "repository", "refactor", "test", "typescript", "javascript", "python", "golang", "rust", "sql", "pull request", "stack trace",
+		"bug", "debug", "code", "compile", "compiler", "function", "class", "repository", "refactor", "test", "typescript", "javascript", "python", "golang", "rust", "sql", "pull request", "stack trace", "concurrency-safe", "concurrency safe",
 	},
 	smartTaskReasoning: {
 		"prove", "proof", "theorem", "calculate", "equation", "math", "logic", "reason step", "optimization", "probability", "algorithm complexity",
@@ -227,6 +227,14 @@ func classifySmartRoute(rawJSON []byte) smartRouteRequirements {
 	}
 	scores := make(map[string]int, len(smartTaskKeywords))
 	lower := strings.ToLower(features)
+	// Implementation phrasing is code only when paired with an engineering
+	// artifact or programming concern. This catches natural prompts such as
+	// "implement a concurrency-safe Go router" without classifying generic
+	// implementation plans as code.
+	if (strings.Contains(lower, "implement ") || strings.Contains(lower, "implementation ")) &&
+		containsAny(lower, "router", "api", "endpoint", "service", "cli", "library", "module", "concurrency", "thread-safe", "thread safe") {
+		scores[smartTaskCode]++
+	}
 	for task, keywords := range smartTaskKeywords {
 		for _, keyword := range keywords {
 			if strings.Contains(lower, keyword) {
@@ -247,6 +255,15 @@ func classifySmartRoute(rawJSON []byte) smartRouteRequirements {
 		requirements.ClassifierReason = "keyword_" + bestTask
 	}
 	return requirements
+}
+
+func containsAny(value string, fragments ...string) bool {
+	for _, fragment := range fragments {
+		if strings.Contains(value, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 type smartModalities struct {

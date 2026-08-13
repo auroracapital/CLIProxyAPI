@@ -507,6 +507,20 @@ func TestSmartRouterClassifierDoesNotTreatPromptModelNamesAsRoutingCommands(t *t
 	}
 }
 
+func TestSmartRouterClassifierRecognizesNaturalImplementationPrompt(t *testing.T) {
+	requirements := classifySmartRoute([]byte(`{"messages":[{"role":"user","content":"Implement a concurrency-safe Go router."}]}`))
+	if requirements.TaskClass != smartTaskCode || requirements.ClassifierReason != "keyword_code" {
+		t.Fatalf("classification = %#v, want code", requirements)
+	}
+}
+
+func TestSmartRouterClassifierDoesNotTreatGenericImplementationPlanAsCode(t *testing.T) {
+	requirements := classifySmartRoute([]byte(`{"messages":[{"role":"user","content":"Draft an implementation plan for the new hiring policy."}]}`))
+	if requirements.TaskClass != smartTaskWriting {
+		t.Fatalf("task class = %q, want writing", requirements.TaskClass)
+	}
+}
+
 func TestSmartRouterClassifierBoundsTextFeatures(t *testing.T) {
 	prefix := strings.Repeat("rewrite this email politely ", 4096)
 	tail := strings.Repeat("debug code stack trace ", 4096)
