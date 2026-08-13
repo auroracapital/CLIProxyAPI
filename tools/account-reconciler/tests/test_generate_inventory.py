@@ -130,7 +130,7 @@ class GenerateInventoryTests(unittest.TestCase):
             with self.assertRaises(generator.GenerationError):
                 generator.generate_inventory(api, auth_dir, candidate_dir)
 
-    def test_disabled_seat_uses_active_same_provider_model(self):
+    def test_disabled_seat_uses_registered_same_provider_model(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             auth_dir, candidate_dir, api, _, _ = self.build_pool(root, count=2)
@@ -152,7 +152,7 @@ class GenerateInventoryTests(unittest.TestCase):
             by_index = {seat["auth_index"]: seat for seat in inventory["seats"]}
             self.assertEqual(by_index[new_index]["model"], "claude-haiku-4-5-20251001")
 
-    def test_disabled_seat_without_active_same_provider_model_fails_closed(self):
+    def test_disabled_seat_without_registered_same_provider_model_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             auth_dir, candidate_dir, api, _, _ = self.build_pool(root, count=1)

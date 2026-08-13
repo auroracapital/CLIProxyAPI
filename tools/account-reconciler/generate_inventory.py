@@ -208,7 +208,7 @@ def generate_inventory(
 
     status_by_index: dict[str, dict[str, Any]] = {}
     models_by_index: dict[str, list[dict[str, Any]]] = {}
-    provider_active_models: dict[str, set[str]] = {}
+    provider_registered_models: dict[str, set[str]] = {}
     for status in status_rows:
         auth_index = _nonempty_string(status.get("auth_index"))
         provider = _nonempty_string(status.get("provider")).lower()
@@ -220,14 +220,13 @@ def generate_inventory(
             raise GenerationError("runtime desired-seat inventory is incomplete")
         if _nonempty_string(row.get("provider")).lower() != provider or row.get("runtime_only") is True:
             raise GenerationError("runtime desired-seat metadata does not match")
-        if _status_is_active(status):
-            name = _nonempty_string(row.get("name"))
-            if not name:
-                raise GenerationError("runtime desired-seat path is ambiguous")
-            models = api.models(name, auth_index)
-            models_by_index[auth_index] = models
-            registered = {_nonempty_string(model.get("id")) for model in models}
-            provider_active_models.setdefault(provider, set()).update(registered - {""})
+        name = _nonempty_string(row.get("name"))
+        if not name:
+            raise GenerationError("runtime desired-seat path is ambiguous")
+        models = api.models(name, auth_index)
+        models_by_index[auth_index] = models
+        registered = {_nonempty_string(model.get("id")) for model in models}
+        provider_registered_models.setdefault(provider, set()).update(registered - {""})
     if set(by_index) != set(status_by_index):
         raise GenerationError("runtime desired-seat inventories differ")
 
@@ -261,7 +260,9 @@ def generate_inventory(
         if _status_is_active(status):
             model = _select_probe_model(provider, models_by_index[auth_index])
         else:
-            peer_models = [{"id": model} for model in provider_active_models.get(provider, set())]
+            # Registry membership proves that the provider/model translation
+            # path exists; health is proven only by the later exact-seat probe.
+            peer_models = [{"id": model} for model in provider_registered_models.get(provider, set())]
             model = _select_probe_model(provider, peer_models)
         seats.append(
             {
