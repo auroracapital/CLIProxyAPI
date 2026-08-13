@@ -41,6 +41,7 @@ var logFieldOrder = []string{
 	"routing_schema_version", "routing_stage", "routing_mode", "routing_task", "routing_score_version",
 	"routing_model", "routing_provider", "routing_reason", "routing_outcome", "routing_attempt",
 	"routing_candidate_count", "routing_duration_ms", "routing_selector", "routing_shadow_match", "routing_seat_bucket", "routing_predicted_seat_bucket",
+	"routing_request_bucket",
 }
 
 var quotedLogFields = map[string]struct{}{

@@ -377,7 +377,7 @@ func (h *BaseAPIHandler) applyModelRouter(ctx context.Context, handlerType, mode
 		}
 	}
 	if smart, ok := h.smartRoute(modelName, rawJSON); ok {
-		emitSmartRouteDecision(smart, h.routingObserver())
+		emitSmartRouteDecision(ctx, smart, h.routingObserver())
 		if smart.Mode == "shadow" {
 			return decision
 		}

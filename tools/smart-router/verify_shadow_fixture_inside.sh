@@ -186,7 +186,7 @@ required = {
     "routing_score_version", "routing_model", "routing_provider", "routing_reason",
     "routing_outcome", "routing_attempt", "routing_candidate_count",
     "routing_duration_ms", "routing_selector", "routing_shadow_match",
-    "routing_seat_bucket", "routing_predicted_seat_bucket",
+    "routing_seat_bucket", "routing_predicted_seat_bucket", "routing_request_bucket",
 }
 for event in events:
     missing = required.difference(event)
@@ -219,6 +219,16 @@ for prediction in predictions:
         raise SystemExit(f"invalid opaque seat buckets: {prediction}")
     if (actual == predicted) != (prediction.get("routing_shadow_match") == "true"):
         raise SystemExit(f"shadow comparison is inconsistent: {prediction}")
+    if not re.fullmatch(r"r1_[0-9a-f]{8}", prediction.get("routing_request_bucket", "")):
+        raise SystemExit(f"invalid opaque request bucket: {prediction}")
+
+decision_bucket = decision.get("routing_request_bucket", "")
+if not re.fullmatch(r"r1_[0-9a-f]{8}", decision_bucket):
+    raise SystemExit(f"invalid semantic request bucket: {decision}")
+if decision_bucket != predictions[0].get("routing_request_bucket"):
+    raise SystemExit("semantic decision and first account prediction are not correlated")
+if decision_bucket == predictions[1].get("routing_request_bucket"):
+    raise SystemExit("distinct requests reused an opaque request bucket")
 
 for forbidden in ("fixture-client", "Bearer", "@", "/auths/"):
     if any(forbidden in line for line in lines):

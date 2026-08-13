@@ -1,6 +1,10 @@
 package executor
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"fmt"
 	"strings"
 	"time"
 	"unicode"
@@ -26,9 +30,33 @@ type RoutingEvent struct {
 	ShadowMatch         bool
 	SeatBucket          string
 	PredictedSeatBucket string
+	RequestBucket       string
 }
 
 const routingEventSchemaVersion = 1
+
+var routingRequestBucketKey, routingRequestBucketEnabled = newRoutingRequestBucketKey()
+
+func newRoutingRequestBucketKey() ([32]byte, bool) {
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		return key, false
+	}
+	return key, true
+}
+
+// RoutingRequestBucket returns a process-local opaque correlation bucket. It
+// is stable only for the process lifetime and cannot reveal the request ID.
+func RoutingRequestBucket(requestID string) string {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" || !routingRequestBucketEnabled {
+		return ""
+	}
+	digest := hmac.New(sha256.New, routingRequestBucketKey[:])
+	_, _ = digest.Write([]byte("cliproxy-routing-request-v1\x00"))
+	_, _ = digest.Write([]byte(requestID))
+	return fmt.Sprintf("r1_%x", digest.Sum(nil)[:4])
+}
 
 var routingEventEnums = map[string]map[string]struct{}{
 	"stage":    values("model_decision", "model_attempt", "stream_attempt", "count_attempt", "account_selection", "account_prediction"),
@@ -64,6 +92,7 @@ func NormalizeRoutingEvent(event RoutingEvent) RoutingEvent {
 	event.Provider = routingIdentifier(event.Provider)
 	event.SeatBucket = routingSeatBucket(event.SeatBucket)
 	event.PredictedSeatBucket = routingSeatBucket(event.PredictedSeatBucket)
+	event.RequestBucket = routingRequestBucket(event.RequestBucket)
 	if event.Attempt < 0 {
 		event.Attempt = 0
 	} else if event.Attempt > 100 {
@@ -80,6 +109,18 @@ func NormalizeRoutingEvent(event RoutingEvent) RoutingEvent {
 		event.Duration = time.Hour
 	}
 	return event
+}
+
+func routingRequestBucket(value string) string {
+	if len(value) != 11 || !strings.HasPrefix(value, "r1_") {
+		return ""
+	}
+	for _, r := range value[3:] {
+		if !(unicode.IsDigit(r) || r >= 'a' && r <= 'f') {
+			return ""
+		}
+	}
+	return value
 }
 
 func routingSeatBucket(value string) string {

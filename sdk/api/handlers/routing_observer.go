@@ -76,6 +76,7 @@ func routingLogFields(event coreexecutor.RoutingEvent) (log.Fields, bool) {
 		"routing_shadow_match":          normalized.ShadowMatch,
 		"routing_seat_bucket":           normalized.SeatBucket,
 		"routing_predicted_seat_bucket": normalized.PredictedSeatBucket,
+		"routing_request_bucket":        normalized.RequestBucket,
 	}, true
 }
 

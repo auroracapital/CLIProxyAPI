@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -570,13 +571,14 @@ func TestShadowLeastPressurePredictsWithoutChangingProductionSelection(t *testin
 	idle := &Auth{ID: "auth-b", Provider: "gemini", Status: StatusActive}
 	selector.pressure.inFlight = map[string]int64{busy.ID: 10}
 	observer := &routingEventCapture{}
+	requestCtx := logging.WithRequestID(context.Background(), "private-request-id")
 	opts := cliproxyexecutor.Options{RoutingObserver: observer}
 
-	first, errFirst := selector.Pick(context.Background(), "gemini", "model", opts, []*Auth{busy, idle})
+	first, errFirst := selector.Pick(requestCtx, "gemini", "model", opts, []*Auth{busy, idle})
 	if errFirst != nil {
 		t.Fatal(errFirst)
 	}
-	second, errSecond := selector.Pick(context.Background(), "gemini", "model", opts, []*Auth{busy, idle})
+	second, errSecond := selector.Pick(requestCtx, "gemini", "model", opts, []*Auth{busy, idle})
 	if errSecond != nil {
 		t.Fatal(errSecond)
 	}
@@ -604,6 +606,9 @@ func TestShadowLeastPressurePredictsWithoutChangingProductionSelection(t *testin
 	}
 	if events[0].Provider != busy.Provider || events[1].Provider != idle.Provider || events[0].CandidateCount != 2 || events[1].CandidateCount != 2 {
 		t.Fatalf("shadow provider/candidate telemetry = %#v", events)
+	}
+	if events[0].RequestBucket == "" || events[0].RequestBucket != events[1].RequestBucket || strings.Contains(events[0].RequestBucket, "private") {
+		t.Fatalf("shadow request buckets = %#v", events)
 	}
 }
 

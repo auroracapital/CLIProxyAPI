@@ -122,6 +122,7 @@ func TestLogFormatterPrintsRoutingFields(t *testing.T) {
 	entry.Data["routing_shadow_match"] = true
 	entry.Data["routing_seat_bucket"] = "h1_0123456789abcdef"
 	entry.Data["routing_predicted_seat_bucket"] = "h1_fedcba9876543210"
+	entry.Data["routing_request_bucket"] = "r1_01234567"
 
 	formatted, errFormat := (&LogFormatter{}).Format(entry)
 	if errFormat != nil {
@@ -146,6 +147,7 @@ func TestLogFormatterPrintsRoutingFields(t *testing.T) {
 		"routing_shadow_match=true",
 		"routing_seat_bucket=h1_0123456789abcdef",
 		"routing_predicted_seat_bucket=h1_fedcba9876543210",
+		"routing_request_bucket=r1_01234567",
 	} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("formatted line %q missing %s", line, want)

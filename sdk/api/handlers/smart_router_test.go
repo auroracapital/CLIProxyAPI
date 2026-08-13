@@ -217,6 +217,7 @@ func TestStructuredRoutingObserverDoesNotLogSensitiveRequestData(t *testing.T) {
 		"routing_shadow_match=false",
 		"routing_seat_bucket=",
 		"routing_predicted_seat_bucket=",
+		"routing_request_bucket=",
 	} {
 		if !strings.Contains(logged, want) {
 			t.Fatalf("routing log %q missing %s", logged, want)
@@ -300,6 +301,36 @@ func TestRoutingLogFieldsOnlyAcceptOpaqueSeatBuckets(t *testing.T) {
 	}
 	if fields["routing_predicted_seat_bucket"] != "" {
 		t.Fatalf("routingLogFields(valid bucket) unexpected predicted bucket: %#v", fields)
+	}
+}
+
+func TestRoutingLogFieldsOnlyAcceptOpaqueRequestBuckets(t *testing.T) {
+	for _, value := range []string{"raw-request-id", "patient@example.com", "r1_nothex"} {
+		fields, ok := routingLogFields(coreexecutor.RoutingEvent{
+			Stage: "model_decision", Mode: "shadow", Outcome: "selected", RequestBucket: value,
+		})
+		if !ok || fields["routing_request_bucket"] != "" {
+			t.Fatalf("routingLogFields(%q) = %#v, %v; want empty request bucket", value, fields, ok)
+		}
+	}
+	fields, ok := routingLogFields(coreexecutor.RoutingEvent{
+		Stage: "model_decision", Mode: "shadow", Outcome: "selected", RequestBucket: "r1_01234567",
+	})
+	if !ok || fields["routing_request_bucket"] != "r1_01234567" {
+		t.Fatalf("routingLogFields(valid request bucket) = %#v, %v", fields, ok)
+	}
+}
+
+func TestSmartRouteAndAccountEventsShareOpaqueRequestBucket(t *testing.T) {
+	ctx := logging.WithRequestID(context.Background(), "private-request-id")
+	observer := &captureRoutingObserver{}
+	registerSmartRouterModel(t, "request-bucket-client", "codex", "request-bucket-model", nil)
+	emitSmartRouteDecision(ctx, smartRouteDecision{
+		Mode: "shadow", TaskClass: "code", ScoreVersion: smartRouteScoreVersion,
+		Models: []string{"request-bucket-model"}, Reason: "keyword_code",
+	}, observer)
+	if len(observer.events) != 1 || observer.events[0].RequestBucket == "" || strings.Contains(observer.events[0].RequestBucket, "private") {
+		t.Fatalf("smart route request bucket = %#v", observer.events)
 	}
 }
 

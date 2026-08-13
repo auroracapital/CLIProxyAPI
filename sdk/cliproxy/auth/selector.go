@@ -26,9 +26,9 @@ import (
 	cliproxysession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
 )
 
-var routingSeatBucketKey, routingSeatBucketEnabled = newRoutingSeatBucketKey()
+var routingTelemetryBucketKey, routingTelemetryBucketEnabled = newRoutingTelemetryBucketKey()
 
-func newRoutingSeatBucketKey() ([32]byte, bool) {
+func newRoutingTelemetryBucketKey() ([32]byte, bool) {
 	var key [32]byte
 	if _, err := rand.Read(key[:]); err != nil {
 		return key, false
@@ -38,10 +38,10 @@ func newRoutingSeatBucketKey() ([32]byte, bool) {
 
 func routingSeatBucket(authID string) string {
 	authID = strings.TrimSpace(authID)
-	if authID == "" || !routingSeatBucketEnabled {
+	if authID == "" || !routingTelemetryBucketEnabled {
 		return ""
 	}
-	digest := hmac.New(sha256.New, routingSeatBucketKey[:])
+	digest := hmac.New(sha256.New, routingTelemetryBucketKey[:])
 	_, _ = digest.Write([]byte("cliproxy-routing-seat-v1\x00"))
 	_, _ = digest.Write([]byte(authID))
 	return fmt.Sprintf("h1_%x", digest.Sum(nil)[:8])
@@ -878,6 +878,7 @@ func (s *ShadowLeastPressureSelector) Pick(ctx context.Context, provider, model 
 			ShadowMatch:         predicted != nil && predicted.ID == actual.ID,
 			SeatBucket:          routingSeatBucket(actual.ID),
 			PredictedSeatBucket: predictedRoutingSeatBucket(predicted),
+			RequestBucket:       cliproxyexecutor.RoutingRequestBucket(logging.GetRequestID(ctx)),
 		})
 	}
 	return actual, nil

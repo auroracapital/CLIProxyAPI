@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"sort"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"unicode"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
@@ -147,7 +149,7 @@ func (h *BaseAPIHandler) smartRoute(model string, rawJSON []byte) (smartRouteDec
 	return decision, true
 }
 
-func emitSmartRouteDecision(decision smartRouteDecision, observer coreexecutor.RoutingObserver) {
+func emitSmartRouteDecision(ctx context.Context, decision smartRouteDecision, observer coreexecutor.RoutingObserver) {
 	selected := ""
 	if len(decision.Models) > 0 {
 		selected = decision.Models[0]
@@ -162,6 +164,7 @@ func emitSmartRouteDecision(decision smartRouteDecision, observer coreexecutor.R
 		Outcome:        map[bool]string{true: "selected", false: "unavailable"}[selected != ""],
 		CandidateCount: len(decision.Models),
 		Duration:       decision.Duration,
+		RequestBucket:  coreexecutor.RoutingRequestBucket(logging.GetRequestID(ctx)),
 	})
 }
 
