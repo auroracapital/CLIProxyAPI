@@ -710,6 +710,7 @@ class Controller:
         max_seats: int = 0,
         only_healthy: bool = False,
         force_probe: bool = False,
+        provider: str = "",
     ):
         self.inventory = inventory
         self.api = api
@@ -724,6 +725,7 @@ class Controller:
         self.max_seats = max_seats
         self.only_healthy = only_healthy
         self.force_probe = force_probe
+        self.provider = provider.strip().lower()
 
     def run(self) -> int:
         with file_lock(self.runtime_dir / "locks" / "global.lock") as global_acquired:
@@ -734,6 +736,8 @@ class Controller:
             validate_complete_inventory(self.inventory, remote)
             by_index = {row["auth_index"]: row for row in remote}
             seats = list(self.inventory.seats)
+            if self.provider:
+                seats = [seat for seat in seats if seat.provider == self.provider]
             if self.only_healthy:
                 seats = [seat for seat in seats if self._remote_credential_is_healthy(by_index[seat.auth_index])]
             if self.max_seats > 0:
@@ -977,6 +981,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-seats", type=int, default=0, help="after full validation, reconcile at most this many seats")
     parser.add_argument("--only-healthy", action="store_true", help="select canary seats from currently healthy runtime credentials")
     parser.add_argument("--force-probe", action="store_true", help="atomically normalize and exact-probe selected seats even when healthy")
+    parser.add_argument("--provider", default="", help="after full validation, reconcile only this provider")
     return parser.parse_args(argv)
 
 
@@ -987,6 +992,9 @@ def main(argv: list[str] | None = None) -> int:
         inventory = load_inventory(args.inventory)
         if args.max_seats < 0 or args.max_seats > len(inventory.seats):
             raise InventoryError("max seats is invalid")
+        provider = args.provider.strip().lower()
+        if provider and provider not in {seat.provider for seat in inventory.seats}:
+            raise InventoryError("provider filter is invalid")
         api = APIAdapter(args.base_url, os.environ.get("CLIPROXY_RECONCILER_API_KEY", ""))
         controller = Controller(
             inventory,
@@ -998,6 +1006,7 @@ def main(argv: list[str] | None = None) -> int:
             max_seats=args.max_seats,
             only_healthy=args.only_healthy,
             force_probe=args.force_probe,
+            provider=provider,
             logger=logger,
         )
         return controller.run()

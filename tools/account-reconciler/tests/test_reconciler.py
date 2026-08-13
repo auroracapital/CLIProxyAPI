@@ -522,6 +522,7 @@ class ControllerTests(unittest.TestCase):
             controller = ImmediateReloadController(
                 reconciler.Inventory(seats), api, root / "state", root / "run", HMAC_KEY,
                 apply=True, max_seats=1, only_healthy=True, force_probe=True,
+                provider="claude",
                 logger=reconciler.configure_logging(io.StringIO()), now=lambda: NOW,
             )
             self.assertEqual(controller.run(), 0)
