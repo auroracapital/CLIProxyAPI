@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	smartRouteScoreVersion = "v1"
+	smartRouteScoreVersion = "v2"
 	defaultAutoFallbacks   = 3
 	maxAutoFallbacks       = 5
 )
@@ -128,10 +128,10 @@ func (h *BaseAPIHandler) smartRoute(model string, rawJSON []byte) (smartRouteDec
 	if limit > maxAutoFallbacks {
 		limit = maxAutoFallbacks
 	}
-	models, providers := eligibleSmartModels(configured, requirements, limit)
+	models, providers := eligibleSmartModels(configured, requirements, autoCfg.Policy, limit)
 	if len(models) == 0 && !hasConfiguredTaskSlate && len(configured) == 0 {
-		models = rankAvailableSmartModels(requirements, limit)
-		providers = eligibleProvidersForModels(models, requirements)
+		models = rankAvailableSmartModels(requirements, autoCfg.Policy, limit)
+		providers = eligibleProvidersForModels(models, requirements, autoCfg.Policy)
 	}
 	if len(models) == 0 {
 		decision.TaskClass = requirements.TaskClass
@@ -345,11 +345,11 @@ func jsonPathContains(raw []byte, path, expected string) bool {
 	return strings.EqualFold(strings.TrimSpace(gjson.GetBytes(raw, path).String()), expected)
 }
 
-func eligibleSmartModels(configured []string, requirements smartRouteRequirements, limit int) ([]string, map[string][]string) {
+func eligibleSmartModels(configured []string, requirements smartRouteRequirements, policy internalconfig.AutoRoutingPolicyConfig, limit int) ([]string, map[string][]string) {
 	registryRef := registry.GetGlobalRegistry()
 	seen := make(map[string]struct{}, len(configured))
-	out := make([]string, 0, limit)
-	providersByModel := make(map[string][]string, limit)
+	out := make([]string, 0, len(configured))
+	providersByModel := make(map[string][]string, len(configured))
 	for _, candidate := range configured {
 		candidate = strings.TrimSpace(candidate)
 		if candidate == "" || isAutoModel(candidate) {
@@ -359,34 +359,38 @@ func eligibleSmartModels(configured []string, requirements smartRouteRequirement
 			continue
 		}
 		seen[candidate] = struct{}{}
-		providers := eligibleSmartProviders(registryRef, candidate, requirements)
+		providers := eligibleSmartProviders(registryRef, candidate, requirements, policy)
 		if len(providers) == 0 {
 			continue
 		}
 		out = append(out, candidate)
 		providersByModel[candidate] = providers
-		if len(out) >= limit {
-			break
-		}
 	}
 	if len(out) == 0 {
 		return nil, nil
 	}
+	applySmartModelPolicy(out, policy)
+	if len(out) > limit {
+		for _, model := range out[limit:] {
+			delete(providersByModel, model)
+		}
+		out = out[:limit]
+	}
 	return out, providersByModel
 }
 
-func eligibleProvidersForModels(models []string, requirements smartRouteRequirements) map[string][]string {
+func eligibleProvidersForModels(models []string, requirements smartRouteRequirements, policy internalconfig.AutoRoutingPolicyConfig) map[string][]string {
 	registryRef := registry.GetGlobalRegistry()
 	out := make(map[string][]string, len(models))
 	for _, model := range models {
-		if providers := eligibleSmartProviders(registryRef, model, requirements); len(providers) > 0 {
+		if providers := eligibleSmartProviders(registryRef, model, requirements, policy); len(providers) > 0 {
 			out[model] = providers
 		}
 	}
 	return out
 }
 
-func eligibleSmartProviders(registryRef *registry.ModelRegistry, model string, requirements smartRouteRequirements) []string {
+func eligibleSmartProviders(registryRef *registry.ModelRegistry, model string, requirements smartRouteRequirements, policy internalconfig.AutoRoutingPolicyConfig) []string {
 	if registryRef == nil {
 		return nil
 	}
@@ -401,6 +405,7 @@ func eligibleSmartProviders(registryRef *registry.ModelRegistry, model string, r
 			out = append(out, provider)
 		}
 	}
+	applySmartProviderPolicy(out, policy)
 	return out
 }
 
@@ -413,7 +418,7 @@ func providerHasAvailableModel(registryRef *registry.ModelRegistry, provider, mo
 	return false
 }
 
-func rankAvailableSmartModels(requirements smartRouteRequirements, limit int) []string {
+func rankAvailableSmartModels(requirements smartRouteRequirements, policy internalconfig.AutoRoutingPolicyConfig, limit int) []string {
 	infos := registry.GetGlobalRegistry().GetAvailableModelInfos()
 	type scored struct {
 		id    string
@@ -421,12 +426,23 @@ func rankAvailableSmartModels(requirements smartRouteRequirements, limit int) []
 	}
 	candidates := make([]scored, 0, len(infos))
 	for _, info := range infos {
-		if info == nil || isSpecializedGenerationModel(info.ID) || len(eligibleSmartProviders(registry.GetGlobalRegistry(), info.ID, requirements)) == 0 {
+		if info == nil || isSpecializedGenerationModel(info.ID) || len(eligibleSmartProviders(registry.GetGlobalRegistry(), info.ID, requirements, policy)) == 0 {
 			continue
 		}
 		candidates = append(candidates, scored{id: info.ID, score: smartModelTaskScore(info, requirements.TaskClass)})
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
+		preference := smartModelPreference(policy)
+		if len(preference) > 0 {
+			iRank, iPreferred := smartPreferenceRank(preference, candidates[i].id)
+			jRank, jPreferred := smartPreferenceRank(preference, candidates[j].id)
+			if iPreferred != jPreferred {
+				return iPreferred
+			}
+			if iPreferred && iRank != jRank {
+				return iRank < jRank
+			}
+		}
 		if candidates[i].score == candidates[j].score {
 			return candidates[i].id < candidates[j].id
 		}
@@ -440,6 +456,57 @@ func rankAvailableSmartModels(requirements smartRouteRequirements, limit int) []
 		}
 	}
 	return out
+}
+
+func applySmartModelPolicy(models []string, policy internalconfig.AutoRoutingPolicyConfig) {
+	preference := smartModelPreference(policy)
+	if len(preference) == 0 {
+		return
+	}
+	sort.SliceStable(models, func(i, j int) bool {
+		iRank, iPreferred := smartPreferenceRank(preference, models[i])
+		jRank, jPreferred := smartPreferenceRank(preference, models[j])
+		if iPreferred != jPreferred {
+			return iPreferred
+		}
+		return iPreferred && iRank < jRank
+	})
+}
+
+func smartModelPreference(policy internalconfig.AutoRoutingPolicyConfig) []string {
+	switch strings.ToLower(strings.TrimSpace(policy.Objective)) {
+	case "quality":
+		return policy.QualityModels
+	case "cost":
+		return policy.CostModels
+	case "latency":
+		return policy.LatencyModels
+	default:
+		return nil
+	}
+}
+
+func applySmartProviderPolicy(providers []string, policy internalconfig.AutoRoutingPolicyConfig) {
+	if !strings.EqualFold(strings.TrimSpace(policy.ProviderStrategy), "priority") || len(policy.ProviderPriority) == 0 {
+		return
+	}
+	sort.SliceStable(providers, func(i, j int) bool {
+		iRank, iPreferred := smartPreferenceRank(policy.ProviderPriority, providers[i])
+		jRank, jPreferred := smartPreferenceRank(policy.ProviderPriority, providers[j])
+		if iPreferred != jPreferred {
+			return iPreferred
+		}
+		return iPreferred && iRank < jRank
+	})
+}
+
+func smartPreferenceRank(preference []string, candidate string) (int, bool) {
+	for index, preferred := range preference {
+		if strings.EqualFold(strings.TrimSpace(preferred), strings.TrimSpace(candidate)) {
+			return index, true
+		}
+	}
+	return 0, false
 }
 
 func smartModelSatisfies(info *registry.ModelInfo, requirements smartRouteRequirements) bool {

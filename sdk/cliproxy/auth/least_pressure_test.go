@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"net/http"
 	"sync"
@@ -231,7 +232,7 @@ func TestLeastPressurePrefersCapacityAndRecentSuccess(t *testing.T) {
 	}}
 
 	tracker.mu.Lock()
-	selected := pickLeastPressureAuth([]*Auth{lowCapacity, highCapacity}, tracker, "gemini:model", nil, now)
+	selected := pickLeastPressureAuth([]*Auth{lowCapacity, highCapacity}, tracker, "gemini:model", "model", nil, now)
 	tracker.mu.Unlock()
 	if selected == nil || selected.ID != highCapacity.ID {
 		t.Fatalf("selected = %#v, want higher-capacity recently-successful credential", selected)
@@ -247,7 +248,7 @@ func TestLeastPressurePredictsBurstAndRefreshExpiryRisk(t *testing.T) {
 	}
 	tracker := &credentialPressureTracker{}
 	tracker.mu.Lock()
-	picked := pickLeastPressureAuth([]*Auth{bursty, steady}, tracker, "burst", nil, now)
+	picked := pickLeastPressureAuth([]*Auth{bursty, steady}, tracker, "burst", "model", nil, now)
 	tracker.mu.Unlock()
 	if picked == nil || picked.ID != steady.ID {
 		t.Fatalf("burst selection = %#v, want steady", picked)
@@ -256,7 +257,7 @@ func TestLeastPressurePredictsBurstAndRefreshExpiryRisk(t *testing.T) {
 	fresh := &Auth{ID: "fresh", Metadata: map[string]any{"expires_at": now.Add(time.Hour).Unix()}}
 	expiring := &Auth{ID: "expiring", Metadata: map[string]any{"expires_at": now.Add(5 * time.Minute).Unix()}}
 	tracker.mu.Lock()
-	picked = pickLeastPressureAuth([]*Auth{expiring, fresh}, tracker, "expiry", nil, now)
+	picked = pickLeastPressureAuth([]*Auth{expiring, fresh}, tracker, "expiry", "model", nil, now)
 	tracker.mu.Unlock()
 	if picked == nil || picked.ID != fresh.ID {
 		t.Fatalf("expiry selection = %#v, want fresh", picked)
@@ -266,9 +267,145 @@ func TestLeastPressurePredictsBurstAndRefreshExpiryRisk(t *testing.T) {
 func TestLeastPressureScoreSaturatesWithoutOverflow(t *testing.T) {
 	auth := &Auth{ID: "saturated"}
 	auth.recentRequests.buckets[0] = recentRequestBucket{bucketID: recentRequestBucketID(time.Now()), success: math.MaxInt64, failed: math.MaxInt64}
-	score := credentialPressureScore(auth, math.MaxInt64, time.Now())
+	score := credentialPressureScore(auth, "model", math.MaxInt64, credentialPressureObservation{
+		latencyEWMA:         time.Duration(math.MaxInt64),
+		consecutiveFailures: math.MaxInt64,
+	}, time.Now())
 	if score < 0 {
 		t.Fatalf("overflowed pressure score = %d", score)
+	}
+}
+
+func TestLeastPressurePrefersLowerLatencyAndResetsFailureStreak(t *testing.T) {
+	tracker := &credentialPressureTracker{observations: map[string]credentialPressureObservation{
+		"slow": {latencyEWMA: 5 * time.Second},
+		"fast": {latencyEWMA: 50 * time.Millisecond},
+	}}
+	slow := &Auth{ID: "slow"}
+	fast := &Auth{ID: "fast"}
+
+	tracker.mu.Lock()
+	picked := pickLeastPressureAuth([]*Auth{slow, fast}, tracker, "latency", "model", nil, time.Now())
+	tracker.mu.Unlock()
+	if picked == nil || picked.ID != fast.ID {
+		t.Fatalf("latency selection = %#v, want fast", picked)
+	}
+
+	tracker.observeOutcome(fast.ID, false)
+	tracker.observeOutcome(fast.ID, false)
+	tracker.observeOutcome(fast.ID, true)
+	tracker.mu.Lock()
+	observation := tracker.observations[fast.ID]
+	tracker.mu.Unlock()
+	if observation.consecutiveFailures != 0 {
+		t.Fatalf("consecutive failures = %d, want reset after success", observation.consecutiveFailures)
+	}
+}
+
+func TestLeastPressurePenalizesFailureStreakAndQuotaRecoveryRisk(t *testing.T) {
+	now := time.Now()
+	model := "model"
+	tracker := &credentialPressureTracker{observations: map[string]credentialPressureObservation{
+		"flaky": {consecutiveFailures: 3},
+	}}
+	flaky := &Auth{ID: "flaky"}
+	steady := &Auth{ID: "steady"}
+	tracker.mu.Lock()
+	picked := pickLeastPressureAuth([]*Auth{flaky, steady}, tracker, "failures", model, nil, now)
+	tracker.mu.Unlock()
+	if picked == nil || picked.ID != steady.ID {
+		t.Fatalf("failure selection = %#v, want steady", picked)
+	}
+
+	recovering := &Auth{ID: "recovering", ModelStates: map[string]*ModelState{
+		model: {Quota: QuotaState{BackoffLevel: 4}},
+	}}
+	clean := &Auth{ID: "clean"}
+	tracker.mu.Lock()
+	picked = pickLeastPressureAuth([]*Auth{recovering, clean}, tracker, "quota", model, nil, now)
+	tracker.mu.Unlock()
+	if picked == nil || picked.ID != clean.ID {
+		t.Fatalf("quota recovery selection = %#v, want clean", picked)
+	}
+
+	authLevelRecovering := &Auth{ID: "auth-level-recovering", Quota: QuotaState{BackoffLevel: 2}, ModelStates: map[string]*ModelState{
+		model: {},
+	}}
+	tracker.mu.Lock()
+	picked = pickLeastPressureAuth([]*Auth{authLevelRecovering, clean}, tracker, "auth-quota", model, nil, now)
+	tracker.mu.Unlock()
+	if picked == nil || picked.ID != clean.ID {
+		t.Fatalf("auth-level quota selection = %#v, want clean", picked)
+	}
+}
+
+func TestLeastPressureLeaseRecordsBoundedLatencyEWMA(t *testing.T) {
+	tracker := &credentialPressureTracker{inFlight: map[string]int64{"auth": 1}}
+	lease := &credentialPressureLease{tracker: tracker, authID: "auth", startedAt: time.Now().Add(-100 * time.Millisecond)}
+	lease.Release()
+	lease.Release()
+	tracker.mu.Lock()
+	observation := tracker.observations["auth"]
+	leaked := tracker.inFlight["auth"]
+	tracker.mu.Unlock()
+	if leaked != 0 {
+		t.Fatalf("in-flight = %d, want released", leaked)
+	}
+	if observation.latencyEWMA < 50*time.Millisecond || observation.latencyEWMA > time.Second {
+		t.Fatalf("latency EWMA = %s, want measured request duration", observation.latencyEWMA)
+	}
+}
+
+func TestLeastPressureObservationMapIsBounded(t *testing.T) {
+	tracker := &credentialPressureTracker{observations: make(map[string]credentialPressureObservation, maxCredentialPressureObservations)}
+	for index := 0; index < maxCredentialPressureObservations; index++ {
+		tracker.observations[fmt.Sprintf("auth-%d", index)] = credentialPressureObservation{latencyEWMA: time.Second}
+	}
+	tracker.observeOutcome("new-auth", false)
+	tracker.mu.Lock()
+	count := len(tracker.observations)
+	_, found := tracker.observations["new-auth"]
+	tracker.mu.Unlock()
+	if !found || count != 1 {
+		t.Fatalf("observations count=%d found_new=%t, want bounded reset", count, found)
+	}
+}
+
+func TestLeastPressureManagerOutcomeObservationIsRaceSafe(t *testing.T) {
+	manager := newLeastPressureManager(t, &leastPressureExecutor{})
+	const observations = 200
+	var wait sync.WaitGroup
+	for index := 0; index < observations; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			manager.observeCredentialPressureOutcome(Result{AuthID: "auth-a", Success: index%3 == 0})
+		}(index)
+	}
+	wait.Wait()
+	tracker := manager.selector.(*LeastPressureSelector).tracker()
+	tracker.mu.Lock()
+	_, found := tracker.observations["auth-a"]
+	tracker.mu.Unlock()
+	if !found {
+		t.Fatal("expected pressure outcome observation")
+	}
+}
+
+func TestLeastPressureDoesNotPenalizeRequestOrCancellationFaults(t *testing.T) {
+	manager := newLeastPressureManager(t, &leastPressureExecutor{})
+	for _, resultErr := range []*Error{
+		{HTTPStatus: http.StatusBadRequest, Message: "invalid request"},
+		{Code: requestScopedErrorCode, Message: "client canceled"},
+	} {
+		manager.observeCredentialPressureOutcome(Result{AuthID: "auth-a", Success: false, Error: resultErr})
+	}
+	tracker := manager.selector.(*LeastPressureSelector).tracker()
+	tracker.mu.Lock()
+	observation := tracker.observations["auth-a"]
+	tracker.mu.Unlock()
+	if observation.consecutiveFailures != 0 {
+		t.Fatalf("request-scoped failures changed streak to %d", observation.consecutiveFailures)
 	}
 }
 

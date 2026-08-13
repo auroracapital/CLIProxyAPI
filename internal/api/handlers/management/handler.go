@@ -49,6 +49,7 @@ type Handler struct {
 	authManager             *coreauth.Manager
 	tokenStore              coreauth.Store
 	localPassword           string
+	reconcilerPassword      string
 	allowRemoteOverride     bool
 	envSecret               string
 	logDir                  string
@@ -71,6 +72,8 @@ type configReloadSnapshot struct {
 func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager) *Handler {
 	envSecret, _ := os.LookupEnv("MANAGEMENT_PASSWORD")
 	envSecret = strings.TrimSpace(envSecret)
+	reconcilerPassword, _ := os.LookupEnv("CLIPROXY_RECONCILER_API_KEY")
+	reconcilerPassword = strings.TrimSpace(reconcilerPassword)
 
 	h := &Handler{
 		cfg:                 cfg,
@@ -78,6 +81,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		failedAttempts:      make(map[string]*attemptInfo),
 		authManager:         manager,
 		tokenStore:          sdkAuth.GetTokenStore(),
+		reconcilerPassword:  reconcilerPassword,
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
 	}
@@ -235,6 +239,10 @@ func (h *Handler) reloadConfigAfterManagementSaveAsync(ctx context.Context, snap
 
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
 func (h *Handler) SetLocalPassword(password string) { h.localPassword = password }
+
+func (h *Handler) HasReconcilerPassword() bool {
+	return h != nil && h.reconcilerPassword != ""
+}
 
 // SetLogDirectory updates the directory where main.log should be looked up.
 func (h *Handler) SetLogDirectory(dir string) {

@@ -60,30 +60,69 @@ func (cfg *Config) NormalizeAutoRoutingConfig() {
 		auto.MaxFallbacks = 5
 	}
 	auto.DefaultModels = normalizeAutoRoutingModels(auto.DefaultModels)
+	if len(auto.TaskModels) > 0 {
+		allowedTasks := map[string]struct{}{
+			"code": {}, "reasoning": {}, "research": {}, "agent": {},
+			"multimodal": {}, "writing": {}, "general": {},
+		}
+		tasks := make(map[string][]string, len(auto.TaskModels))
+		for rawTask, models := range auto.TaskModels {
+			task := strings.ToLower(strings.TrimSpace(rawTask))
+			if _, ok := allowedTasks[task]; !ok {
+				continue
+			}
+			models = normalizeAutoRoutingModels(models)
+			if len(models) > 0 {
+				tasks[task] = models
+			}
+		}
+		auto.TaskModels = tasks
+	}
 	if len(auto.TaskModels) == 0 {
 		auto.TaskModels = nil
+	}
+	normalizeAutoRoutingPolicy(&auto.Policy)
+}
+
+func normalizeAutoRoutingPolicy(policy *AutoRoutingPolicyConfig) {
+	if policy == nil {
 		return
 	}
-	allowedTasks := map[string]struct{}{
-		"code": {}, "reasoning": {}, "research": {}, "agent": {},
-		"multimodal": {}, "writing": {}, "general": {},
+	policy.Objective = strings.ToLower(strings.TrimSpace(policy.Objective))
+	switch policy.Objective {
+	case "quality", "cost", "latency":
+	default:
+		policy.Objective = "balanced"
 	}
-	tasks := make(map[string][]string, len(auto.TaskModels))
-	for rawTask, models := range auto.TaskModels {
-		task := strings.ToLower(strings.TrimSpace(rawTask))
-		if _, ok := allowedTasks[task]; !ok {
+	policy.QualityModels = normalizeAutoRoutingModels(policy.QualityModels)
+	policy.CostModels = normalizeAutoRoutingModels(policy.CostModels)
+	policy.LatencyModels = normalizeAutoRoutingModels(policy.LatencyModels)
+	policy.ProviderStrategy = strings.ToLower(strings.TrimSpace(policy.ProviderStrategy))
+	if policy.ProviderStrategy != "priority" {
+		policy.ProviderStrategy = "health"
+	}
+	policy.ProviderPriority = normalizeAutoRoutingProviders(policy.ProviderPriority)
+}
+
+func normalizeAutoRoutingProviders(providers []string) []string {
+	seen := make(map[string]struct{}, len(providers))
+	out := make([]string, 0, len(providers))
+	for _, rawProvider := range providers {
+		provider := strings.TrimSpace(rawProvider)
+		key := strings.ToLower(provider)
+		if provider == "" {
 			continue
 		}
-		models = normalizeAutoRoutingModels(models)
-		if len(models) > 0 {
-			tasks[task] = models
+		if _, exists := seen[key]; exists {
+			continue
 		}
+		seen[key] = struct{}{}
+		out = append(out, provider)
 	}
-	if len(tasks) == 0 {
-		auto.TaskModels = nil
-		return
+	if len(out) == 0 {
+		return nil
 	}
-	auto.TaskModels = tasks
+	return out
 }
 
 func normalizeAutoRoutingModels(models []string) []string {

@@ -863,6 +863,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 	}
 	m.mu.Unlock()
+	m.observeCredentialPressureOutcome(result)
 	if m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
 	}
@@ -926,9 +927,29 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 		authSnapshot = auth.Clone()
 	}
 	m.mu.Unlock()
+	m.observeCredentialPressureOutcome(result)
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
+}
+
+func (m *Manager) observeCredentialPressureOutcome(result Result) {
+	if m == nil || result.AuthID == "" {
+		return
+	}
+	if !result.Success && (isRequestInvalidError(result.Error) || shouldSkipCredentialCooldown(result.Error)) {
+		return
+	}
+	var tracker *credentialPressureTracker
+	m.mu.RLock()
+	switch selector := m.selector.(type) {
+	case *LeastPressureSelector:
+		tracker = selector.tracker()
+	case *ShadowLeastPressureSelector:
+		tracker = selector.tracker()
+	}
+	m.mu.RUnlock()
+	tracker.observeOutcome(result.AuthID, result.Success)
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {

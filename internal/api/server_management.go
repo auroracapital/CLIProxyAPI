@@ -24,6 +24,17 @@ func (s *Server) registerManagementRoutes() {
 	s.engine.POST("/v0/management/oauth-callback", s.managementAvailabilityMiddleware(), s.mgmt.PostOAuthCallback)
 	s.engine.GET("/v0/management/oauth-callback", s.managementAvailabilityMiddleware(), s.mgmt.GetOAuthCallback)
 
+	reconcile := s.engine.Group("/v0/management/auth-files")
+	reconcile.Use(s.managementAvailabilityMiddleware(), s.mgmt.ReconcileMiddleware())
+	{
+		reconcile.GET("/reconcile-status", s.mgmt.GetAuthReconcileStatus)
+		reconcile.GET("/reconcile-inventory", s.mgmt.GetAuthReconcileInventory)
+		reconcile.GET("/reconcile-models", s.mgmt.GetAuthReconcileModels)
+		reconcile.POST("/reconcile-state", s.mgmt.SetAuthReconcileState)
+		reconcile.POST("/refresh", s.mgmt.RefreshAuthCredential)
+		reconcile.POST("/probe", s.mgmt.ProbeAuthCredential)
+	}
+
 	mgmt := s.engine.Group("/v0/management")
 	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
 	{
@@ -163,10 +174,6 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
-		mgmt.GET("/auth-files/reconcile-status", s.mgmt.GetAuthReconcileStatus)
-		mgmt.POST("/auth-files/reconcile-state", s.mgmt.SetAuthReconcileState)
-		mgmt.POST("/auth-files/refresh", s.mgmt.RefreshAuthCredential)
-		mgmt.POST("/auth-files/probe", s.mgmt.ProbeAuthCredential)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)

@@ -385,7 +385,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 				entries = append(entries, bucket.all.flat...)
 			}
 		}
-		picked := pickLeastPressureScheduled(entries, s.pressure, strings.Join(normalized, ",")+":"+modelKey, predicate, time.Now(), pressureReservationRequested(opts))
+		picked := pickLeastPressureScheduled(entries, s.pressure, strings.Join(normalized, ",")+":"+modelKey, modelKey, predicate, time.Now(), pressureReservationRequested(opts))
 		if picked != nil && picked.meta != nil {
 			return picked.auth, picked.meta.providerKey, nil
 		}
@@ -879,7 +879,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	case schedulerStrategyWeightedRoundRobin:
 		picked = view.pickWeighted(predicate)
 	case schedulerStrategyLeastPressure:
-		picked = pickLeastPressureScheduled(view.flat, pressure, cursorKey, predicate, time.Now(), reserve)
+		picked = pickLeastPressureScheduled(view.flat, pressure, cursorKey, m.modelKey, predicate, time.Now(), reserve)
 	default:
 		picked = view.pickRoundRobin(predicate)
 	}
@@ -889,7 +889,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	return picked.auth
 }
 
-func pickLeastPressureScheduled(entries []*scheduledAuth, tracker *credentialPressureTracker, cursorKey string, predicate func(*scheduledAuth) bool, now time.Time, reserve bool) *scheduledAuth {
+func pickLeastPressureScheduled(entries []*scheduledAuth, tracker *credentialPressureTracker, cursorKey, model string, predicate func(*scheduledAuth) bool, now time.Time, reserve bool) *scheduledAuth {
 	if tracker == nil {
 		return nil
 	}
@@ -904,7 +904,7 @@ func pickLeastPressureScheduled(entries []*scheduledAuth, tracker *credentialPre
 		auths = append(auths, entry.auth)
 		byID[entry.auth.ID] = entry
 	}
-	selected := pickLeastPressureAuth(auths, tracker, cursorKey, nil, now)
+	selected := pickLeastPressureAuth(auths, tracker, cursorKey, model, nil, now)
 	if selected == nil {
 		return nil
 	}

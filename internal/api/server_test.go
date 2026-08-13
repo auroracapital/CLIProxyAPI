@@ -1304,6 +1304,47 @@ func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {
 	}
 }
 
+func TestReconcilerKeyEnablesOnlyLoopbackScopedRoutes(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	t.Setenv("CLIPROXY_RECONCILER_API_KEY", "reconciler-test-key")
+
+	server := newTestServer(t)
+	if !server.managementRoutesEnabled.Load() {
+		t.Fatal("reconciler key did not register scoped routes")
+	}
+
+	general := httptest.NewRequest(http.MethodGet, "/v0/management/config", nil)
+	general.Header.Set("Authorization", "Bearer reconciler-test-key")
+	generalRecorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(generalRecorder, general)
+	if generalRecorder.Code != http.StatusForbidden {
+		t.Fatalf("general management status=%d body=%s, want 403", generalRecorder.Code, generalRecorder.Body.String())
+	}
+
+	reconcile := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/reconcile-status", nil)
+	reconcile.RemoteAddr = "127.0.0.1:1234"
+	reconcile.Header.Set("Authorization", "Bearer reconciler-test-key")
+	reconcileRecorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(reconcileRecorder, reconcile)
+	if reconcileRecorder.Code != http.StatusOK {
+		t.Fatalf("reconcile status=%d body=%s, want 200", reconcileRecorder.Code, reconcileRecorder.Body.String())
+	}
+
+	proxied := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/reconcile-status", nil)
+	proxied.RemoteAddr = "127.0.0.1:1234"
+	proxied.Header.Set("Authorization", "Bearer reconciler-test-key")
+	proxied.Header.Set("X-Forwarded-For", "203.0.113.10")
+	proxiedRecorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(proxiedRecorder, proxied)
+	if proxiedRecorder.Code != http.StatusForbidden {
+		t.Fatalf("proxied reconcile status=%d body=%s, want 403", proxiedRecorder.Code, proxiedRecorder.Body.String())
+	}
+
+	if redisqueue.Enabled() {
+		t.Fatal("reconciler key unexpectedly enabled redis management protocol")
+	}
+}
+
 func TestOAuthCallbackRouteSkipsManagementKeyMiddleware(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 

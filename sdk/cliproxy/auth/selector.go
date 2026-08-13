@@ -64,22 +64,32 @@ func NewShadowLeastPressureSelector(fallback Selector) *ShadowLeastPressureSelec
 }
 
 type credentialPressureTracker struct {
-	mu       sync.Mutex
-	inFlight map[string]int64
-	cursors  map[string]int
+	mu           sync.Mutex
+	inFlight     map[string]int64
+	cursors      map[string]int
+	observations map[string]credentialPressureObservation
 }
 
 type credentialPressureLease struct {
-	tracker *credentialPressureTracker
-	authID  string
-	once    sync.Once
+	tracker   *credentialPressureTracker
+	authID    string
+	startedAt time.Time
+	once      sync.Once
 }
+
+type credentialPressureObservation struct {
+	latencyEWMA         time.Duration
+	consecutiveFailures int64
+}
+
+const maxCredentialPressureObservations = 4096
 
 func (l *credentialPressureLease) Release() {
 	if l == nil || l.tracker == nil || l.authID == "" {
 		return
 	}
 	l.once.Do(func() {
+		now := time.Now()
 		l.tracker.mu.Lock()
 		defer l.tracker.mu.Unlock()
 		if current := l.tracker.inFlight[l.authID]; current > 1 {
@@ -87,7 +97,56 @@ func (l *credentialPressureLease) Release() {
 		} else {
 			delete(l.tracker.inFlight, l.authID)
 		}
+		if !l.startedAt.IsZero() && now.After(l.startedAt) {
+			l.tracker.observeLatencyLocked(l.authID, now.Sub(l.startedAt))
+		}
 	})
+}
+
+func (t *credentialPressureTracker) observeLatencyLocked(authID string, latency time.Duration) {
+	if t == nil || authID == "" || latency <= 0 {
+		return
+	}
+	const maxObservedLatency = 10 * time.Minute
+	if latency > maxObservedLatency {
+		latency = maxObservedLatency
+	}
+	t.ensureObservationCapacityLocked(authID)
+	observation := t.observations[authID]
+	if observation.latencyEWMA <= 0 {
+		observation.latencyEWMA = latency
+	} else {
+		// Give the newest request 25% weight. Integer duration arithmetic keeps
+		// the hot selection path deterministic and allocation-free.
+		observation.latencyEWMA = (observation.latencyEWMA*3 + latency) / 4
+	}
+	t.observations[authID] = observation
+}
+
+func (t *credentialPressureTracker) observeOutcome(authID string, success bool) {
+	if t == nil || authID == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.ensureObservationCapacityLocked(authID)
+	observation := t.observations[authID]
+	if success {
+		observation.consecutiveFailures = 0
+	} else if observation.consecutiveFailures < math.MaxInt64 {
+		observation.consecutiveFailures++
+	}
+	t.observations[authID] = observation
+}
+
+func (t *credentialPressureTracker) ensureObservationCapacityLocked(authID string) {
+	if t.observations == nil {
+		t.observations = make(map[string]credentialPressureObservation)
+		return
+	}
+	if _, exists := t.observations[authID]; !exists && len(t.observations) >= maxCredentialPressureObservations {
+		t.observations = make(map[string]credentialPressureObservation)
+	}
 }
 
 func (s *LeastPressureSelector) tracker() *credentialPressureTracker {
@@ -121,7 +180,7 @@ func recentRequestTotals(auth *Auth, now time.Time) (success, failed int64) {
 	return success, failed
 }
 
-func credentialPressureScore(auth *Auth, inFlight int64, now time.Time) int64 {
+func credentialPressureScore(auth *Auth, model string, inFlight int64, observation credentialPressureObservation, now time.Time) int64 {
 	capacity := authWeight(auth)
 	if capacity <= 0 {
 		capacity = credentialweight.Default
@@ -136,7 +195,65 @@ func credentialPressureScore(auth *Auth, inFlight int64, now time.Time) int64 {
 	requestRatePressure := saturatingMulDiv(total, 25, capacity)
 	failurePressure := saturatingMulDiv(failed, 1000, saturatingAddInt64(total, 10))
 	expiryPressure := credentialExpiryPressure(auth, now)
-	return saturatingAddInt64(saturatingAddInt64(concurrencyPressure, requestRatePressure), saturatingAddInt64(failurePressure, expiryPressure))
+	latencyPressure := credentialLatencyPressure(observation.latencyEWMA)
+	consecutiveFailurePressure := saturatingMulDiv(observation.consecutiveFailures, 250, 1)
+	if consecutiveFailurePressure > 1000 {
+		consecutiveFailurePressure = 1000
+	}
+	quotaPressure := credentialQuotaRecoveryPressure(auth, model, now)
+	return saturatingAddInt64(
+		saturatingAddInt64(concurrencyPressure, requestRatePressure),
+		saturatingAddInt64(
+			saturatingAddInt64(failurePressure, expiryPressure),
+			saturatingAddInt64(saturatingAddInt64(latencyPressure, consecutiveFailurePressure), quotaPressure),
+		),
+	)
+}
+
+func credentialLatencyPressure(latency time.Duration) int64 {
+	if latency <= 0 {
+		return 0
+	}
+	// Ten milliseconds is one pressure point. Cap latency so an old outlier
+	// cannot permanently starve a credential after it has recovered.
+	pressure := int64(latency / (10 * time.Millisecond))
+	if pressure > 1000 {
+		return 1000
+	}
+	return pressure
+}
+
+func credentialQuotaRecoveryPressure(auth *Auth, model string, now time.Time) int64 {
+	if auth == nil {
+		return 0
+	}
+	quota := auth.Quota
+	if state := auth.ModelStates[canonicalModelKey(model)]; state != nil && quotaStateHasPressureSignal(state.Quota) {
+		quota = state.Quota
+	}
+	// Exceeded credentials with an open recovery window are hard-excluded by
+	// availability filtering. Backoff level remains a useful provider-supplied
+	// risk signal during recovery without guessing at quota providers do not
+	// expose. An explicit future recovery time adds a bounded proximity penalty.
+	pressure := int64(0)
+	if quota.BackoffLevel > 0 {
+		pressure = saturatingMulDiv(int64(quota.BackoffLevel), 100, 1)
+	}
+	if pressure > 1000 {
+		pressure = 1000
+	}
+	if !quota.NextRecoverAt.IsZero() && quota.NextRecoverAt.After(now) {
+		remaining := quota.NextRecoverAt.Sub(now)
+		const recoveryRiskWindow = 30 * time.Minute
+		if remaining < recoveryRiskWindow {
+			pressure = saturatingAddInt64(pressure, int64((recoveryRiskWindow-remaining)*500/recoveryRiskWindow))
+		}
+	}
+	return pressure
+}
+
+func quotaStateHasPressureSignal(quota QuotaState) bool {
+	return quota.Exceeded || quota.BackoffLevel > 0 || !quota.NextRecoverAt.IsZero()
 }
 
 func credentialExpiryPressure(auth *Auth, now time.Time) int64 {
@@ -168,7 +285,7 @@ func saturatingMulDiv(value, multiplier, divisor int64) int64 {
 	return value * multiplier / divisor
 }
 
-func pickLeastPressureAuth(auths []*Auth, tracker *credentialPressureTracker, cursorKey string, predicate func(*Auth) bool, now time.Time) *Auth {
+func pickLeastPressureAuth(auths []*Auth, tracker *credentialPressureTracker, cursorKey, model string, predicate func(*Auth) bool, now time.Time) *Auth {
 	if tracker == nil {
 		return nil
 	}
@@ -187,7 +304,7 @@ func pickLeastPressureAuth(auths []*Auth, tracker *credentialPressureTracker, cu
 		if candidate == nil || (predicate != nil && !predicate(candidate)) {
 			continue
 		}
-		score := credentialPressureScore(candidate, tracker.inFlight[candidate.ID], now)
+		score := credentialPressureScore(candidate, model, tracker.inFlight[candidate.ID], tracker.observations[candidate.ID], now)
 		switch {
 		case score < bestScore:
 			bestScore = score
@@ -237,7 +354,7 @@ func attachCredentialPressureLease(auth *Auth, tracker *credentialPressureTracke
 	if auth == nil || tracker == nil || auth.ID == "" {
 		return
 	}
-	auth.pressureLease = &credentialPressureLease{tracker: tracker, authID: auth.ID}
+	auth.pressureLease = &credentialPressureLease{tracker: tracker, authID: auth.ID, startedAt: time.Now()}
 }
 
 func releaseCredentialPressure(auth *Auth) {
@@ -675,13 +792,13 @@ func (s *LeastPressureSelector) Pick(ctx context.Context, provider, model string
 	tracker := s.tracker()
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
-	selected := pickLeastPressureAuth(available, tracker, provider+":"+canonicalModelKey(model), nil, time.Now())
+	selected := pickLeastPressureAuth(available, tracker, provider+":"+canonicalModelKey(model), model, nil, time.Now())
 	if selected == nil {
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
 	if pressureReservationRequested(opts) {
 		tracker.inFlight[selected.ID]++
-		selected.pressureLease = &credentialPressureLease{tracker: tracker, authID: selected.ID}
+		selected.pressureLease = &credentialPressureLease{tracker: tracker, authID: selected.ID, startedAt: time.Now()}
 	}
 	return selected, nil
 }
@@ -699,7 +816,7 @@ func (s *ShadowLeastPressureSelector) Pick(ctx context.Context, provider, model 
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	tracker := s.tracker()
 	tracker.mu.Lock()
-	predicted := predictLeastPressureAuth(available, tracker, time.Now())
+	predicted := predictLeastPressureAuth(available, tracker, model, time.Now())
 	tracker.mu.Unlock()
 
 	actual, errPick := s.fallback.Pick(ctx, provider, model, opts, auths)
@@ -716,7 +833,7 @@ func (s *ShadowLeastPressureSelector) Pick(ctx context.Context, provider, model 
 		}
 		tracker.inFlight[actual.ID]++
 		tracker.mu.Unlock()
-		actual.pressureLease = &credentialPressureLease{tracker: tracker, authID: actual.ID}
+		actual.pressureLease = &credentialPressureLease{tracker: tracker, authID: actual.ID, startedAt: time.Now()}
 	}
 	if opts.RoutingObserver != nil {
 		opts.RoutingObserver.ObserveRouting(cliproxyexecutor.NormalizeRoutingEvent(cliproxyexecutor.RoutingEvent{
@@ -733,7 +850,7 @@ func (s *ShadowLeastPressureSelector) Pick(ctx context.Context, provider, model 
 	return actual, nil
 }
 
-func predictLeastPressureAuth(auths []*Auth, tracker *credentialPressureTracker, now time.Time) *Auth {
+func predictLeastPressureAuth(auths []*Auth, tracker *credentialPressureTracker, model string, now time.Time) *Auth {
 	if tracker == nil {
 		return nil
 	}
@@ -743,7 +860,7 @@ func predictLeastPressureAuth(auths []*Auth, tracker *credentialPressureTracker,
 		if candidate == nil {
 			continue
 		}
-		score := credentialPressureScore(candidate, tracker.inFlight[candidate.ID], now)
+		score := credentialPressureScore(candidate, model, tracker.inFlight[candidate.ID], tracker.observations[candidate.ID], now)
 		if selected == nil || score < bestScore || (score == bestScore && candidate.ID < selected.ID) {
 			selected = candidate
 			bestScore = score

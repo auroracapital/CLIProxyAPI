@@ -2,14 +2,17 @@ package management
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -23,6 +26,33 @@ func requireLoopback(c *gin.Context) bool {
 		c.JSON(http.StatusForbidden, gin.H{"error": "loopback access required"})
 	}
 	return false
+}
+
+// ReconcileMiddleware authorizes the hub-local controller without enabling
+// general or remote management access. Proxy-origin requests fail before key
+// comparison even when nginx connects from loopback.
+func (h *Handler) ReconcileMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !requireLoopback(c) {
+			c.Abort()
+			return
+		}
+		provided := ""
+		if authorization := strings.TrimSpace(c.GetHeader("Authorization")); authorization != "" {
+			parts := strings.SplitN(authorization, " ", 2)
+			if len(parts) == 2 && strings.EqualFold(parts[0], "bearer") {
+				provided = strings.TrimSpace(parts[1])
+			}
+		}
+		if provided == "" {
+			provided = strings.TrimSpace(c.GetHeader("X-Management-Key"))
+		}
+		if h == nil || h.reconcilerPassword == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(h.reconcilerPassword)) != 1 {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid reconciler key"})
+			return
+		}
+		c.Next()
+	}
 }
 
 func requestHasProxyOrigin(req *http.Request) bool {
@@ -57,19 +87,81 @@ func (h *Handler) GetAuthReconcileStatus(c *gin.Context) {
 	}
 	items := make([]gin.H, 0)
 	for _, auth := range h.authManager.List() {
-		if auth == nil {
+		if !isReconcileManagedAuth(auth) {
 			continue
 		}
 		items = append(items, gin.H{
-			"auth_index":   lockedAuthIndex(auth),
-			"provider":     strings.ToLower(strings.TrimSpace(auth.Provider)),
-			"state":        auth.ReconcileState,
-			"reason":       auth.ReconcileReason,
-			"next_attempt": auth.ReconcileNextAttempt,
-			"updated_at":   auth.UpdatedAt,
+			"auth_index":        lockedAuthIndex(auth),
+			"provider":          strings.ToLower(strings.TrimSpace(auth.Provider)),
+			"credential_status": reconcileCredentialStatus(auth.Status),
+			"disabled":          auth.Disabled,
+			"unavailable":       auth.Unavailable,
+			"state":             auth.ReconcileState,
+			"reason":            auth.ReconcileReason,
+			"next_attempt":      auth.ReconcileNextAttempt,
+			"updated_at":        auth.UpdatedAt,
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"credentials": items})
+}
+
+// GetAuthReconcileInventory returns the minimum filesystem mapping required to
+// build the root-protected desired-seat inventory. The route is separately
+// protected by ReconcileMiddleware and never exposed through general telemetry.
+func (h *Handler) GetAuthReconcileInventory(c *gin.Context) {
+	if !requireLoopback(c) {
+		return
+	}
+	if h == nil || h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+	items := make([]gin.H, 0)
+	for _, auth := range h.authManager.List() {
+		if !isReconcileManagedAuth(auth) {
+			continue
+		}
+		path := strings.TrimSpace(authAttribute(auth, coreauth.AttributePath))
+		if path == "" {
+			continue
+		}
+		items = append(items, gin.H{
+			"auth_index": lockedAuthIndex(auth),
+			"provider":   strings.ToLower(strings.TrimSpace(auth.Provider)),
+			"name":       filepath.Base(path),
+			"path":       path,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"files": items})
+}
+
+func (h *Handler) GetAuthReconcileModels(c *gin.Context) {
+	if !requireLoopback(c) {
+		return
+	}
+	auth := h.reconcileAuthByIndex(c.Query("auth_index"))
+	if auth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "credential not found"})
+		return
+	}
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	items := make([]gin.H, 0, len(models))
+	for _, model := range models {
+		if model != nil && strings.TrimSpace(model.ID) != "" {
+			items = append(items, gin.H{"id": model.ID})
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"models": items})
+}
+
+func reconcileCredentialStatus(status coreauth.Status) string {
+	switch status {
+	case coreauth.StatusActive, coreauth.StatusPending, coreauth.StatusRefreshing,
+		coreauth.StatusError, coreauth.StatusDisabled:
+		return string(status)
+	default:
+		return string(coreauth.StatusUnknown)
+	}
 }
 
 func (h *Handler) SetAuthReconcileState(c *gin.Context) {
@@ -86,7 +178,7 @@ func (h *Handler) SetAuthReconcileState(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
-	auth := h.authByIndex(req.AuthIndex)
+	auth := h.reconcileAuthByIndex(req.AuthIndex)
 	if auth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "credential not found"})
 		return
@@ -110,7 +202,7 @@ func (h *Handler) RefreshAuthCredential(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
-	auth := h.authByIndex(req.AuthIndex)
+	auth := h.reconcileAuthByIndex(req.AuthIndex)
 	if auth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "credential not found"})
 		return
@@ -151,7 +243,7 @@ func (h *Handler) ProbeAuthCredential(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
-	auth := h.authByIndex(req.AuthIndex)
+	auth := h.reconcileAuthByIndex(req.AuthIndex)
 	if auth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "credential not found"})
 		return
@@ -169,4 +261,30 @@ func (h *Handler) ProbeAuthCredential(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, outcome)
+}
+
+func isReconcileManagedAuth(auth *coreauth.Auth) bool {
+	if auth == nil || auth.Metadata == nil {
+		return false
+	}
+	if auth.AuthSourceKind() != coreauth.AuthSourceFile {
+		return false
+	}
+	return !coreauth.IsConfigAPIKeyAuth(auth) && !coreauth.IsPluginVirtualAuth(auth)
+}
+
+func (h *Handler) reconcileAuthByIndex(authIndex string) *coreauth.Auth {
+	authIndex = strings.TrimSpace(authIndex)
+	if authIndex == "" || h == nil || h.authManager == nil {
+		return nil
+	}
+	for _, auth := range h.authManager.List() {
+		if !isReconcileManagedAuth(auth) {
+			continue
+		}
+		if lockedAuthIndex(auth) == authIndex {
+			return auth
+		}
+	}
+	return nil
 }

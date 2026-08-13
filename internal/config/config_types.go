@@ -252,6 +252,26 @@ type AutoRoutingConfig struct {
 	// TaskModels optionally overrides the ordered model slate for a task class.
 	// Supported task keys are code, reasoning, research, agent, multimodal, writing, and general.
 	TaskModels map[string][]string `yaml:"task-models,omitempty" json:"task-models,omitempty"`
+	// Policy optionally reorders compatible candidates. Capability checks always run first.
+	Policy AutoRoutingPolicyConfig `yaml:"policy,omitempty" json:"policy,omitempty"`
+}
+
+// AutoRoutingPolicyConfig controls soft model and provider preferences after hard filtering.
+// Ordered preference lists are deliberately operator-supplied because the runtime registry
+// does not publish comparable price or latency metadata for every provider.
+type AutoRoutingPolicyConfig struct {
+	// Objective selects the matching ordered model preference list.
+	// Supported values: balanced (default), quality, cost, and latency.
+	Objective string `yaml:"objective,omitempty" json:"objective,omitempty"`
+	// QualityModels, CostModels, and LatencyModels are ordered best-first preferences.
+	// Compatible models not listed here remain eligible after listed models.
+	QualityModels []string `yaml:"quality-models,omitempty" json:"quality-models,omitempty"`
+	CostModels    []string `yaml:"cost-models,omitempty" json:"cost-models,omitempty"`
+	LatencyModels []string `yaml:"latency-models,omitempty" json:"latency-models,omitempty"`
+	// ProviderStrategy selects provider ordering: health (default) uses live registry
+	// availability counts, while priority uses ProviderPriority before the health order.
+	ProviderStrategy string   `yaml:"provider-strategy,omitempty" json:"provider-strategy,omitempty"`
+	ProviderPriority []string `yaml:"provider-priority,omitempty" json:"provider-priority,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

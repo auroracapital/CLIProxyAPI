@@ -217,6 +217,18 @@ routing:
     # task-models:
     #   code: ["gpt-5.6-sol", "claude-sonnet-5"]
     #   reasoning: ["claude-opus-5", "gpt-5.6-sol"]
+    # Hard capability filters always run before these optional soft preferences.
+    # The balanced objective preserves the configured/task-score order. Quality,
+    # cost, and latency use their corresponding operator-supplied best-first list.
+    policy:
+      objective: balanced # balanced (default), quality, cost, latency
+      # quality-models: ["claude-opus-5", "gpt-5.6-sol"]
+      # cost-models: ["gemini-3.5-flash-low", "gpt-5.6-luna"]
+      # latency-models: ["gpt-5.6-luna", "gemini-3.5-flash-low"]
+      # health preserves the registry's live availability-count order. Priority
+      # puts listed providers first, retaining live health order for all ties.
+      provider-strategy: health # health (default), priority
+      # provider-priority: ["codex", "claude", "gemini"]
   # Privacy-safe routing telemetry is independently reversible and contains no
   # prompts, headers, auth identifiers, paths, tokens, emails, or upstream bodies.
   observability:

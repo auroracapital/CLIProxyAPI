@@ -32,6 +32,14 @@ ALLOWED_STATES = {
     "auth_required",
     "misconfigured",
 }
+ALLOWED_CREDENTIAL_STATUSES = {
+    "unknown",
+    "active",
+    "pending",
+    "refreshing",
+    "error",
+    "disabled",
+}
 ALLOWED_REASONS = {
     "none",
     "attempt_budget_exhausted",
@@ -255,6 +263,12 @@ def validate_complete_inventory(inventory: Inventory, remote: list[dict[str, Any
         provider = item.get("provider")
         if not isinstance(index, str) or not index or not isinstance(provider, str) or not provider:
             raise InventoryError("remote inventory is incomplete")
+        if item.get("state") not in ALLOWED_STATES:
+            raise InventoryError("remote lifecycle state is invalid")
+        if item.get("credential_status") not in ALLOWED_CREDENTIAL_STATUSES:
+            raise InventoryError("remote credential status is invalid")
+        if not isinstance(item.get("disabled"), bool) or not isinstance(item.get("unavailable"), bool):
+            raise InventoryError("remote availability flags are invalid")
         if index in indexed:
             raise InventoryError("remote inventory is ambiguous")
         indexed[index] = provider.strip().lower()
@@ -469,6 +483,34 @@ def validate_candidate(seat: Seat) -> dict[str, Any]:
     return value
 
 
+def validate_canonical(seat: Seat) -> dict[str, Any]:
+    """Read and validate a declared canonical credential without mutating it."""
+    if seat.canonical_path is None:
+        raise PromotionError("canonical is not configured")
+    try:
+        info = seat.canonical_path.lstat()
+    except OSError as exc:
+        raise PromotionError("canonical is unavailable") from exc
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise PromotionError("canonical must be a regular file")
+    try:
+        value = json.loads(seat.canonical_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PromotionError("canonical JSON is invalid") from exc
+    if not isinstance(value, dict):
+        raise PromotionError("canonical content is invalid")
+    if "disabled" in value and not isinstance(value["disabled"], bool):
+        raise PromotionError("canonical disabled flag is invalid")
+    provider = value.get("provider", value.get("type"))
+    if not isinstance(provider, str) or provider.strip().lower() != seat.provider:
+        raise PromotionError("canonical provider does not match")
+    if any(key not in value or value[key] in (None, "") for key in seat.required_keys):
+        raise PromotionError("canonical is missing required fields")
+    if any(str(value.get(key, "")) != expected for key, expected in seat.expected_fields):
+        raise PromotionError("canonical identity does not match")
+    return value
+
+
 def _copy_fsync(source: Path, destination: Path, exclusive: bool = False) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC | (os.O_EXCL if exclusive else os.O_TRUNC)
     fd = os.open(destination, flags, 0o600)
@@ -529,6 +571,58 @@ def promote_candidate(seat: Seat, archive_dir: Path, seat_key: str, now: dt.date
                 revert_promotion(seat, archive)
         raise PromotionError("candidate promotion failed") from exc
     finally:
+        with contextlib.suppress(FileNotFoundError):
+            temp.unlink()
+    return archive
+
+
+def normalize_canonical(seat: Seat, archive_dir: Path, seat_key: str, now: dt.datetime) -> Path:
+    """Atomically make an existing desired credential probeable.
+
+    The original bytes are archived first so watcher, refresh, probe, or
+    admission failures can restore the exact pre-normalization credential.
+    """
+    canonical = validate_canonical(seat)
+    assert seat.canonical_path is not None
+    parent_info = seat.canonical_path.parent.stat()
+    if not stat.S_ISDIR(parent_info.st_mode) or stat.S_IMODE(parent_info.st_mode) & 0o022:
+        raise PromotionError("canonical directory permissions are unsafe")
+    archive_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    archive = archive_dir / f"{seat_key}-{now.strftime('%Y%m%dT%H%M%S%fZ')}.rollback"
+    _copy_fsync(seat.canonical_path, archive, exclusive=True)
+
+    fd, temp_name = tempfile.mkstemp(prefix=".canonical-normalize-", dir=seat.canonical_path.parent)
+    temp = Path(temp_name)
+    replaced = False
+    try:
+        canonical["disabled"] = False
+        canonical["reconcile_state"] = "probing"
+        canonical.pop("reconcile_reason", None)
+        canonical.pop("reconcile_next_attempt", None)
+        os.fchmod(fd, 0o600)
+        outgoing = os.fdopen(fd, "w", encoding="utf-8")
+        fd = -1
+        with outgoing:
+            json.dump(canonical, outgoing, sort_keys=True, separators=(",", ":"))
+            outgoing.write("\n")
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+        os.replace(temp, seat.canonical_path)
+        replaced = True
+        repair_canonical_access(seat.canonical_path)
+        directory_fd = os.open(seat.canonical_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except (OSError, PromotionError) as exc:
+        if replaced:
+            with contextlib.suppress(OSError, PromotionError):
+                rollback(seat, archive)
+        raise PromotionError("canonical normalization failed") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
         with contextlib.suppress(FileNotFoundError):
             temp.unlink()
     return archive
@@ -659,20 +753,39 @@ class Controller:
         if not self.apply:
             log_event(self.logger, "seat_dry_run", seat_key=seat_key, state=state, outcome="skipped")
             return True
-        if seat.canonical_path and seat.canonical_path.exists():
+
+        canonical_exists = bool(seat.canonical_path and seat.canonical_path.exists())
+        canonical_needs_normalization = False
+        if seat.canonical_path is not None and not candidate_exists:
+            if not canonical_exists:
+                return self._fail(
+                    seat,
+                    seat_key,
+                    int(persisted.get("attempts", 0)),
+                    "candidate_invalid",
+                    "misconfigured",
+                    "failed",
+                )
             try:
-                access_repaired = repair_canonical_access(seat.canonical_path)
-                if access_repaired:
-                    self._wait_for_reload(seat.auth_index, remote.get("updated_at"))
-            except (OSError, PromotionError, APIError):
+                canonical = validate_canonical(seat)
+                info = seat.canonical_path.lstat()
+                canonical_needs_normalization = (
+                    canonical.get("disabled") is True
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_uid != os.geteuid()
+                    or info.st_gid != os.getegid()
+                    or state != "ready"
+                    or not self._remote_credential_is_healthy(remote)
+                )
+            except (OSError, PromotionError):
                 return self._fail(seat, seat_key, int(persisted.get("attempts", 0)), "candidate_invalid", "misconfigured", "failed")
-        if state == "ready" and not candidate_exists:
+        if state == "ready" and not candidate_exists and not canonical_needs_normalization:
             self._record(seat_key, "ready", "none", "skipped", persisted["attempts"], "")
             return True
-        if state == "misconfigured" and not candidate_exists:
+        if state == "misconfigured" and not candidate_exists and seat.canonical_path is None:
             self._record(seat_key, state, "none", "skipped", persisted["attempts"], "")
             return False
-        if state == "auth_required" and not candidate_exists:
+        if state == "auth_required" and not candidate_exists and seat.canonical_path is None:
             self._record(seat_key, state, "none", "skipped", persisted["attempts"], "")
             return True
         next_attempt = _parse_time(persisted.get("next_attempt", ""))
@@ -700,6 +813,21 @@ class Controller:
         if candidate_exists:
             try:
                 archive = promote_candidate(seat, self.state_dir / "rollback", seat_key, self.now())
+                promoted = True
+                promoted_updated_at = self._wait_for_reload(seat.auth_index, remote.get("updated_at"))
+            except (PromotionError, APIError):
+                if promoted and not self._rollback_and_reload(seat, archive, remote.get("updated_at")):
+                    return self._record_local_failure(
+                        seat_key,
+                        attempts,
+                        "rollback_failed",
+                        "misconfigured",
+                        "failed",
+                    )
+                return self._fail(seat, seat_key, attempts, "candidate_invalid", "misconfigured", "failed")
+        elif canonical_needs_normalization:
+            try:
+                archive = normalize_canonical(seat, self.state_dir / "rollback", seat_key, self.now())
                 promoted = True
                 promoted_updated_at = self._wait_for_reload(seat.auth_index, remote.get("updated_at"))
             except (PromotionError, APIError):
@@ -743,6 +871,16 @@ class Controller:
             if promoted and not self._rollback_and_reload(seat, archive, promoted_updated_at):
                 return self._fail(seat, seat_key, attempts, "rollback_failed", "misconfigured", "failed")
             return self._fail(seat, seat_key, attempts, "probe_retryable", "cooling", "retryable")
+
+    @staticmethod
+    def _remote_credential_is_healthy(remote: dict[str, Any]) -> bool:
+        status = remote.get("credential_status")
+        return (
+            isinstance(status, str)
+            and status.strip().lower() in {"active", "ready"}
+            and remote.get("disabled") is False
+            and remote.get("unavailable") is False
+        )
 
     def _wait_for_reload(self, auth_index: str, previous_updated_at: Any) -> Any:
         """Wait briefly for the file watcher to observe an atomic promotion."""

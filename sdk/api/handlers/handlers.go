@@ -371,6 +371,10 @@ func (h *BaseAPIHandler) autoRoutingConfig() internalconfig.AutoRoutingConfig {
 func cloneAutoRoutingConfig(src internalconfig.AutoRoutingConfig) internalconfig.AutoRoutingConfig {
 	out := src
 	out.DefaultModels = append([]string(nil), src.DefaultModels...)
+	out.Policy.QualityModels = append([]string(nil), src.Policy.QualityModels...)
+	out.Policy.CostModels = append([]string(nil), src.Policy.CostModels...)
+	out.Policy.LatencyModels = append([]string(nil), src.Policy.LatencyModels...)
+	out.Policy.ProviderPriority = append([]string(nil), src.Policy.ProviderPriority...)
 	if len(src.TaskModels) > 0 {
 		out.TaskModels = make(map[string][]string, len(src.TaskModels))
 		for task, models := range src.TaskModels {

@@ -53,7 +53,16 @@ def inventory_dict(seats: list[dict] | None = None) -> dict:
 
 class FakeAPI:
     def __init__(self, rows=None, refresh="succeeded", probe="succeeded"):
-        self.rows = rows or [{"auth_index": "index-alpha", "provider": "claude", "state": "cooling"}]
+        self.rows = rows or [
+            {
+                "auth_index": "index-alpha",
+                "provider": "claude",
+                "state": "cooling",
+                "credential_status": "error",
+                "disabled": False,
+                "unavailable": True,
+            }
+        ]
         self.refresh_outcome = refresh
         self.probe_outcome = probe
         self.calls = []
@@ -74,6 +83,20 @@ class FakeAPI:
         return self.probe_outcome
 
 
+def remote_row(**overrides):
+    row = {
+        "auth_index": "index-alpha",
+        "provider": "claude",
+        "state": "ready",
+        "credential_status": "active",
+        "disabled": False,
+        "unavailable": False,
+        "updated_at": "before",
+    }
+    row.update(overrides)
+    return row
+
+
 class FailingSetStateAPI(FakeAPI):
     def set_state(self, auth_index, state, reason="", next_attempt=""):
         self.calls.append(("set_state", auth_index, state, reason, next_attempt))
@@ -90,6 +113,27 @@ class PromotionReloadFailureController(reconciler.Controller):
         if self.reload_calls == 1:
             raise reconciler.PromotionError("reload failed")
         return "rollback-reloaded"
+
+
+class ImmediateReloadController(reconciler.Controller):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reload_calls = []
+
+    def _wait_for_reload(self, auth_index, previous_updated_at):
+        self.reload_calls.append((auth_index, previous_updated_at))
+        return f"reloaded-{len(self.reload_calls)}"
+
+
+class InspectingAPI(FakeAPI):
+    def __init__(self, canonical_path, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.canonical_path = canonical_path
+        self.probed_canonical = None
+
+    def probe(self, seat, payload):
+        self.probed_canonical = json.loads(self.canonical_path.read_text(encoding="utf-8"))
+        return super().probe(seat, payload)
 
 
 class HTTPErrorAdapter(reconciler.APIAdapter):
@@ -117,7 +161,7 @@ class InventoryTests(unittest.TestCase):
             self.assertEqual(inventory.seats[0].provider, "claude")
             reconciler.validate_complete_inventory(
                 inventory,
-                [{"auth_index": "index-alpha", "provider": "claude", "state": "ready"}],
+                [remote_row()],
             )
 
     def test_rejects_incomplete_duplicate_and_unknown_fields(self):
@@ -162,9 +206,15 @@ class InventoryTests(unittest.TestCase):
         inventory = reconciler.Inventory((reconciler.Seat("one", "claude", "m"),))
         cases = [
             [],
-            [{"auth_index": "one", "provider": "claude"}, {"auth_index": "two", "provider": "claude"}],
-            [{"auth_index": "one", "provider": "claude"}, {"auth_index": "one", "provider": "claude"}],
-            [{"auth_index": "one", "provider": "gemini"}],
+            [
+                remote_row(auth_index="one"),
+                remote_row(auth_index="two"),
+            ],
+            [
+                remote_row(auth_index="one"),
+                remote_row(auth_index="one"),
+            ],
+            [remote_row(auth_index="one", provider="gemini")],
         ]
         for rows in cases:
             with self.subTest(rows=rows), self.assertRaises(reconciler.InventoryError):
@@ -270,6 +320,116 @@ class PromotionTests(unittest.TestCase):
             self.assertEqual(json.loads(seat.canonical_path.read_text()), original)
             self.assertEqual(stat.S_IMODE(seat.canonical_path.stat().st_mode), 0o600)
 
+    def test_normalizes_disabled_canonical_and_archives_exact_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            original = {
+                "provider": "claude",
+                "refresh_token": "old",
+                "disabled": True,
+                "reconcile_state": "auth_required",
+                "reconcile_reason": "old",
+                "reconcile_next_attempt": "later",
+            }
+            write_json(seat.canonical_path, original, 0o664)
+            archive = reconciler.normalize_canonical(
+                seat, root / "state" / "rollback", "opaque-seat", NOW
+            )
+            normalized = json.loads(seat.canonical_path.read_text())
+            self.assertFalse(normalized["disabled"])
+            self.assertEqual(normalized["reconcile_state"], "probing")
+            self.assertNotIn("reconcile_reason", normalized)
+            self.assertNotIn("reconcile_next_attempt", normalized)
+            self.assertEqual(stat.S_IMODE(seat.canonical_path.stat().st_mode), 0o600)
+            self.assertEqual(json.loads(archive.read_text()), original)
+            self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o600)
+
+    def test_controller_repairs_access_normalizes_disabled_and_admits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            write_json(
+                seat.canonical_path,
+                {"provider": "claude", "refresh_token": "old", "disabled": True},
+                0o664,
+            )
+            api = InspectingAPI(
+                seat.canonical_path,
+                rows=[remote_row(credential_status="disabled", disabled=True)],
+            )
+            controller = ImmediateReloadController(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+            self.assertEqual(controller.run(), 0)
+            canonical = json.loads(seat.canonical_path.read_text())
+            self.assertFalse(canonical["disabled"])
+            self.assertEqual(canonical["reconcile_state"], "probing")
+            self.assertEqual(stat.S_IMODE(seat.canonical_path.stat().st_mode), 0o600)
+            self.assertEqual(api.probed_canonical, canonical)
+            self.assertEqual(
+                [call[2] for call in api.calls if call[0] == "set_state"],
+                ["refreshing", "probing"],
+            )
+            self.assertEqual(len(controller.reload_calls), 1)
+            seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+            self.assertEqual(controller.store.read(seat_key)["state"], "ready")
+
+    def test_controller_rolls_back_normalization_when_watcher_rejects_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            original = {"provider": "claude", "refresh_token": "old", "disabled": True}
+            write_json(seat.canonical_path, original, 0o664)
+            controller = PromotionReloadFailureController(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                FakeAPI(rows=[remote_row(credential_status="disabled", disabled=True)]),
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+            self.assertEqual(controller.run(), 1)
+            self.assertEqual(json.loads(seat.canonical_path.read_text()), original)
+            self.assertEqual(stat.S_IMODE(seat.canonical_path.stat().st_mode), 0o600)
+            self.assertEqual(controller.reload_calls, 2)
+
+    def test_controller_rolls_back_normalization_when_probe_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            original = {"provider": "claude", "refresh_token": "old", "disabled": True}
+            write_json(seat.canonical_path, original, 0o664)
+            controller = ImmediateReloadController(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                FakeAPI(
+                    rows=[remote_row(credential_status="disabled", disabled=True)],
+                    probe="retryable",
+                ),
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+            self.assertEqual(controller.run(), 1)
+            self.assertEqual(json.loads(seat.canonical_path.read_text()), original)
+            self.assertEqual(stat.S_IMODE(seat.canonical_path.stat().st_mode), 0o600)
+            self.assertEqual(len(controller.reload_calls), 2)
+
     def test_controller_rolls_back_when_pinned_probe_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -373,7 +533,7 @@ class ControllerTests(unittest.TestCase):
     def test_dry_run_does_not_persist_even_for_ready_seat(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            api = FakeAPI(rows=[{"auth_index": "index-alpha", "provider": "claude", "state": "ready"}])
+            api = FakeAPI(rows=[remote_row()])
             inventory = reconciler.Inventory((reconciler.Seat("index-alpha", "claude", "probe-model"),))
             controller = reconciler.Controller(
                 inventory,
@@ -386,6 +546,90 @@ class ControllerTests(unittest.TestCase):
             )
             self.assertEqual(controller.run(), 0)
             self.assertFalse((root / "state").exists())
+
+    def test_dry_run_does_not_normalize_or_repair_canonical_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical = root / "auths" / "canonical.json"
+            candidate = root / "auths" / "candidate.json"
+            original = {"provider": "claude", "refresh_token": "old", "disabled": True}
+            write_json(canonical, original, 0o664)
+            seat = reconciler.Seat(
+                "index-alpha", "claude", "probe-model", canonical, candidate, ("refresh_token",)
+            )
+            api = FakeAPI(rows=[remote_row(credential_status="disabled", disabled=True)])
+            controller = reconciler.Controller(
+                reconciler.Inventory((seat,)),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+            )
+            self.assertEqual(controller.run(), 0)
+            self.assertEqual(json.loads(canonical.read_text()), original)
+            self.assertEqual(stat.S_IMODE(canonical.stat().st_mode), 0o664)
+            self.assertEqual(api.calls, [("status",)])
+            self.assertFalse((root / "state").exists())
+
+    def test_healthy_ready_canonical_seat_skips_without_file_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical = root / "auths" / "canonical.json"
+            candidate = root / "auths" / "candidate.json"
+            original = {"provider": "claude", "refresh_token": "old", "disabled": False}
+            write_json(canonical, original)
+            seat = reconciler.Seat(
+                "index-alpha", "claude", "probe-model", canonical, candidate, ("refresh_token",)
+            )
+            api = FakeAPI(rows=[remote_row()])
+            controller = reconciler.Controller(
+                reconciler.Inventory((seat,)),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+            )
+            self.assertEqual(controller.run(), 0)
+            self.assertEqual(json.loads(canonical.read_text()), original)
+            self.assertEqual(api.calls, [("status",)])
+
+    def test_ready_but_unhealthy_runtime_status_triggers_reconciliation(self):
+        cases = [
+            {"credential_status": "error"},
+            {"credential_status": "pending"},
+            {"credential_status": "refreshing"},
+            {"credential_status": "disabled", "disabled": True},
+            {"credential_status": "active", "unavailable": True},
+            {"credential_status": "unknown"},
+        ]
+        for remote_overrides in cases:
+            with self.subTest(remote_overrides=remote_overrides), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                canonical = root / "auths" / "canonical.json"
+                candidate = root / "auths" / "candidate.json"
+                write_json(canonical, {"provider": "claude", "refresh_token": "old"})
+                seat = reconciler.Seat(
+                    "index-alpha", "claude", "probe-model", canonical, candidate, ("refresh_token",)
+                )
+                api = FakeAPI(rows=[remote_row(**remote_overrides)])
+                controller = ImmediateReloadController(
+                    reconciler.Inventory((seat,)),
+                    api,
+                    root / "state",
+                    root / "run",
+                    HMAC_KEY,
+                    apply=True,
+                    logger=reconciler.configure_logging(io.StringIO()),
+                    now=lambda: NOW,
+                )
+                self.assertEqual(controller.run(), 0)
+                self.assertIn(("refresh", "index-alpha"), api.calls)
+                self.assertIn(("probe", "index-alpha", "probe-model"), api.calls)
 
     def test_attempt_budget_prevents_api_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -461,7 +705,16 @@ class ControllerTests(unittest.TestCase):
             stream = io.StringIO()
             secret_index = "account-person@example.test-/private/auth.json-token"
             seat = reconciler.Seat(secret_index, "claude", "probe-model")
-            api = FakeAPI(rows=[{"auth_index": secret_index, "provider": "claude", "state": "cooling"}])
+            api = FakeAPI(
+                rows=[
+                    remote_row(
+                        auth_index=secret_index,
+                        state="cooling",
+                        credential_status="error",
+                        unavailable=True,
+                    )
+                ]
+            )
             controller = reconciler.Controller(
                 reconciler.Inventory((seat,), 3, 10, 80),
                 api,

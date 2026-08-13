@@ -60,7 +60,7 @@ func newManagementReconcileHandler(t *testing.T) (*Handler, *managementProbeExec
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.SetStore(&managementReconcileStore{})
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "private-seat-id", FileName: "/private/auth/seat.json", Provider: "gemini", Status: coreauth.StatusActive, ReconcileState: coreauth.ReconcileStateProbing, Metadata: map[string]any{"type": "gemini"}}
+	auth := &coreauth.Auth{ID: "private-seat-id", FileName: "seat.json", Provider: "gemini", Status: coreauth.StatusActive, ReconcileState: coreauth.ReconcileStateProbing, Attributes: map[string]string{coreauth.AttributePath: "/private/auth/seat.json", coreauth.AttributeSourceBackend: coreauth.AuthSourceFile}, Metadata: map[string]any{"type": "gemini"}}
 	index := auth.EnsureIndex()
 	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "gemini-probe"}})
 	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
@@ -80,6 +80,47 @@ func TestAuthReconcileEndpointsRequireLoopback(t *testing.T) {
 	h.GetAuthReconcileStatus(c)
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", recorder.Code)
+	}
+}
+
+func TestReconcileMiddlewareAcceptsOnlyLoopbackReconcilerKey(t *testing.T) {
+	h := &Handler{reconcilerPassword: "reconciler-test-key"}
+	tests := []struct {
+		name       string
+		remoteAddr string
+		headers    map[string]string
+		want       int
+	}{
+		{name: "loopback bearer", remoteAddr: "127.0.0.1:1234", headers: map[string]string{"Authorization": "Bearer reconciler-test-key"}, want: http.StatusNoContent},
+		{name: "loopback management header", remoteAddr: "[::1]:1234", headers: map[string]string{"X-Management-Key": "reconciler-test-key"}, want: http.StatusNoContent},
+		{name: "wrong key", remoteAddr: "127.0.0.1:1234", headers: map[string]string{"Authorization": "Bearer wrong"}, want: http.StatusUnauthorized},
+		{name: "remote peer", remoteAddr: "203.0.113.10:1234", headers: map[string]string{"Authorization": "Bearer reconciler-test-key"}, want: http.StatusForbidden},
+		{name: "proxy origin", remoteAddr: "127.0.0.1:1234", headers: map[string]string{"Authorization": "Bearer reconciler-test-key", "X-Forwarded-For": "203.0.113.10"}, want: http.StatusForbidden},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			router := gin.New()
+			router.Use(h.ReconcileMiddleware())
+			router.GET("/reconcile", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/reconcile", nil)
+			req.RemoteAddr = test.remoteAddr
+			for name, value := range test.headers {
+				req.Header.Set(name, value)
+			}
+			router.ServeHTTP(recorder, req)
+			if recorder.Code != test.want {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, test.want, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestReconcilerKeyDoesNotAuthorizeGeneralManagement(t *testing.T) {
+	h := &Handler{cfg: &config.Config{}, reconcilerPassword: "reconciler-test-key", failedAttempts: make(map[string]*attemptInfo)}
+	allowed, status, _ := h.AuthenticateManagementKey("127.0.0.1", true, "reconciler-test-key")
+	if allowed || status != http.StatusForbidden {
+		t.Fatalf("allowed=%t status=%d, want false/403", allowed, status)
 	}
 }
 
@@ -131,6 +172,191 @@ func TestGetAuthReconcileStatusOmitsIdentityAndPaths(t *testing.T) {
 		if strings.Contains(recorder.Body.String(), secret) {
 			t.Fatalf("response leaked %q: %s", secret, recorder.Body.String())
 		}
+	}
+	var payload struct {
+		Credentials []struct {
+			CredentialStatus string `json:"credential_status"`
+			Disabled         bool   `json:"disabled"`
+			Unavailable      bool   `json:"unavailable"`
+		} `json:"credentials"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if len(payload.Credentials) != 1 || payload.Credentials[0].CredentialStatus != "active" || payload.Credentials[0].Disabled || payload.Credentials[0].Unavailable {
+		t.Fatalf("categorical credential status = %#v", payload.Credentials)
+	}
+}
+
+func TestReconcileScopedInventoryAndModelsAreExactSeatOnly(t *testing.T) {
+	h, _, index := newManagementReconcileHandler(t)
+
+	inventoryRecorder := httptest.NewRecorder()
+	inventoryContext, _ := gin.CreateTestContext(inventoryRecorder)
+	inventoryRequest := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/reconcile-inventory", nil)
+	inventoryRequest.RemoteAddr = "127.0.0.1:1234"
+	inventoryContext.Request = inventoryRequest
+	h.GetAuthReconcileInventory(inventoryContext)
+	if inventoryRecorder.Code != http.StatusOK || !strings.Contains(inventoryRecorder.Body.String(), index) || !strings.Contains(inventoryRecorder.Body.String(), "seat.json") {
+		t.Fatalf("inventory status=%d body=%s", inventoryRecorder.Code, inventoryRecorder.Body.String())
+	}
+	if strings.Contains(inventoryRecorder.Body.String(), "private-seat-id") {
+		t.Fatalf("inventory leaked internal auth id: %s", inventoryRecorder.Body.String())
+	}
+
+	modelsRecorder := httptest.NewRecorder()
+	modelsContext, _ := gin.CreateTestContext(modelsRecorder)
+	modelsRequest := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/reconcile-models?auth_index="+index, nil)
+	modelsRequest.RemoteAddr = "127.0.0.1:1234"
+	modelsContext.Request = modelsRequest
+	h.GetAuthReconcileModels(modelsContext)
+	if modelsRecorder.Code != http.StatusOK || !strings.Contains(modelsRecorder.Body.String(), "gemini-probe") {
+		t.Fatalf("models status=%d body=%s", modelsRecorder.Code, modelsRecorder.Body.String())
+	}
+
+	missingRecorder := httptest.NewRecorder()
+	missingContext, _ := gin.CreateTestContext(missingRecorder)
+	missingRequest := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/reconcile-models?auth_index=missing", nil)
+	missingRequest.RemoteAddr = "127.0.0.1:1234"
+	missingContext.Request = missingRequest
+	h.GetAuthReconcileModels(missingContext)
+	if missingRecorder.Code != http.StatusNotFound {
+		t.Fatalf("missing models status=%d body=%s", missingRecorder.Code, missingRecorder.Body.String())
+	}
+}
+
+func TestReconcileCredentialStatusIsClosed(t *testing.T) {
+	if got := reconcileCredentialStatus(coreauth.Status("private-status")); got != "unknown" {
+		t.Fatalf("status = %q, want unknown", got)
+	}
+}
+
+func TestGetAuthReconcileStatusIncludesOnlyFileBackedDesiredSeats(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetStore(&managementReconcileStore{})
+	want := make(map[string]string, 19)
+	for i := 0; i < 19; i++ {
+		provider := "claude"
+		if i%2 == 1 {
+			provider = "codex"
+		}
+		auth := &coreauth.Auth{
+			ID:             "file-seat-" + string(rune('a'+i)),
+			FileName:       "/opt/crsproxy/auths/seat-" + string(rune('a'+i)) + ".json",
+			Provider:       provider,
+			Status:         coreauth.StatusActive,
+			ReconcileState: coreauth.ReconcileStateReady,
+			Metadata:       map[string]any{"type": provider},
+		}
+		index := auth.EnsureIndex()
+		want[index] = provider
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+	}
+	configAuth := &coreauth.Auth{
+		ID:             "config-kimi-client",
+		Provider:       "openai-compatible-kimi",
+		Status:         coreauth.StatusActive,
+		ReconcileState: coreauth.ReconcileStateReady,
+		Attributes: map[string]string{
+			coreauth.AttributeAPIKey: "not-a-real-key",
+			coreauth.AttributeSource: "config:kimi[test]",
+		},
+		Metadata: map[string]any{},
+	}
+	configIndex := configAuth.EnsureIndex()
+	if _, errRegister := manager.Register(context.Background(), configAuth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/reconcile-status", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	c.Request = req
+	h.GetAuthReconcileStatus(c)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Credentials []struct {
+			AuthIndex string `json:"auth_index"`
+			Provider  string `json:"provider"`
+		} `json:"credentials"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if len(payload.Credentials) != len(want) {
+		t.Fatalf("credential count = %d, want %d; body=%s", len(payload.Credentials), len(want), recorder.Body.String())
+	}
+	for _, credential := range payload.Credentials {
+		provider, ok := want[credential.AuthIndex]
+		if !ok {
+			t.Fatalf("unexpected auth_index %q", credential.AuthIndex)
+		}
+		if credential.Provider != provider {
+			t.Fatalf("provider for %q = %q, want %q", credential.AuthIndex, credential.Provider, provider)
+		}
+		delete(want, credential.AuthIndex)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing file-backed credentials: %v", want)
+	}
+	if strings.Contains(recorder.Body.String(), configIndex) {
+		t.Fatalf("config-backed auth_index leaked into desired inventory: %s", recorder.Body.String())
+	}
+}
+
+func TestAuthReconcileMutationsRejectNonPersistableCredentials(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetStore(&managementReconcileStore{})
+	configAuth := &coreauth.Auth{
+		ID:             "config-kimi-client",
+		Provider:       "openai-compatible-kimi",
+		Status:         coreauth.StatusActive,
+		ReconcileState: coreauth.ReconcileStateReady,
+		Attributes: map[string]string{
+			coreauth.AttributeAPIKey: "not-a-real-key",
+			coreauth.AttributeSource: "config:kimi[test]",
+		},
+		Metadata: map[string]any{},
+	}
+	configIndex := configAuth.EnsureIndex()
+	if _, errRegister := manager.Register(context.Background(), configAuth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+
+	tests := []struct {
+		name    string
+		path    string
+		body    map[string]any
+		handler func(*gin.Context)
+	}{
+		{name: "state", path: "/v0/management/auth-files/reconcile-state", body: map[string]any{"auth_index": configIndex, "state": "cooling"}, handler: h.SetAuthReconcileState},
+		{name: "refresh", path: "/v0/management/auth-files/refresh", body: map[string]any{"auth_index": configIndex}, handler: h.RefreshAuthCredential},
+		{name: "probe", path: "/v0/management/auth-files/probe", body: map[string]any{"auth_index": configIndex, "model": "kimi", "payload": map[string]any{"messages": []any{}}, "admit": true}, handler: h.ProbeAuthCredential},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body, errMarshal := json.Marshal(test.body)
+			if errMarshal != nil {
+				t.Fatal(errMarshal)
+			}
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			req := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(string(body)))
+			req.RemoteAddr = "127.0.0.1:1234"
+			req.Header.Set("Content-Type", "application/json")
+			c.Request = req
+			test.handler(c)
+			if recorder.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404; body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
 	}
 }
 
