@@ -274,6 +274,11 @@ def main() -> int:
     lifecycle_state["manual_toggles"] = int(lifecycle_state.get("manual_toggles", 0)) + manual_toggles
     atomic_json(lifecycle_path, lifecycle_state)
     failures: list[str] = []
+    reconciler_result = command("systemctl", "show", "cliproxy-account-reconciler.service", "-p", "Result", "--value")
+    reconciler_status = int(
+        command("systemctl", "show", "cliproxy-account-reconciler.service", "-p", "ExecMainStatus", "--value") or "0"
+    )
+    reconciler_completed = (reconciler_result, reconciler_status) in {("success", 0), ("exit-code", 1)}
     checks = {
         "binary_hash": binary_hash == baseline["expected_binary_sha256"],
         "config_hash": config_hash == baseline["expected_config_sha256"],
@@ -283,7 +288,7 @@ def main() -> int:
         "nginx_active": command("systemctl", "is-active", "nginx") == "active",
         "reconciler_timer_active": command("systemctl", "is-active", "cliproxy-account-reconciler.timer") == "active",
         "reconciler_timer_enabled": command("systemctl", "is-enabled", "cliproxy-account-reconciler.timer") == "enabled",
-        "reconciler_last_success": command("systemctl", "show", "cliproxy-account-reconciler.service", "-p", "Result", "--value") == "success",
+        "reconciler_controller_completed": reconciler_completed,
         "inventory_complete": len(reconcile) == 19,
         "generation_converged": generation_mismatches == 0,
         "ready_admission_converged": ready_mismatches == 0,
@@ -305,7 +310,14 @@ def main() -> int:
         "healthy": not failures,
         "failures": failures,
         "checks": checks,
-        "inventory": {"total": len(reconcile), "states": dict(states), "generation_mismatches": generation_mismatches, "ready_mismatches": ready_mismatches},
+        "inventory": {
+            "total": len(reconcile),
+            "states": dict(states),
+            "managed_degraded": sum(value for state, value in states.items() if state != "ready"),
+            "generation_mismatches": generation_mismatches,
+            "ready_mismatches": ready_mismatches,
+        },
+        "reconciler": {"result": reconciler_result, "exec_main_status": reconciler_status},
         "pressure": {"active_leases": pressure.get("active_leases"), "active_seats": pressure.get("active_seats")},
         "events": event_summary,
         "manual_toggles": lifecycle_state["manual_toggles"],
