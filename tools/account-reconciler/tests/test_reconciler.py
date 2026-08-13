@@ -148,6 +148,12 @@ class ImmediateReloadController(reconciler.Controller):
     def _wait_for_generation(self, auth_index, generation, disabled):
         self.reload_calls.append((auth_index, generation, disabled))
 
+    def _raw_generation_matching(self, seat, generation):
+        # The lightweight FakeAPI used with this controller does not persist
+        # lifecycle CAS updates to the fixture file. Tests that exercise real
+        # generation binding use StatefulGenerationAPI and the base controller.
+        return reconciler.raw_file_generation(seat.canonical_path)
+
 
 class InspectingAPI(FakeAPI):
     def __init__(self, canonical_path, *args, **kwargs):
@@ -469,6 +475,156 @@ class LockAndBackoffTests(unittest.TestCase):
         self.assertLessEqual(capped, 40)
 
 
+class RollbackRecoveryTests(unittest.TestCase):
+    def make_seat(self, root: Path) -> reconciler.Seat:
+        return reconciler.Seat(
+            "index-alpha",
+            "claude",
+            "probe-model",
+            root / "auths" / "canonical.json",
+            root / "auths" / "candidate.json",
+            ("refresh_token",),
+        )
+
+    def make_controller(self, root: Path, seat: reconciler.Seat, api):
+        return reconciler.Controller(
+            reconciler.Inventory((seat,), 3, 10, 80),
+            api,
+            root / "state",
+            root / "run",
+            HMAC_KEY,
+            apply=True,
+            recover_rollbacks=True,
+            logger=reconciler.configure_logging(io.StringIO()),
+            now=lambda: NOW,
+            rng=random.Random(1),
+        )
+
+    def mark_rollback_failed(self, controller, seat):
+        seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+        controller.store.write(seat_key, "ready", "rollback_failed", "failed", 1, "")
+        return seat_key
+
+    def write_archive(self, root: Path, seat_key: str, suffix: str, disabled: bool, mode: int = 0o600):
+        archive = root / "state" / "rollback" / f"{seat_key}-{suffix}.rollback"
+        write_json(
+            archive,
+            {"provider": "claude", "refresh_token": "archived-token", "disabled": disabled},
+            mode,
+        )
+        return archive
+
+    def test_recover_rollbacks_preserves_tokens_and_restores_latest_archived_admission(self):
+        for archived_disabled in (False, True):
+            with self.subTest(archived_disabled=archived_disabled), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                seat = self.make_seat(root)
+                current = {
+                    "provider": "claude",
+                    "access_token": "current-access",
+                    "refresh_token": "current-refresh",
+                    "disabled": False,
+                    "reconcile_state": "refreshing",
+                }
+                write_json(seat.canonical_path, current)
+                api = StatefulGenerationAPI(seat.canonical_path, publish_delay=1)
+                controller = self.make_controller(root, seat, api)
+                seat_key = self.mark_rollback_failed(controller, seat)
+                self.write_archive(root, seat_key, "20260813T010000000000Z", not archived_disabled)
+                latest = self.write_archive(root, seat_key, "20260813T020000000000Z", archived_disabled)
+
+                self.assertEqual(PromotionTests().run_with_stateful_watcher(controller), 0)
+                canonical = json.loads(seat.canonical_path.read_text())
+                self.assertEqual(canonical["access_token"], current["access_token"])
+                self.assertEqual(canonical["refresh_token"], current["refresh_token"])
+                self.assertEqual(canonical["disabled"], archived_disabled)
+                self.assertEqual(canonical["reconcile_state"], "cooling")
+                self.assertEqual(canonical["reconcile_reason"], "refresh_failed")
+                self.assertTrue(canonical.get("reconcile_next_attempt"))
+                self.assertEqual(stat.S_IMODE(latest.stat().st_mode), 0o600)
+                persisted = controller.store.read(seat_key)
+                self.assertEqual(persisted["state"], "cooling")
+                self.assertEqual(persisted["reason"], "rollback_completed")
+                self.assertTrue(persisted["next_attempt"])
+                self.assertEqual([call[2] for call in api.calls if call[0] == "set_state"], ["cooling"])
+                self.assertFalse(any(call[0] in {"refresh", "probe"} for call in api.calls))
+
+    def test_recover_rollbacks_with_no_matching_state_rows_is_noop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            current = {"provider": "claude", "refresh_token": "current", "disabled": False}
+            write_json(seat.canonical_path, current)
+            api = StatefulGenerationAPI(seat.canonical_path)
+            controller = self.make_controller(root, seat, api)
+
+            self.assertEqual(controller.run(), 0)
+            self.assertEqual(json.loads(seat.canonical_path.read_text()), current)
+            self.assertFalse(any(call[0] in {"set_state", "refresh", "probe"} for call in api.calls))
+
+    def test_recover_rollbacks_validates_full_inventory_before_selecting_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            current = {"provider": "claude", "refresh_token": "current", "disabled": False}
+            write_json(seat.canonical_path, current)
+            api = StatefulGenerationAPI(seat.canonical_path)
+            api.status = mock.Mock(return_value=[])
+            controller = self.make_controller(root, seat, api)
+            seat_key = self.mark_rollback_failed(controller, seat)
+            self.write_archive(root, seat_key, "20260813T020000000000Z", True)
+
+            with self.assertRaises(reconciler.InventoryError):
+                controller.run()
+            self.assertEqual(json.loads(seat.canonical_path.read_text()), current)
+            self.assertFalse(any(call[0] in {"set_state", "refresh", "probe"} for call in api.calls))
+
+    def test_recover_rollbacks_rejects_candidate_presence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            current = {"provider": "claude", "refresh_token": "current", "disabled": False}
+            write_json(seat.canonical_path, current)
+            write_json(seat.candidate_path, {"provider": "claude", "refresh_token": "candidate"})
+            api = StatefulGenerationAPI(seat.canonical_path)
+            controller = self.make_controller(root, seat, api)
+            seat_key = self.mark_rollback_failed(controller, seat)
+            self.write_archive(root, seat_key, "20260813T020000000000Z", True)
+
+            self.assertEqual(controller.run(), 1)
+            self.assertEqual(json.loads(seat.canonical_path.read_text()), current)
+            self.assertTrue(seat.candidate_path.exists())
+            self.assertEqual(controller.store.read(seat_key)["reason"], "rollback_failed")
+            self.assertFalse(any(call[0] in {"set_state", "refresh", "probe"} for call in api.calls))
+
+    def test_recover_rollbacks_fails_closed_for_missing_or_unsafe_latest_archive(self):
+        for condition in ("missing", "bad_mode", "symlink"):
+            with self.subTest(condition=condition), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                seat = self.make_seat(root)
+                current = {"provider": "claude", "refresh_token": "current", "disabled": False}
+                write_json(seat.canonical_path, current)
+                api = StatefulGenerationAPI(seat.canonical_path)
+                controller = self.make_controller(root, seat, api)
+                seat_key = self.mark_rollback_failed(controller, seat)
+                self.write_archive(root, seat_key, "20260813T010000000000Z", False)
+                latest = root / "state" / "rollback" / f"{seat_key}-20260813T020000000000Z.rollback"
+                if condition == "bad_mode":
+                    write_json(latest, {"disabled": True}, 0o644)
+                elif condition == "symlink":
+                    target = root / "unsafe-target.json"
+                    write_json(target, {"disabled": True})
+                    latest.symlink_to(target)
+                else:
+                    for archive in (root / "state" / "rollback").glob(f"{seat_key}-*.rollback"):
+                        archive.unlink()
+
+                self.assertEqual(controller.run(), 1)
+                self.assertEqual(json.loads(seat.canonical_path.read_text()), current)
+                self.assertEqual(controller.store.read(seat_key)["reason"], "rollback_failed")
+                self.assertFalse(any(call[0] in {"set_state", "refresh", "probe"} for call in api.calls))
+
+
 class PromotionTests(unittest.TestCase):
     def make_seat(self, root: Path) -> reconciler.Seat:
         return reconciler.Seat(
@@ -661,6 +817,307 @@ class PromotionTests(unittest.TestCase):
             self.assertEqual(canonical["reconcile_reason"], "probe_retryable")
             self.assertEqual(stat.S_IMODE(seat.canonical_path.stat().st_mode), 0o600)
             self.assertGreaterEqual(len(controller.reload_calls), 2)
+
+    def test_failed_refresh_after_normalization_restores_archived_generation(self):
+        class FailedRefreshAPI(StatefulGenerationAPI):
+            def refresh(self, auth_index):
+                self.calls.append(("refresh", auth_index))
+                return "retryable", self._generation(), self._canonical().get("disabled", False)
+
+        for disabled in (False, True):
+            with self.subTest(disabled=disabled), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                seat = self.make_seat(root)
+                original = {
+                    "provider": "claude",
+                    "refresh_token": "old",
+                    "disabled": disabled,
+                    "reconcile_state": "cooling",
+                    "reconcile_reason": "probe_retryable",
+                }
+                write_json(seat.canonical_path, original)
+                api = FailedRefreshAPI(
+                    seat.canonical_path,
+                    row={
+                        "credential_status": "disabled" if disabled else "active",
+                        "disabled": disabled,
+                        "state": "cooling",
+                    },
+                    publish_delay=1,
+                )
+                controller = reconciler.Controller(
+                    reconciler.Inventory((seat,), 3, 10, 80),
+                    api,
+                    root / "state",
+                    root / "run",
+                    HMAC_KEY,
+                    apply=True,
+                    logger=reconciler.configure_logging(io.StringIO()),
+                    now=lambda: NOW,
+                    rng=random.Random(1),
+                )
+
+                self.assertEqual(self.run_with_stateful_watcher(controller), 1)
+                canonical = json.loads(seat.canonical_path.read_text())
+                self.assertEqual(canonical["refresh_token"], original["refresh_token"])
+                self.assertEqual(canonical["disabled"], disabled)
+                self.assertEqual(canonical["reconcile_state"], "cooling")
+                self.assertEqual(canonical["reconcile_reason"], "refresh_failed")
+                seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+                self.assertEqual(controller.store.read(seat_key)["reason"], "refresh_failed")
+
+    def test_failed_refresh_after_candidate_promotion_restores_archive(self):
+        class FailedRefreshAPI(StatefulGenerationAPI):
+            def refresh(self, auth_index):
+                self.calls.append(("refresh", auth_index))
+                return "retryable", self._generation(), self._canonical().get("disabled", False)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            original = {"provider": "claude", "refresh_token": "old", "disabled": True}
+            candidate = {"provider": "claude", "refresh_token": "candidate"}
+            write_json(seat.canonical_path, original)
+            write_json(seat.candidate_path, candidate)
+            api = FailedRefreshAPI(
+                seat.canonical_path,
+                row={"credential_status": "disabled", "disabled": True},
+                publish_delay=1,
+            )
+            controller = reconciler.Controller(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+
+            self.assertEqual(self.run_with_stateful_watcher(controller), 1)
+            canonical = json.loads(seat.canonical_path.read_text())
+            self.assertEqual(canonical["refresh_token"], original["refresh_token"])
+            self.assertTrue(canonical["disabled"])
+            self.assertEqual(canonical["reconcile_state"], "cooling")
+            self.assertEqual(canonical["reconcile_reason"], "refresh_failed")
+            self.assertTrue(seat.candidate_path.exists())
+
+    def test_competing_writer_after_refreshing_transition_is_not_rolled_back(self):
+        class CompetingWriterController(reconciler.Controller):
+            def _raw_generation_matching(self, seat, generation):
+                competing = json.loads(seat.canonical_path.read_text())
+                competing["refresh_token"] = "competing-refresh"
+                write_json(seat.canonical_path, competing)
+                return super()._raw_generation_matching(seat, generation)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            original = {"provider": "claude", "refresh_token": "old", "disabled": True}
+            write_json(seat.canonical_path, original)
+            api = StatefulGenerationAPI(
+                seat.canonical_path,
+                row={"credential_status": "disabled", "disabled": True},
+                publish_delay=1,
+            )
+            controller = CompetingWriterController(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+
+            self.assertEqual(self.run_with_stateful_watcher(controller), 1)
+            canonical = json.loads(seat.canonical_path.read_text())
+            self.assertEqual(canonical["refresh_token"], "competing-refresh")
+            self.assertFalse(any(call[0] == "refresh" for call in api.calls))
+            seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+            self.assertEqual(controller.store.read(seat_key)["reason"], "rollback_failed")
+
+    def test_failed_refresh_mutation_is_not_overwritten_by_archive(self):
+        class MutatingFailedRefreshAPI(StatefulGenerationAPI):
+            def refresh(self, auth_index):
+                self.calls.append(("refresh", auth_index))
+                canonical = self._canonical()
+                canonical["access_token"] = "new-access-from-failed-refresh"
+                canonical["refresh_token"] = "new-refresh-from-failed-refresh"
+                write_json(self.canonical_path, canonical)
+                self.row["generation"] = self._generation()
+                self.row["durable_disabled"] = canonical.get("disabled", False)
+                self._queue_current_file()
+                return "retryable", self._generation(), canonical.get("disabled", False)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            original = {"provider": "claude", "refresh_token": "old", "disabled": True}
+            write_json(seat.canonical_path, original)
+            api = MutatingFailedRefreshAPI(
+                seat.canonical_path,
+                row={"credential_status": "disabled", "disabled": True},
+                publish_delay=1,
+            )
+            controller = reconciler.Controller(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+
+            self.assertEqual(self.run_with_stateful_watcher(controller), 1)
+            canonical = json.loads(seat.canonical_path.read_text())
+            self.assertEqual(canonical["access_token"], "new-access-from-failed-refresh")
+            self.assertEqual(canonical["refresh_token"], "new-refresh-from-failed-refresh")
+            self.assertTrue(canonical["disabled"])
+            self.assertEqual(canonical["reconcile_state"], "cooling")
+            self.assertEqual(canonical["reconcile_reason"], "refresh_failed")
+            seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+            self.assertEqual(controller.store.read(seat_key)["reason"], "refresh_failed")
+
+    def test_refresh_transport_error_after_mutation_preserves_newest_tokens(self):
+        class MutatingLostRefreshResponseAPI(StatefulGenerationAPI):
+            def refresh(self, auth_index):
+                self.calls.append(("refresh", auth_index))
+                canonical = self._canonical()
+                canonical["access_token"] = "new-access-before-lost-response"
+                canonical["refresh_token"] = "new-refresh-before-lost-response"
+                write_json(self.canonical_path, canonical)
+                self.row["generation"] = self._generation()
+                self.row["durable_disabled"] = canonical.get("disabled", False)
+                self._queue_current_file()
+                raise reconciler.APIError()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            original = {"provider": "claude", "refresh_token": "old", "disabled": True}
+            write_json(seat.canonical_path, original)
+            api = MutatingLostRefreshResponseAPI(
+                seat.canonical_path,
+                row={"credential_status": "disabled", "disabled": True},
+                publish_delay=1,
+            )
+            controller = reconciler.Controller(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+
+            self.assertEqual(self.run_with_stateful_watcher(controller), 1)
+            canonical = json.loads(seat.canonical_path.read_text())
+            self.assertEqual(canonical["access_token"], "new-access-before-lost-response")
+            self.assertEqual(canonical["refresh_token"], "new-refresh-before-lost-response")
+            self.assertTrue(canonical["disabled"])
+            self.assertEqual(canonical["reconcile_state"], "cooling")
+            self.assertEqual(canonical["reconcile_reason"], "probe_retryable")
+            seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+            self.assertEqual(controller.store.read(seat_key)["reason"], "probe_retryable")
+
+    def test_converged_canonical_generation_rechecks_file_after_status_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            write_json(
+                seat.canonical_path,
+                {"provider": "claude", "refresh_token": "snapshot", "disabled": False},
+            )
+            snapshot_generation = reconciler.file_generation(seat.canonical_path, HMAC_KEY)
+
+            class StaleSnapshotAPI(FakeAPI):
+                def status(self):
+                    write_json(
+                        seat.canonical_path,
+                        {"provider": "claude", "refresh_token": "competing", "disabled": False},
+                    )
+                    return [
+                        remote_row(
+                            generation=snapshot_generation,
+                            runtime_generation=snapshot_generation,
+                            disabled=False,
+                            durable_disabled=False,
+                        )
+                    ]
+
+            controller = reconciler.Controller(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                StaleSnapshotAPI(),
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+            )
+            clock = AdvancingClock()
+            with mock.patch.object(reconciler.time, "monotonic", side_effect=clock), mock.patch.object(
+                reconciler.time, "sleep", return_value=None
+            ):
+                with self.assertRaises(reconciler.PromotionError):
+                    controller._converged_canonical_generation(seat)
+            self.assertEqual(json.loads(seat.canonical_path.read_text())["refresh_token"], "competing")
+
+    def test_failed_candidate_refresh_mutation_is_not_attributed_or_restaged(self):
+        class MutatingFailedRefreshAPI(StatefulGenerationAPI):
+            def refresh(self, auth_index):
+                self.calls.append(("refresh", auth_index))
+                canonical = self._canonical()
+                canonical["access_token"] = "rotated-candidate-access"
+                canonical["refresh_token"] = "rotated-candidate-refresh"
+                write_json(self.canonical_path, canonical)
+                self.row["generation"] = self._generation()
+                self.row["durable_disabled"] = canonical.get("disabled", False)
+                self._queue_current_file()
+                return "retryable", self._generation(), canonical.get("disabled", False)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            original = {"provider": "claude", "refresh_token": "old", "disabled": True}
+            write_json(seat.canonical_path, original)
+            write_json(seat.candidate_path, {"provider": "claude", "refresh_token": "candidate"})
+            api = MutatingFailedRefreshAPI(
+                seat.canonical_path,
+                row={"credential_status": "disabled", "disabled": True},
+                publish_delay=1,
+            )
+            controller = reconciler.Controller(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+
+            self.assertEqual(self.run_with_stateful_watcher(controller), 1)
+            canonical = json.loads(seat.canonical_path.read_text())
+            candidate = json.loads(seat.candidate_path.read_text())
+            self.assertEqual(canonical["refresh_token"], "rotated-candidate-refresh")
+            self.assertTrue(canonical["disabled"])
+            self.assertEqual(canonical["reconcile_state"], "cooling")
+            self.assertEqual(canonical["reconcile_reason"], "refresh_failed")
+            self.assertNotIn("access_token", candidate)
+            self.assertEqual(candidate["refresh_token"], "candidate")
 
     def test_rejected_probe_preserves_rotated_tokens_but_restores_archived_admission(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -10,6 +10,16 @@ The inventory must exactly match the runtime `auth_index` and provider set. Miss
 
 Use `--seat-key` for a single-seat canary. The value is the controller's 32-character opaque HMAC seat key from its categorical logs or state filename, never an auth index, identity, or path. The controller validates the complete inventory first and then applies the seat, provider, health, and maximum-seat filters together; an invalid, unknown, or contradictory selection fails before mutation.
 
+If an interrupted controller version records `rollback_failed`, use
+`--recover-rollbacks` to repair every such inventory-managed seat as one automatic
+operation. The mode cannot be combined with seat, provider, health, maximum, or
+force-probe filters. It validates the complete inventory and the exact latest
+pre-failure archive for each selected opaque seat, preserves the current
+credential bytes, and restores only archived admission plus a cooling lifecycle
+through a generation-fenced service CAS. It never refreshes, probes, promotes,
+deletes, or copies a credential. The default remains a non-mutating dry run;
+add `--apply` only after the categorical selection is reviewed.
+
 Install `reconciler.py` as `/opt/crsproxy/bin/account-reconciler`, create `/etc/crsproxy/account-inventory.json`, and install the templates from `systemd/`. The supplied unit runs with `--apply`; invoking the program manually without it is a safe dry run.
 
 Generate the real inventory only on `healify-hub` with `generate_inventory.py`. The generator is dry-run by default, accepts the management key only through `CLIPROXY_RECONCILER_API_KEY`, and talks only to CLIProxyAPI's pinned loopback endpoint. It cross-checks every durable runtime seat against its canonical JSON path, stable `auth_index`, provider, and registered models, then selects a probe model from a fixed provider policy. Disabled seats may bootstrap a model from the same provider's file-backed registry, but registry membership proves only that the translation path exists; the later exact-seat probe remains the sole health and admission proof. Dry-run output contains only categorical counts. After reviewing that count, run with `--write`; the default output is atomically installed as `/etc/crsproxy/account-inventory.json`, owner `root:crsproxy`, mode `0640`. The generator never prints identities, paths, tokens, or API response bodies.

@@ -1,6 +1,6 @@
 # Smart Model Router and Predictive Account Balancer
 
-Status: generation-safe reconciliation patch verified locally; exact live canary and 24-hour soak pending
+Status: post-CAS rollback recovery patch verified locally; four-seat recovery rollout, active canary, and 24-hour soak pending
 Owner: primary agent
 Canonical runtime: `healify-hub` only
 Proxy path: nginx `:8317` -> CLIProxyAPI `127.0.0.1:8319`
@@ -379,7 +379,7 @@ Current verified evidence, 2026-08-13:
 - `go test ./... -count=1` passes across the repository.
 - Focused routing, management, config, reconciliation, and least-pressure race tests pass.
 - Changed-package `go vet` passes. Repository-wide vet still reports pre-existing warnings in untouched logging/plugin-host files.
-- The controller compiles and all 52 Python unit tests pass, including delayed watcher publication, candidate token rotation, generation-fenced rollback/restaging, response-loss recovery, and two-run first-install recovery.
+- The controller compiles and all 64 Python unit tests pass, including delayed watcher publication, candidate token rotation, generation-fenced rollback/restaging, response-loss recovery, failed-refresh mutation handling, automatic rollback-failure recovery, and two-run first-install recovery.
 - Durable reconcile mutations use opaque HMAC generations and compare-and-swap; status fails closed without a generation-capable file store, probe endpoints cannot admit directly, and committed-but-unpublished CAS results are explicit.
 - File credential saves/deletes participate in the shared per-seat lock protocol; atomic writes fsync the file and directory, reject symlink-substituted staging, and watcher deletes retain a runtime seat only after validating the authoritative replacement generation/provider.
 - Formatting, `git diff --check`, workflow YAML parsing, and changed-file credential-pattern scan pass.
@@ -388,12 +388,11 @@ Current verified evidence, 2026-08-13:
 - The current uncommitted diff passes gitleaks pre-commit and stdin scans with zero findings.
 - The service and timer templates pass `systemd-analyze verify` on the arm64 hub with systemd 255.
 - Live topology remains nginx `:8317` to loopback CLIProxyAPI `:8319`; the Mac has no local CLIProxy/crsproxy listener or refresh process.
-- The live hub still runs `v7.2.130-smart-router.5` (`157b6def`) in shadow-only mode with 19 desired/runtime seats; the reconciler service/timer remain disabled/inactive under the dry-run override, and no new binary, config, controller, unit, or inventory has been deployed in this checkpoint.
+- The live hub runs `v7.2.130-smart-router.6` (`910878b7`) in shadow-only mode with all 19 desired/runtime generations converged. The reconciler timer/service remain disabled/inactive after four unhealthy-seat canaries exposed a stale post-CAS rollback fence; this patch fixes that fence and adds metadata-only automatic recovery, but it has not yet been deployed in this checkpoint.
 
 Remaining production evidence:
 
-- Build the complete root-protected desired inventory for all 19 current auth files without deleting or silently dropping any seat.
-- Capture root-owned rollback copies and hashes for binary, config, nginx, and units immediately before deployment.
+- Deploy the patched controller and provenance-pinned binary, dry-run and apply automatic recovery for the four recorded rollback failures, then repeat only those exact-seat canaries.
 - Run semantic and account shadow modes, fixed-model least-pressure canary, controlled fault injection, rollback rehearsal, and a 24-hour zero-manual-toggle soak.
 
 ### Functional

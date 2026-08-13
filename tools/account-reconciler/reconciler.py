@@ -365,6 +365,7 @@ class StateStore:
             "attempt_day": today,
             "attempts": 0,
             "next_attempt": "",
+            "updated_at": "",
         }
         try:
             value = json.loads(self.path(seat_key).read_text(encoding="utf-8"))
@@ -851,6 +852,7 @@ class Controller:
         force_probe: bool = False,
         provider: str = "",
         seat_key: str = "",
+        recover_rollbacks: bool = False,
     ):
         self.inventory = inventory
         self.api = api
@@ -867,6 +869,7 @@ class Controller:
         self.force_probe = force_probe
         self.provider = provider.strip().lower()
         self.seat_key = seat_key.strip().lower()
+        self.recover_rollbacks = recover_rollbacks
 
     def run(self) -> int:
         with file_lock(self.runtime_dir / "locks" / "global.lock") as global_acquired:
@@ -876,6 +879,8 @@ class Controller:
             remote = self.api.status()
             validate_complete_inventory(self.inventory, remote)
             by_index = {row["auth_index"]: row for row in remote}
+            if self.recover_rollbacks:
+                return self._recover_recorded_rollbacks()
             seats = list(self.inventory.seats)
             if self.seat_key:
                 seats = [
@@ -896,6 +901,188 @@ class Controller:
                 if not self._reconcile_locked(seat, by_index[seat.auth_index]):
                     failures += 1
             return 1 if failures else 0
+
+    def _recover_recorded_rollbacks(self) -> int:
+        """Restore archived admission for every locally recorded rollback failure."""
+        failures = 0
+        for seat in self.inventory.seats:
+            seat_key = opaque_key(self.hmac_key, "seat", seat.auth_index)
+            persisted = self.store.read(seat_key)
+            if (
+                persisted.get("reason") != "rollback_failed"
+                or persisted.get("outcome") != "failed"
+            ):
+                continue
+            if not self.apply:
+                log_event(
+                    self.logger,
+                    "rollback_recovery_dry_run",
+                    seat_key=seat_key,
+                    outcome="skipped",
+                    reason="rollback_failed",
+                )
+                continue
+            if not self._recover_recorded_rollback_locked(
+                seat,
+                seat_key,
+                persisted,
+            ):
+                failures += 1
+        log_event(
+            self.logger,
+            "rollback_recovery_completed",
+            outcome="failed" if failures else "succeeded",
+            reason="rollback_failed" if failures else "rollback_completed",
+        )
+        return 1 if failures else 0
+
+    def _recover_recorded_rollback_locked(
+        self,
+        seat: Seat,
+        seat_key: str,
+        persisted: dict[str, Any],
+    ) -> bool:
+        provider_key = opaque_key(self.hmac_key, "provider", seat.provider)
+        with file_lock(self.runtime_dir / "locks" / f"provider-{provider_key}.lock") as provider_acquired:
+            if not provider_acquired:
+                log_event(self.logger, "seat_skipped", seat_key=seat_key, reason="locked")
+                return False
+            with file_lock(self.runtime_dir / "locks" / f"seat-{seat_key}.lock") as seat_acquired:
+                if not seat_acquired:
+                    log_event(self.logger, "seat_skipped", seat_key=seat_key, reason="locked")
+                    return False
+                try:
+                    if seat.canonical_path is None or seat.candidate_path is None:
+                        raise PromotionError("rollback recovery requires managed paths")
+                    with credential_file_lock(seat.candidate_path):
+                        if seat.candidate_path.exists():
+                            raise PromotionError("rollback recovery refuses a staged candidate")
+                        disabled = self._latest_rollback_admission(
+                            seat,
+                            seat_key,
+                            persisted.get("updated_at", ""),
+                        )
+                        _, generation, _ = self._converged_canonical_generation(seat)
+                        attempts = int(persisted.get("attempts", 0))
+                        delay = backoff_seconds(
+                            max(1, attempts),
+                            self.inventory.base_backoff_seconds,
+                            self.inventory.max_backoff_seconds,
+                            self.rng,
+                        )
+                        next_attempt = (self.now() + dt.timedelta(seconds=delay)).replace(microsecond=0).isoformat()
+                        generation = self._transition(
+                            seat.auth_index,
+                            generation,
+                            "cooling",
+                            "refresh_failed",
+                            next_attempt,
+                            disabled,
+                        )
+                        self._wait_for_generation(seat.auth_index, generation, disabled)
+                    self._record(
+                        seat_key,
+                        "cooling",
+                        "rollback_completed",
+                        "succeeded",
+                        attempts,
+                        next_attempt,
+                    )
+                    return True
+                except (OSError, PromotionError, APIError):
+                    return self._record_local_failure(
+                        seat_key,
+                        int(persisted.get("attempts", 0)),
+                        "rollback_failed",
+                        "misconfigured",
+                        "failed",
+                    )
+
+    def _latest_rollback_admission(
+        self,
+        seat: Seat,
+        seat_key: str,
+        failure_updated_at: str,
+    ) -> bool:
+        archive_dir = self.state_dir / "rollback"
+        try:
+            dir_info = archive_dir.lstat()
+        except OSError as exc:
+            raise PromotionError("rollback archive directory is unavailable") from exc
+        if (
+            not stat.S_ISDIR(dir_info.st_mode)
+            or stat.S_ISLNK(dir_info.st_mode)
+            or stat.S_IMODE(dir_info.st_mode) & 0o022
+            or dir_info.st_uid != os.geteuid()
+            or dir_info.st_gid != os.getegid()
+        ):
+            raise PromotionError("rollback archive directory is unsafe")
+        failure_time = _parse_time(failure_updated_at)
+        if failure_time is None:
+            raise PromotionError("rollback failure timestamp is invalid")
+        pattern = re.compile(
+            rf"^{re.escape(seat_key)}-(\d{{8}}T\d{{12}}Z)\.rollback$"
+        )
+        candidates: list[tuple[dt.datetime, Path]] = []
+        for path in archive_dir.glob(f"{seat_key}-*.rollback"):
+            match = pattern.fullmatch(path.name)
+            if match is None:
+                raise PromotionError("rollback archive name is invalid")
+            try:
+                timestamp = dt.datetime.strptime(
+                    match.group(1),
+                    "%Y%m%dT%H%M%S%fZ",
+                ).replace(tzinfo=UTC)
+            except ValueError as exc:
+                raise PromotionError("rollback archive timestamp is invalid") from exc
+            # Existing state files historically recorded second precision while
+            # archive names include microseconds. The archive must fall within
+            # or before the failure record's final second.
+            if timestamp >= failure_time + dt.timedelta(seconds=1):
+                raise PromotionError("rollback archive postdates failure")
+            candidates.append((timestamp, path))
+        if not candidates:
+            raise PromotionError("rollback archive is unavailable")
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        archive = candidates[0][1]
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(archive, flags)
+        except OSError as exc:
+            raise PromotionError("rollback archive is unavailable") from exc
+        try:
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_uid != os.geteuid()
+                or info.st_gid != os.getegid()
+            ):
+                raise PromotionError("rollback archive is unsafe")
+            raw = os.read(fd, 1024 * 1024 + 1)
+            if len(raw) > 1024 * 1024:
+                raise PromotionError("rollback archive is too large")
+        finally:
+            os.close(fd)
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise PromotionError("rollback archive is invalid") from exc
+        if not isinstance(value, dict):
+            raise PromotionError("rollback archive is invalid")
+        provider = value.get("provider", value.get("type"))
+        if not isinstance(provider, str) or provider.strip().lower() != seat.provider:
+            raise PromotionError("rollback archive provider does not match")
+        if any(key not in value or value[key] in (None, "") for key in seat.required_keys):
+            raise PromotionError("rollback archive is missing required fields")
+        if any(str(value.get(key, "")) != expected for key, expected in seat.expected_fields):
+            raise PromotionError("rollback archive identity does not match")
+        disabled = value.get("disabled", False)
+        if not isinstance(disabled, bool):
+            raise PromotionError("rollback archive admission is invalid")
+        return disabled
 
     def _reconcile_locked(self, seat: Seat, remote: dict[str, Any]) -> bool:
         seat_key = opaque_key(self.hmac_key, "seat", seat.auth_index)
@@ -983,6 +1170,7 @@ class Controller:
         promoted_raw_generation = ""
         candidate_raw_generation = ""
         canonical_raw_generation = ""
+        refresh_attempted = False
         refresh_succeeded = False
         generation = remote["generation"]
         durable_disabled = remote["durable_disabled"]
@@ -1042,10 +1230,28 @@ class Controller:
                 "candidate_promoted" if candidate_exists else "",
                 disabled=False,
             )
+            if promoted:
+                # The lifecycle CAS above intentionally rewrites the canonical
+                # JSON and therefore advances its raw generation. Rollback must
+                # fence against that committed generation, not the earlier
+                # promotion/normalization bytes. Bind the current raw hash to
+                # the opaque generation returned by the service so an unrelated
+                # writer cannot be mistaken for our own transition.
+                promoted_raw_generation = self._raw_generation_matching(
+                    seat,
+                    generation,
+                )
+            refresh_attempted = True
             refresh_outcome, refreshed_generation, refreshed_disabled = self.api.refresh(seat.auth_index)
             if refresh_outcome != "succeeded":
                 if promoted:
-                    restored = self._restore_and_reload(seat, archive, promoted_raw_generation)
+                    restored = self._recover_promoted_refresh_failure(
+                        seat,
+                        archive,
+                        promoted_raw_generation,
+                        candidate_exists,
+                        candidate_raw_generation,
+                    )
                     if restored is None:
                         return self._record_local_failure(seat_key, attempts, "rollback_failed", "misconfigured", "failed")
                     generation, durable_disabled = restored
@@ -1125,7 +1331,17 @@ class Controller:
                 elif refresh_succeeded:
                     durable_disabled = archived_disabled(archive)
                 else:
-                    restored = self._restore_and_reload(seat, archive, promoted_raw_generation)
+                    restored = (
+                        self._recover_promoted_refresh_failure(
+                            seat,
+                            archive,
+                            promoted_raw_generation,
+                            candidate_exists,
+                            candidate_raw_generation,
+                        )
+                        if refresh_attempted
+                        else self._restore_and_reload(seat, archive, promoted_raw_generation)
+                    )
                     if restored is None:
                         return self._record_local_failure(seat_key, attempts, "rollback_failed", "misconfigured", "failed")
                     generation, durable_disabled = restored
@@ -1157,6 +1373,29 @@ class Controller:
         except (OSError, PromotionError, APIError):
             return None
 
+    def _recover_promoted_refresh_failure(
+        self,
+        seat: Seat,
+        archive: Path | None,
+        expected_raw_generation: str,
+        candidate_exists: bool,
+        expected_candidate_generation: str,
+    ) -> tuple[str, bool] | None:
+        """Recover a failed refresh without discarding a newer credential generation."""
+        try:
+            current_raw, generation, _ = self._converged_canonical_generation(seat)
+            if current_raw == expected_raw_generation:
+                return self._restore_and_reload(seat, archive, expected_raw_generation)
+            # A refresh may rotate credential material before a later persistence
+            # or publication error is reported, but an advanced generation is
+            # not attributable to the refresh response. Preserve the current
+            # canonical bytes and any existing staged candidate without copying
+            # between them. The caller applies only archived admission and
+            # failure lifecycle through a generation-fenced CAS.
+            return generation, archived_disabled(archive)
+        except (OSError, PromotionError, APIError):
+            return None
+
     @staticmethod
     def _remote_credential_is_healthy(remote: dict[str, Any]) -> bool:
         status = remote.get("credential_status")
@@ -1185,6 +1424,68 @@ class Controller:
                 return
             time.sleep(0.2)
         raise PromotionError("promoted credential was not reloaded")
+
+    def _raw_generation_matching(self, seat: Seat, generation: str) -> str:
+        """Return the raw file hash only when it matches a committed opaque generation."""
+        if seat.canonical_path is None:
+            raise PromotionError("canonical path is unavailable")
+        with credential_file_lock(seat.canonical_path):
+            raw_generation = raw_file_generation(seat.canonical_path)
+            opaque_generation = file_generation(
+                seat.canonical_path,
+                self.api.api_key.encode(),
+            )
+            if not hmac.compare_digest(opaque_generation, generation):
+                raise PromotionError("canonical generation changed after transition")
+            return raw_generation
+
+    def _converged_canonical_generation(self, seat: Seat) -> tuple[str, str, bool]:
+        """Bind current canonical bytes to exact durable and runtime status."""
+        if seat.canonical_path is None:
+            raise PromotionError("canonical path is unavailable")
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            with credential_file_lock(seat.canonical_path):
+                canonical = validate_canonical(seat)
+                disabled = canonical.get("disabled", False)
+                raw_generation = raw_file_generation(seat.canonical_path)
+                generation = file_generation(
+                    seat.canonical_path,
+                    self.api.api_key.encode(),
+                )
+            try:
+                rows = self.api.status()
+            except APIError:
+                time.sleep(0.2)
+                continue
+            matches = [row for row in rows if row.get("auth_index") == seat.auth_index]
+            if len(matches) != 1:
+                raise PromotionError("credential identity changed during refresh recovery")
+            row = matches[0]
+            if (
+                row.get("generation") == generation
+                and row.get("runtime_generation") == generation
+                and row.get("durable_disabled") is disabled
+                and row.get("disabled") is disabled
+            ):
+                # Close the file/status TOCTOU window before trusting the
+                # snapshot as a rollback or lifecycle CAS base.
+                with credential_file_lock(seat.canonical_path):
+                    current = validate_canonical(seat)
+                    current_disabled = current.get("disabled", False)
+                    current_raw = raw_file_generation(seat.canonical_path)
+                    current_generation = file_generation(
+                        seat.canonical_path,
+                        self.api.api_key.encode(),
+                    )
+                if (
+                    current_raw == raw_generation
+                    and hmac.compare_digest(current_generation, generation)
+                    and current_disabled is disabled
+                ):
+                    return raw_generation, generation, disabled
+            time.sleep(0.2)
+        raise PromotionError("credential did not converge after failed refresh")
 
     def _restore_and_reload(
         self,
@@ -1398,6 +1699,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--force-probe", action="store_true", help="atomically normalize and exact-probe selected seats even when healthy")
     parser.add_argument("--provider", default="", help="after full validation, reconcile only this provider")
     parser.add_argument("--seat-key", default="", help="after full validation, reconcile only this opaque seat key")
+    parser.add_argument("--recover-rollbacks", action="store_true", help="recover all locally recorded rollback failures without refreshing or probing")
     return parser.parse_args(argv)
 
 
@@ -1419,6 +1721,14 @@ def main(argv: list[str] | None = None) -> int:
         if provider and provider not in {seat.provider for seat in inventory.seats}:
             raise InventoryError("provider filter is invalid")
         seat_key = validate_seat_key_filter(args.seat_key)
+        if args.recover_rollbacks and (
+            args.max_seats
+            or args.only_healthy
+            or args.force_probe
+            or provider
+            or seat_key
+        ):
+            raise InventoryError("rollback recovery cannot be combined with seat filters")
         api = APIAdapter(args.base_url, os.environ.get("CLIPROXY_RECONCILER_API_KEY", ""))
         controller = Controller(
             inventory,
@@ -1432,6 +1742,7 @@ def main(argv: list[str] | None = None) -> int:
             force_probe=args.force_probe,
             provider=provider,
             seat_key=seat_key,
+            recover_rollbacks=args.recover_rollbacks,
             logger=logger,
         )
         return controller.run()
