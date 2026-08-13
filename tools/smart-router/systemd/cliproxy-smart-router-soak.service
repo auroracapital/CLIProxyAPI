@@ -6,6 +6,7 @@ Requires=crsproxy.service
 
 [Service]
 Type=oneshot
+TimeoutStartSec=30s
 User=root
 Group=root
 UMask=0077

@@ -175,6 +175,32 @@ def append_json(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
 
 
+def routing_modes(config_text: str) -> tuple[str, str]:
+    strategy = ""
+    auto_mode = ""
+    in_routing = False
+    in_auto = False
+    for raw_line in config_text.splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip())
+        text = raw_line.strip()
+        if indent == 0:
+            in_routing = text == "routing:"
+            in_auto = False
+            continue
+        if not in_routing:
+            continue
+        if indent == 2 and text.startswith("strategy:"):
+            strategy = text.split(":", 1)[1].strip().strip('"\'')
+        if indent == 2:
+            in_auto = text == "auto:"
+            continue
+        if in_auto and indent == 4 and text.startswith("mode:"):
+            auto_mode = text.split(":", 1)[1].strip().strip('"\'')
+    return strategy, auto_mode
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-directory", type=Path, default=Path("/var/lib/cliproxy-smart-router-soak"))
@@ -195,8 +221,9 @@ def main() -> int:
     binary_hash = sha256(args.binary)
     config_hash = sha256(args.config)
     config_text = args.config.read_text(encoding="utf-8", errors="replace")
-    auto_active = bool(re.search(r"(?ms)^routing:\n(?:^[ \t].*\n)*?^[ \t]+auto:\n(?:^[ \t].*\n)*?^[ \t]+mode:\s*active\s*$", config_text))
-    least_pressure = bool(re.search(r"(?m)^\s+strategy:\s*least-pressure\s*$", config_text))
+    strategy, auto_mode = routing_modes(config_text)
+    auto_active = auto_mode == "active"
+    least_pressure = strategy == "least-pressure"
 
     if baseline_path.exists():
         baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
