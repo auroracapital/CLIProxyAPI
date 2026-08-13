@@ -65,6 +65,9 @@ class SoakCanaryTests(unittest.TestCase):
             key.chmod(0o640)
             with self.assertRaises(canary.CanaryError):
                 canary.read_key(key)
+            if os.geteuid() == 0:
+                key.chmod(0o440)
+                self.assertEqual(canary.read_key(key), "secret")
             target = root / "target"
             target.write_text("secret", encoding="utf-8")
             target.chmod(0o600)
