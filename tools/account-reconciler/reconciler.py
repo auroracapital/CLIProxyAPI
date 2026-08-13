@@ -900,20 +900,36 @@ class Controller:
                 raise InventoryError("canary selection is empty")
             failures = 0
             for seat in seats:
+                periodic_before = None
+                if self.periodic:
+                    periodic_before = self.store.read(
+                        opaque_key(self.hmac_key, "seat", seat.auth_index)
+                    )
                 handled = self._reconcile_locked(seat, by_index[seat.auth_index])
                 if not handled and self.periodic:
-                    handled = self._periodic_failure_is_safely_quarantined(seat)
+                    handled = self._periodic_failure_is_safely_quarantined(
+                        seat,
+                        periodic_before,
+                    )
                 if not handled:
                     failures += 1
             return 1 if failures else 0
 
-    def _periodic_failure_is_safely_quarantined(self, seat: Seat) -> bool:
+    def _periodic_failure_is_safely_quarantined(
+        self,
+        seat: Seat,
+        previous: dict[str, Any] | None,
+    ) -> bool:
         """Treat a proven future quarantine as successful periodic handling."""
         persisted = self.store.read(opaque_key(self.hmac_key, "seat", seat.auth_index))
+        # A stale record from an earlier cycle cannot prove that the current
+        # reconciliation failure was safely handled.
+        if previous is not None and persisted == previous:
+            return False
         if persisted.get("state") != "cooling":
             return False
         expected = {
-            "refresh_failed": {"retryable", "cooling", "rejected", "auth_required"},
+            "refresh_failed": {"retryable", "cooling", "rejected"},
             "probe_retryable": {"retryable", "cooling"},
             "probe_rejected": {"rejected"},
         }

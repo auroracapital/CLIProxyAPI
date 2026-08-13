@@ -1535,6 +1535,10 @@ class PeriodicModeTests(unittest.TestCase):
             self.store.write(seat_key, state, reason, outcome, 1, next_attempt)
             return False
 
+    class StaleFailureController(reconciler.Controller):
+        def _reconcile_locked(self, seat, remote):
+            return False
+
     def run_records(self, root: Path, records: dict[str, tuple[str, str, str, str]]) -> int:
         seats = tuple(
             reconciler.Seat(auth_index, "claude", "probe-model")
@@ -1598,6 +1602,127 @@ class PeriodicModeTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(self.run_records(Path(directory), records), 1)
+
+    def test_periodic_does_not_reuse_stale_safe_quarantine_for_current_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = reconciler.Seat("index-alpha", "claude", "probe-model")
+            controller = self.StaleFailureController(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                FakeAPI(),
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                periodic=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+            )
+            seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+            controller.store.write(
+                seat_key,
+                "cooling",
+                "probe_retryable",
+                "retryable",
+                1,
+                (NOW + dt.timedelta(minutes=5)).isoformat(),
+            )
+            self.assertEqual(controller.run(), 1)
+
+    def test_periodic_does_not_reuse_stale_safe_row_when_current_failure_writes_nothing(self):
+        class UnrecordedHardFailureController(reconciler.Controller):
+            def _reconcile_locked(self, seat, remote):
+                return False
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = reconciler.Seat("index-alpha", "claude", "probe-model")
+            controller = UnrecordedHardFailureController(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                FakeAPI(rows=[remote_row()]),
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                periodic=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+            )
+            seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+            future = (NOW + dt.timedelta(minutes=5)).isoformat()
+            controller.store.write(seat_key, "cooling", "probe_retryable", "retryable", 1, future)
+
+            self.assertEqual(controller.run(), 1)
+            self.assertEqual(controller.store.read(seat_key)["reason"], "probe_retryable")
+
+    def test_periodic_does_not_mask_record_local_failure_over_prior_safe_row(self):
+        class LocalFailureController(reconciler.Controller):
+            def _reconcile_locked(self, seat, remote):
+                seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+                future = (NOW + dt.timedelta(minutes=5)).isoformat()
+                return self._record_local_failure(
+                    seat_key,
+                    2,
+                    "refresh_failed",
+                    "cooling",
+                    "failed",
+                    future,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = reconciler.Seat("index-alpha", "claude", "probe-model")
+            controller = LocalFailureController(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                FakeAPI(rows=[remote_row()]),
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                periodic=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+            )
+            seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+            future = (NOW + dt.timedelta(minutes=5)).isoformat()
+            controller.store.write(seat_key, "cooling", "probe_retryable", "retryable", 1, future)
+
+            self.assertEqual(controller.run(), 1)
+            persisted = controller.store.read(seat_key)
+            self.assertEqual(persisted["state"], "cooling")
+            self.assertEqual(persisted["reason"], "refresh_failed")
+            self.assertEqual(persisted["outcome"], "failed")
+
+    def test_periodic_local_state_write_failure_is_hard_failure(self):
+        class StateWriteController(reconciler.Controller):
+            def _reconcile_locked(self, seat, remote):
+                seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+                future = (NOW + dt.timedelta(minutes=5)).isoformat()
+                self.store.write(seat_key, "cooling", "probe_retryable", "retryable", 2, future)
+                return False
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = reconciler.Seat("index-alpha", "claude", "probe-model")
+            controller = StateWriteController(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                FakeAPI(rows=[remote_row()]),
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                periodic=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+            )
+            seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+            future = (NOW + dt.timedelta(minutes=5)).isoformat()
+            controller.store.write(seat_key, "cooling", "probe_retryable", "retryable", 1, future)
+            controller.store.write = mock.Mock(side_effect=OSError("state write failed"))
+
+            with self.assertRaises(OSError):
+                controller.run()
+            self.assertEqual(controller.store.read(seat_key)["attempts"], 1)
 
     def test_systemd_execstart_enables_periodic_exit_policy(self):
         unit = (MODULE_PATH.parent / "systemd" / "cliproxy-account-reconciler.service").read_text(
