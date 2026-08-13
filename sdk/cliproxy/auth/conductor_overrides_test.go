@@ -178,10 +178,64 @@ type authFallbackExecutor struct {
 	mu                sync.Mutex
 	executeCalls      []string
 	streamCalls       []string
+	countTokenCalls   []string
 	executeErrors     map[string]error
 	streamFirstErrors map[string]error
 	streamTailErrors  map[string]error
 	countTokenErrors  map[string]error
+}
+
+type delayedFallbackExecutor struct {
+	mu           sync.Mutex
+	executeCalls []string
+	streamCalls  []string
+	countCalls   []string
+	failID       string
+	retryErr     error
+}
+
+func (*delayedFallbackExecutor) Identifier() string { return "claude" }
+
+func (e *delayedFallbackExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.executeCalls = append(e.executeCalls, auth.ID)
+	e.mu.Unlock()
+	if auth.ID == e.failID {
+		return cliproxyexecutor.Response{}, e.retryErr
+	}
+	return cliproxyexecutor.Response{Payload: []byte(auth.ID)}, nil
+}
+
+func (e *delayedFallbackExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.mu.Lock()
+	e.streamCalls = append(e.streamCalls, auth.ID)
+	e.mu.Unlock()
+	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+	if auth.ID == e.failID {
+		chunks <- cliproxyexecutor.StreamChunk{Err: e.retryErr}
+	} else {
+		chunks <- cliproxyexecutor.StreamChunk{Payload: []byte(auth.ID)}
+	}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (*delayedFallbackExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *delayedFallbackExecutor) CountTokens(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.countCalls = append(e.countCalls, auth.ID)
+	e.mu.Unlock()
+	if auth.ID == e.failID {
+		return cliproxyexecutor.Response{}, e.retryErr
+	}
+	return cliproxyexecutor.Response{Payload: []byte(auth.ID)}, nil
+}
+
+func (*delayedFallbackExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
 }
 
 func (e *authFallbackExecutor) Identifier() string {
@@ -226,6 +280,7 @@ func (e *authFallbackExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, er
 
 func (e *authFallbackExecutor) CountTokens(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	e.mu.Lock()
+	e.countTokenCalls = append(e.countTokenCalls, auth.ID)
 	err := e.countTokenErrors[auth.ID]
 	e.mu.Unlock()
 	if err != nil {
@@ -1173,8 +1228,199 @@ func TestManager_Execute_DisableCooling_RetriesAfter429RetryAfter(t *testing.T) 
 	}
 
 	calls := executor.ExecuteCalls()
-	if len(calls) != 4 {
-		t.Fatalf("execute calls = %d, want 4 (initial + 3 retries)", len(calls))
+	if len(calls) != 1 {
+		t.Fatalf("execute calls = %d, want one distinct credential attempt", len(calls))
+	}
+}
+
+func TestManager_RequestRetryNeverReusesCredential(t *testing.T) {
+	testCases := []struct {
+		name      string
+		configure func(*authFallbackExecutor, string, error)
+		invoke    func(*Manager, cliproxyexecutor.Request, cliproxyexecutor.Options) error
+		calls     func(*authFallbackExecutor) []string
+	}{
+		{
+			name: "execute",
+			configure: func(executor *authFallbackExecutor, authID string, retryErr error) {
+				executor.executeErrors = map[string]error{authID: retryErr}
+			},
+			invoke: func(manager *Manager, request cliproxyexecutor.Request, opts cliproxyexecutor.Options) error {
+				_, errExecute := manager.Execute(context.Background(), []string{"claude"}, request, opts)
+				return errExecute
+			},
+			calls: (*authFallbackExecutor).ExecuteCalls,
+		},
+		{
+			name: "count",
+			configure: func(executor *authFallbackExecutor, authID string, retryErr error) {
+				executor.countTokenErrors = map[string]error{authID: retryErr}
+			},
+			invoke: func(manager *Manager, request cliproxyexecutor.Request, opts cliproxyexecutor.Options) error {
+				_, errExecute := manager.ExecuteCount(context.Background(), []string{"claude"}, request, opts)
+				return errExecute
+			},
+			calls: func(executor *authFallbackExecutor) []string {
+				executor.mu.Lock()
+				defer executor.mu.Unlock()
+				return slices.Clone(executor.countTokenCalls)
+			},
+		},
+		{
+			name: "stream",
+			configure: func(executor *authFallbackExecutor, authID string, retryErr error) {
+				executor.streamFirstErrors = map[string]error{authID: retryErr}
+			},
+			invoke: func(manager *Manager, request cliproxyexecutor.Request, opts cliproxyexecutor.Options) error {
+				result, errExecute := manager.ExecuteStream(context.Background(), []string{"claude"}, request, opts)
+				if errExecute != nil || result == nil {
+					return errExecute
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						return chunk.Err
+					}
+				}
+				return nil
+			},
+			calls: (*authFallbackExecutor).StreamCalls,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := NewManager(nil, nil, nil)
+			manager.SetRetryConfig(3, 100*time.Millisecond, 3)
+			executor := &authFallbackExecutor{id: "claude"}
+			manager.RegisterExecutor(executor)
+			authID := "only-auth-" + tc.name
+			model := "retry-model-" + tc.name
+			retryErr := &retryAfterStatusError{status: http.StatusTooManyRequests, message: "busy", retryAfter: time.Millisecond}
+			tc.configure(executor, authID, retryErr)
+			registry.GetGlobalRegistry().RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+			if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "claude"}); errRegister != nil {
+				t.Fatal(errRegister)
+			}
+			observer := &pressureRoutingObserver{}
+			errExecute := tc.invoke(manager, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: tc.name == "stream", RoutingObserver: observer})
+			if statusCodeFromError(errExecute) != http.StatusTooManyRequests {
+				t.Fatalf("error = %v, want original HTTP 429", errExecute)
+			}
+			if errExecute.Error() != retryErr.Error() {
+				t.Fatalf("error = %q, want original %q", errExecute, retryErr)
+			}
+			if calls := tc.calls(executor); !slices.Equal(calls, []string{authID}) {
+				t.Fatalf("credential calls = %v, want one distinct call", calls)
+			}
+			events := observer.Events()
+			if len(events) != 2 || events[0].Stage != "account_selection" || events[1].Stage != "account_attempt" || events[0].SeatBucket != events[1].SeatBucket {
+				t.Fatalf("routing events = %+v, want one selected/terminal pair", events)
+			}
+		})
+	}
+}
+
+func TestManager_RequestRetryWaitsOnlyForDistinctCredential(t *testing.T) {
+	testCases := []struct {
+		name   string
+		invoke func(*Manager, cliproxyexecutor.Request) error
+		calls  func(*delayedFallbackExecutor) []string
+	}{
+		{
+			name: "execute",
+			invoke: func(manager *Manager, request cliproxyexecutor.Request) error {
+				_, errExecute := manager.Execute(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
+				return errExecute
+			},
+			calls: func(executor *delayedFallbackExecutor) []string { return slices.Clone(executor.executeCalls) },
+		},
+		{
+			name: "count",
+			invoke: func(manager *Manager, request cliproxyexecutor.Request) error {
+				_, errExecute := manager.ExecuteCount(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
+				return errExecute
+			},
+			calls: func(executor *delayedFallbackExecutor) []string { return slices.Clone(executor.countCalls) },
+		},
+		{
+			name: "stream",
+			invoke: func(manager *Manager, request cliproxyexecutor.Request) error {
+				result, errExecute := manager.ExecuteStream(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{Stream: true})
+				if errExecute != nil || result == nil {
+					return errExecute
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						return chunk.Err
+					}
+				}
+				return nil
+			},
+			calls: func(executor *delayedFallbackExecutor) []string { return slices.Clone(executor.streamCalls) },
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			model := "delayed-distinct-" + tc.name
+			firstID := "a-first-" + tc.name
+			secondID := "b-second-" + tc.name
+			retryErr := &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "busy"}
+			executor := &delayedFallbackExecutor{failID: firstID, retryErr: retryErr}
+			manager := NewManager(nil, &FillFirstSelector{}, nil)
+			manager.SetRetryConfig(2, 100*time.Millisecond, 2)
+			manager.RegisterExecutor(executor)
+			next := time.Now().Add(15 * time.Millisecond)
+			for _, auth := range []*Auth{
+				{ID: firstID, Provider: "claude"},
+				{ID: secondID, Provider: "claude", ModelStates: map[string]*ModelState{model: {Unavailable: true, Status: StatusError, NextRetryAfter: next}}},
+			} {
+				registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+				if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+					t.Fatal(errRegister)
+				}
+			}
+			if errExecute := tc.invoke(manager, cliproxyexecutor.Request{Model: model}); errExecute != nil {
+				t.Fatal(errExecute)
+			}
+			executor.mu.Lock()
+			calls := tc.calls(executor)
+			executor.mu.Unlock()
+			if !slices.Equal(calls, []string{firstID, secondID}) {
+				t.Fatalf("credential calls = %v, want distinct attempts [%s %s]", calls, firstID, secondID)
+			}
+		})
+	}
+}
+
+func TestManager_RequestRetryDoesNotWaitAfterCredentialBudgetExhausted(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.SetRetryConfig(2, time.Second, 1)
+	executor := &delayedFallbackExecutor{
+		failID:   "a-budget-first",
+		retryErr: &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "busy"},
+	}
+	manager.RegisterExecutor(executor)
+	model := "budget-no-wait"
+	for _, auth := range []*Auth{
+		{ID: executor.failID, Provider: "claude"},
+		{ID: "b-budget-second", Provider: "claude", ModelStates: map[string]*ModelState{model: {Unavailable: true, Status: StatusError, NextRetryAfter: time.Now().Add(500 * time.Millisecond)}}},
+	} {
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+	}
+	started := time.Now()
+	_, errExecute := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("expected retryable failure")
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("credential budget exhaustion waited %v for an unusable retry", elapsed)
 	}
 }
 

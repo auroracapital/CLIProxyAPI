@@ -691,6 +691,10 @@ func (m *Manager) retrySettings() (int, int, time.Duration) {
 }
 
 func (m *Manager) closestCooldownWait(providers []string, model string, attempt int) (time.Duration, bool) {
+	return m.closestCooldownWaitExcluding(providers, model, attempt, nil)
+}
+
+func (m *Manager) closestCooldownWaitExcluding(providers []string, model string, attempt int, tried map[string]struct{}) (time.Duration, bool) {
 	if m == nil || len(providers) == 0 {
 		return 0, false
 	}
@@ -715,6 +719,9 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 	)
 	for _, auth := range m.auths {
 		if auth == nil {
+			continue
+		}
+		if _, alreadyTried := tried[auth.ID]; alreadyTried {
 			continue
 		}
 		providerKey := executorKeyFromAuth(auth)
@@ -796,6 +803,10 @@ func (m *Manager) retryAllowed(attempt int, providers []string) bool {
 }
 
 func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []string, model string, maxWait time.Duration) (time.Duration, bool) {
+	return m.shouldRetryAfterErrorExcluding(err, attempt, providers, model, maxWait, nil)
+}
+
+func (m *Manager) shouldRetryAfterErrorExcluding(err error, attempt int, providers []string, model string, maxWait time.Duration, tried map[string]struct{}) (time.Duration, bool) {
 	if err == nil {
 		return 0, false
 	}
@@ -813,12 +824,18 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if isRequestInvalidError(err) {
 		return 0, false
 	}
-	wait, found := m.closestCooldownWait(providers, model, attempt)
+	wait, found := m.closestCooldownWaitExcluding(providers, model, attempt, tried)
 	if found {
 		if wait > maxWait {
 			return 0, false
 		}
 		return wait, true
+	}
+	// Request execution passes every credential already dispatched. Once no
+	// untried credential has a bounded recovery window, a provider Retry-After
+	// must not cause the same failed credential to be replayed.
+	if len(tried) > 0 {
+		return 0, false
 	}
 	if status != http.StatusTooManyRequests {
 		return 0, false

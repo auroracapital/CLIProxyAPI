@@ -48,11 +48,12 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	}
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
+	credentialAttempts := newCredentialAttemptState()
 
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	for attempt := 0; ; attempt++ {
-		resp, errExec := m.executeMixedOnce(ctx, normalized, req, opts, maxRetryCredentials, routingRequest)
+		resp, errExec := m.executeMixedOnce(ctx, normalized, req, opts, maxRetryCredentials, routingRequest, credentialAttempts, lastErr)
 		if errExec == nil {
 			return resp, nil
 		}
@@ -60,7 +61,10 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 			return cliproxyexecutor.Response{}, errExec
 		}
 		lastErr = errExec
-		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, retryModel, maxWait)
+		if maxRetryCredentials > 0 && len(credentialAttempts.attempted) >= maxRetryCredentials {
+			break
+		}
+		wait, shouldRetry := m.shouldRetryAfterErrorExcluding(errExec, attempt, normalized, retryModel, maxWait, credentialAttempts.tried)
 		if !shouldRetry {
 			break
 		}
@@ -94,11 +98,12 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	}
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
+	credentialAttempts := newCredentialAttemptState()
 
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	for attempt := 0; ; attempt++ {
-		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, opts, maxRetryCredentials, routingRequest)
+		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, opts, maxRetryCredentials, routingRequest, credentialAttempts, lastErr)
 		if errExec == nil {
 			return resp, nil
 		}
@@ -106,7 +111,10 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 			return cliproxyexecutor.Response{}, errExec
 		}
 		lastErr = errExec
-		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, retryModel, maxWait)
+		if maxRetryCredentials > 0 && len(credentialAttempts.attempted) >= maxRetryCredentials {
+			break
+		}
+		wait, shouldRetry := m.shouldRetryAfterErrorExcluding(errExec, attempt, normalized, retryModel, maxWait, credentialAttempts.tried)
 		if !shouldRetry {
 			break
 		}
@@ -136,11 +144,12 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	}
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
+	credentialAttempts := newCredentialAttemptState()
 
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	for attempt := 0; ; attempt++ {
-		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, maxRetryCredentials, routingRequest)
+		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, maxRetryCredentials, routingRequest, credentialAttempts, lastErr)
 		if errStream == nil {
 			return result, nil
 		}
@@ -148,7 +157,10 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 			return nil, errStream
 		}
 		lastErr = errStream
-		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, normalized, retryModel, maxWait)
+		if maxRetryCredentials > 0 && len(credentialAttempts.attempted) >= maxRetryCredentials {
+			break
+		}
+		wait, shouldRetry := m.shouldRetryAfterErrorExcluding(errStream, attempt, normalized, retryModel, maxWait, credentialAttempts.tried)
 		if !shouldRetry {
 			break
 		}
@@ -276,7 +288,7 @@ func mergeRequestHeaders(current, updates http.Header, clear []string) http.Head
 	return out
 }
 
-func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, routingRequest *accountRoutingRequest) (cliproxyexecutor.Response, error) {
+func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, routingRequest *accountRoutingRequest, credentialAttempts *credentialAttemptState, previousErr error) (cliproxyexecutor.Response, error) {
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -285,11 +297,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
-	tried := make(map[string]struct{})
-	attempted := make(map[string]struct{})
-	var lastErr error
+	lastErr := previousErr
 	for {
-		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if !homeMode && maxRetryCredentials > 0 && len(credentialAttempts.attempted) >= maxRetryCredentials {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -299,7 +309,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, requestPressureReservation(pickOpts), tried)
+		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, requestPressureReservation(pickOpts), credentialAttempts.tried)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
@@ -328,7 +338,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
-		tried[auth.ID] = struct{}{}
+		credentialAttempts.tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -342,7 +352,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			releasePressure()
 			continue
 		}
-		attempted[auth.ID] = struct{}{}
+		credentialAttempts.attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
@@ -439,7 +449,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	}
 }
 
-func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, routingRequest *accountRoutingRequest) (cliproxyexecutor.Response, error) {
+func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, routingRequest *accountRoutingRequest, credentialAttempts *credentialAttemptState, previousErr error) (cliproxyexecutor.Response, error) {
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -448,11 +458,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
-	tried := make(map[string]struct{})
-	attempted := make(map[string]struct{})
-	var lastErr error
+	lastErr := previousErr
 	for {
-		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if !homeMode && maxRetryCredentials > 0 && len(credentialAttempts.attempted) >= maxRetryCredentials {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -462,7 +470,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, requestPressureReservation(pickOpts), tried)
+		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, requestPressureReservation(pickOpts), credentialAttempts.tried)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
@@ -491,7 +499,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
-		tried[auth.ID] = struct{}{}
+		credentialAttempts.tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -505,7 +513,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			releasePressure()
 			continue
 		}
-		attempted[auth.ID] = struct{}{}
+		credentialAttempts.attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
@@ -610,7 +618,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 }
 
-func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, routingRequest *accountRoutingRequest) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, routingRequest *accountRoutingRequest, credentialAttempts *credentialAttemptState, previousErr error) (*cliproxyexecutor.StreamResult, error) {
 	if len(providers) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -620,12 +628,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
-	tried := make(map[string]struct{})
-	attempted := make(map[string]struct{})
 	unauthorizedRefreshTried := make(map[string]struct{})
-	var lastErr error
+	lastErr := previousErr
 	for {
-		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if !homeMode && maxRetryCredentials > 0 && len(credentialAttempts.attempted) >= maxRetryCredentials {
 			if lastErr != nil {
 				return nil, lastErr
 			}
@@ -649,7 +655,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				provider = selection.Provider
 			}
 		} else {
-			auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, requestPressureReservation(pickOpts), tried)
+			auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, requestPressureReservation(pickOpts), credentialAttempts.tried)
 		}
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
@@ -701,7 +707,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
-		tried[auth.ID] = struct{}{}
+		credentialAttempts.tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		releaseAttempt := func() {}
 		if selection != nil {
@@ -736,7 +742,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			continue
 		}
-		attempted[auth.ID] = struct{}{}
+		credentialAttempts.attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		if selection != nil {
 			auth, errPrepare = m.prepareHomeRequestAuth(execCtx, executor, selection)
@@ -824,6 +830,21 @@ type accountRoutingRequest struct {
 	observer      cliproxyexecutor.RoutingObserver
 	requestBucket string
 	nextAttempt   atomic.Uint64
+}
+
+// credentialAttemptState keeps credential exclusions for the whole client
+// request, including retries after a cooldown wait. Recreating these maps for
+// each outer retry can dispatch the same failed credential repeatedly.
+type credentialAttemptState struct {
+	tried     map[string]struct{}
+	attempted map[string]struct{}
+}
+
+func newCredentialAttemptState() *credentialAttemptState {
+	return &credentialAttemptState{
+		tried:     make(map[string]struct{}),
+		attempted: make(map[string]struct{}),
+	}
 }
 
 type accountRoutingAttempt struct {

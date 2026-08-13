@@ -306,9 +306,9 @@ func TestRoutingLogFieldsOnlyAcceptOpaqueRequestBuckets(t *testing.T) {
 		}
 	}
 	fields, ok := routingLogFields(coreexecutor.RoutingEvent{
-		Stage: "model_decision", Mode: "shadow", Outcome: "selected", RequestBucket: "r1_01234567",
+		Stage: "model_decision", Mode: "shadow", Outcome: "selected", RequestBucket: "r1_0123456789abcdef",
 	})
-	if !ok || fields["routing_request_bucket"] != "r1_01234567" {
+	if !ok || fields["routing_request_bucket"] != "r1_0123456789abcdef" {
 		t.Fatalf("routingLogFields(valid request bucket) = %#v, %v", fields, ok)
 	}
 }

@@ -16,6 +16,7 @@ type unauthorizedRefreshExecutor struct {
 	mu            sync.Mutex
 	executeCalls  []string
 	streamCalls   []string
+	countCalls    []string
 	refreshCalls  int
 	tokenInvalid  map[string]struct{}
 	refreshFail   bool
@@ -75,8 +76,16 @@ func (e *unauthorizedRefreshExecutor) Refresh(_ context.Context, auth *Auth) (*A
 	return auth, nil
 }
 
-func (e *unauthorizedRefreshExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusNotImplemented, Message: "not implemented"}
+func (e *unauthorizedRefreshExecutor) CountTokens(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.countCalls = append(e.countCalls, auth.ID)
+	token := authAccessToken(auth)
+	_, invalid := e.tokenInvalid[token]
+	e.mu.Unlock()
+	if invalid {
+		return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "authentication token invalidated"}
+	}
+	return cliproxyexecutor.Response{Payload: []byte(auth.ID + ":" + token)}, nil
 }
 
 func (e *unauthorizedRefreshExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
@@ -97,6 +106,12 @@ func (e *unauthorizedRefreshExecutor) StreamCalls() []string {
 	out := make([]string, len(e.streamCalls))
 	copy(out, e.streamCalls)
 	return out
+}
+
+func (e *unauthorizedRefreshExecutor) CountCalls() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.countCalls...)
 }
 
 func (e *unauthorizedRefreshExecutor) RefreshCalls() int {
@@ -221,6 +236,29 @@ func TestManager_ExecuteStream_UnauthorizedRefreshesCurrentAuthBeforeFallback(t 
 		t.Fatalf("Stream calls = %v, want [primary, primary]", got)
 	}
 	for _, id := range executor.StreamCalls() {
+		if id == backup.ID {
+			t.Fatalf("backup auth should not be used when refresh recovers primary")
+		}
+	}
+}
+
+func TestManager_ExecuteCount_UnauthorizedRefreshesCurrentAuthBeforeFallback(t *testing.T) {
+	m, executor, primary, backup, model := newUnauthorizedRefreshFixture(t, false)
+
+	resp, errCount := m.ExecuteCount(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errCount != nil {
+		t.Fatalf("ExecuteCount error = %v, want success on refreshed primary", errCount)
+	}
+	if got := string(resp.Payload); got != primary.ID+":fresh-access-token" {
+		t.Fatalf("payload = %q, want refreshed primary response", got)
+	}
+	if got := executor.RefreshCalls(); got != 1 {
+		t.Fatalf("Refresh calls = %d, want 1", got)
+	}
+	if got := executor.CountCalls(); len(got) != 2 || got[0] != primary.ID || got[1] != primary.ID {
+		t.Fatalf("Count calls = %v, want [primary, primary]", got)
+	}
+	for _, id := range executor.CountCalls() {
 		if id == backup.ID {
 			t.Fatalf("backup auth should not be used when refresh recovers primary")
 		}

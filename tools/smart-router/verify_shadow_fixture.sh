@@ -22,5 +22,5 @@ if ! id crsproxy >/dev/null 2>&1; then
   exit 2
 fi
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 exec unshare --net --fork --mount-proc "$script_dir/verify_shadow_fixture_inside.sh" --inside "$binary"

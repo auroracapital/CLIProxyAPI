@@ -55,7 +55,7 @@ func RoutingRequestBucket(requestID string) string {
 	digest := hmac.New(sha256.New, routingRequestBucketKey[:])
 	_, _ = digest.Write([]byte("cliproxy-routing-request-v1\x00"))
 	_, _ = digest.Write([]byte(requestID))
-	return fmt.Sprintf("r1_%x", digest.Sum(nil)[:4])
+	return fmt.Sprintf("r1_%x", digest.Sum(nil)[:8])
 }
 
 var routingEventEnums = map[string]map[string]struct{}{
@@ -110,7 +110,7 @@ func NormalizeRoutingEvent(event RoutingEvent) RoutingEvent {
 }
 
 func routingRequestBucket(value string) string {
-	if len(value) != 11 || !strings.HasPrefix(value, "r1_") {
+	if len(value) != 19 || !strings.HasPrefix(value, "r1_") {
 		return ""
 	}
 	for _, r := range value[3:] {

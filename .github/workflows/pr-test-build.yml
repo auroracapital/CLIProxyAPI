@@ -145,6 +145,7 @@ jobs:
           python -m compileall -q tools/account-reconciler/reconciler.py tools/account-reconciler/tests
           python -m py_compile tools/smart-router/verify_production_soak.py
           python -m unittest discover -s tools/account-reconciler/tests -q
+          python -m unittest discover -s tools/smart-router/tests -q
           systemd-analyze verify \
             tools/account-reconciler/systemd/cliproxy-account-reconciler.service \
             tools/account-reconciler/systemd/cliproxy-account-reconciler.timer \

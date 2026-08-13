@@ -411,7 +411,7 @@ terminal = [event for event in events if event.get("routing_stage") == "account_
 if len(selected) != len(expected) or len(terminal) != len(expected):
     raise SystemExit(f"missing selected/terminal account events: {events}")
 request_buckets = {event.get("routing_request_bucket", "") for event in events}
-if len(request_buckets) != 1 or not re.fullmatch(r"r1_[0-9a-f]{8}", next(iter(request_buckets))):
+if len(request_buckets) != 1 or not re.fullmatch(r"r1_[0-9a-f]{16}", next(iter(request_buckets))):
     raise SystemExit(f"account events do not share one opaque request bucket: {events}")
 if any(event.get("routing_selector") != "least_pressure" for event in events):
     raise SystemExit(f"unexpected selector: {events}")
