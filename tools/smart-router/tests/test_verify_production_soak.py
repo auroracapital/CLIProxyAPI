@@ -30,6 +30,16 @@ def event(stage: str, outcome: str, *, request: str = "r1_0123456789abcdef", att
 
 
 class PureStateMachineTests(unittest.TestCase):
+    def test_routing_modes_supports_rendered_json_and_source_yaml(self) -> None:
+        self.assertEqual(
+            soak.routing_modes(json.dumps({"routing": {"strategy": "least-pressure", "auto": {"mode": "exclusive"}}})),
+            ("least-pressure", "exclusive"),
+        )
+        self.assertEqual(
+            soak.routing_modes("routing:\n  strategy: least-pressure\n  auto:\n    mode: reject\n"),
+            ("least-pressure", "reject"),
+        )
+
     def baseline(self, *, now: float = 1000, leases: int = 0) -> dict[str, object]:
         class Metadata:
             st_ino = 7

@@ -446,6 +446,19 @@ def write_final_once(path: Path, content: bytes) -> None:
 
 
 def routing_modes(config_text: str) -> tuple[str, str]:
+    try:
+        parsed = json.loads(config_text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        routing = parsed.get("routing")
+        if not isinstance(routing, dict):
+            return "", ""
+        auto = routing.get("auto")
+        return (
+            str(routing.get("strategy", "")).strip(),
+            str(auto.get("mode", "")).strip() if isinstance(auto, dict) else "",
+        )
     strategy = ""
     auto_mode = ""
     in_routing = False
