@@ -309,7 +309,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 
 		entry := logEntryWithRequestID(ctx)
-		m.emitAccountRoutingEvent(opts.RoutingObserver, "account_selection", provider, routeModel, auth, "selected", len(attempted), len(providers))
+		m.emitAccountRoutingEvent(opts.RoutingObserver, "account_selection", provider, routeModel, auth, "selected", len(attempted), 0)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
@@ -452,7 +452,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 
 		entry := logEntryWithRequestID(ctx)
-		m.emitAccountRoutingEvent(opts.RoutingObserver, "account_selection", provider, routeModel, auth, "selected", len(attempted), len(providers))
+		m.emitAccountRoutingEvent(opts.RoutingObserver, "account_selection", provider, routeModel, auth, "selected", len(attempted), 0)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
@@ -633,7 +633,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 
 		entry := logEntryWithRequestID(ctx)
-		m.emitAccountRoutingEvent(opts.RoutingObserver, "account_selection", provider, routeModel, auth, "selected", len(attempted), len(providers))
+		m.emitAccountRoutingEvent(opts.RoutingObserver, "account_selection", provider, routeModel, auth, "selected", len(attempted), 0)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		if selection != nil {
 			if errRuntimeAuth := m.bindHomeSelectionRuntimeAuth(ctx, opts, selection); errRuntimeAuth != nil {

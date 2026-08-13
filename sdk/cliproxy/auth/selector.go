@@ -871,7 +871,7 @@ func (s *ShadowLeastPressureSelector) Pick(ctx context.Context, provider, model 
 			Stage:               "account_prediction",
 			Mode:                "shadow",
 			Model:               model,
-			Provider:            provider,
+			Provider:            actual.Provider,
 			Outcome:             "predicted",
 			CandidateCount:      len(available),
 			Selector:            "shadow_least_pressure",

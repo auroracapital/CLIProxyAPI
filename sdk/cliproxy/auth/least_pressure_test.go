@@ -602,6 +602,9 @@ func TestShadowLeastPressurePredictsWithoutChangingProductionSelection(t *testin
 	if events[0].PredictedSeatBucket != routingSeatBucket(idle.ID) || events[1].PredictedSeatBucket != routingSeatBucket(idle.ID) {
 		t.Fatalf("shadow predicted seat buckets = %#v", events)
 	}
+	if events[0].Provider != busy.Provider || events[1].Provider != idle.Provider || events[0].CandidateCount != 2 || events[1].CandidateCount != 2 {
+		t.Fatalf("shadow provider/candidate telemetry = %#v", events)
+	}
 }
 
 func TestShadowLeastPressureReservationTracksActualNotPrediction(t *testing.T) {
