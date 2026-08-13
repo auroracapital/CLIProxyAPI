@@ -206,8 +206,11 @@ assert_zero_leases() {
   for _ in $(seq 1 100); do
     snapshot=$(pressure 2>/dev/null || true)
     if [[ -n $snapshot ]] && jq -e '
-      .schema_version == 1 and
+      .schema_version == 2 and
       .selector == "least_pressure" and
+      (.telemetry_instance | test("^p1_[0-9a-f]{32}$")) and
+      (.routing_events_dropped | type == "number") and
+      (.routing_events_rejected | type == "number") and
       .active_leases == 0 and
       .active_seats == 0 and
       (.seats | length) == 0
@@ -225,8 +228,9 @@ assert_one_active_lease() {
   for _ in $(seq 1 100); do
     snapshot=$(pressure 2>/dev/null || true)
     if [[ -n $snapshot ]] && jq -e '
-      .schema_version == 1 and
+      .schema_version == 2 and
       .selector == "least_pressure" and
+      (.telemetry_instance | test("^p1_[0-9a-f]{32}$")) and
       .active_leases == 1 and
       .active_seats == 1 and
       (.seats | length) == 1 and

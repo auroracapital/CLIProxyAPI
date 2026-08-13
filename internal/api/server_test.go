@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1474,15 +1475,21 @@ func TestManagementRoutingPressureRouteUsesLiveManagerAndRequiresAuth(t *testing
 		t.Fatalf("authenticated status = %d, want %d body=%s", authRR.Code, http.StatusOK, authRR.Body.String())
 	}
 	var payload struct {
-		SchemaVersion int           `json:"schema_version"`
-		ActiveLeases  int64         `json:"active_leases"`
-		ActiveSeats   int           `json:"active_seats"`
-		Seats         []interface{} `json:"seats"`
+		SchemaVersion         int           `json:"schema_version"`
+		TelemetryInstance     string        `json:"telemetry_instance"`
+		ActiveLeases          int64         `json:"active_leases"`
+		ActiveSeats           int           `json:"active_seats"`
+		Seats                 []interface{} `json:"seats"`
+		EligibleRoutes        []interface{} `json:"eligible_routes"`
+		RoutingEventsDropped  uint64        `json:"routing_events_dropped"`
+		RoutingEventsRejected uint64        `json:"routing_events_rejected"`
 	}
 	if errUnmarshal := json.Unmarshal(authRR.Body.Bytes(), &payload); errUnmarshal != nil {
 		t.Fatalf("unmarshal response: %v body=%s", errUnmarshal, authRR.Body.String())
 	}
-	if payload.SchemaVersion != 1 || payload.ActiveLeases != 0 || payload.ActiveSeats != 0 || len(payload.Seats) != 0 {
+	if payload.SchemaVersion != 2 || !regexp.MustCompile(`^p1_[0-9a-f]{32}$`).MatchString(payload.TelemetryInstance) ||
+		payload.ActiveLeases != 0 || payload.ActiveSeats != 0 || len(payload.Seats) != 0 || len(payload.EligibleRoutes) != 0 ||
+		payload.RoutingEventsDropped != 0 || payload.RoutingEventsRejected != 0 {
 		t.Fatalf("routing pressure payload = %#v", payload)
 	}
 }

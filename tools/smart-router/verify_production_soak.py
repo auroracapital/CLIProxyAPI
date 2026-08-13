@@ -42,6 +42,8 @@ SELECTION_OUTCOMES = {"selected"}
 INVENTORY_STATES = {"ready", "cooling", "auth_required", "refreshing", "probing", "quarantined"}
 RECONCILER_RESULTS = {"success", "exit-code"}
 SEAT_BUCKET = re.compile(r"^h1_[0-9a-f]{16}$")
+ROUTE_BUCKET = re.compile(r"^g1_[0-9a-f]{16}$")
+TELEMETRY_INSTANCE = re.compile(r"^p1_[0-9a-f]{32}$")
 REQUEST_BUCKET = re.compile(r"^r1_[0-9a-f]{16}$")
 SAFE_ROUTE_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,127}$")
 ATTEMPT = re.compile(r"^[1-9][0-9]{0,3}$")
@@ -50,6 +52,13 @@ HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 RUN_ID = re.compile(r"^[0-9a-f]{32}$")
 EVENT_ID = re.compile(r"^e1_[0-9a-f]{64}$")
 TELEMETRY_FIELD = re.compile(r"\b(routing_[a-z_]+)=(\S*)")
+ROUTING_FIELDS = {
+    "routing_schema_version", "routing_stage", "routing_mode", "routing_task",
+    "routing_score_version", "routing_model", "routing_provider", "routing_reason",
+    "routing_outcome", "routing_attempt", "routing_candidate_count", "routing_duration_ms",
+    "routing_selector", "routing_shadow_match", "routing_seat_bucket",
+    "routing_predicted_seat_bucket", "routing_request_bucket",
+}
 FORBIDDEN_TELEMETRY = re.compile(
     r"(?i)(bearer\s+|authorization|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|"
     r"password|cookie|secret|credential|(?:^|[\s_=-])token(?:[\s_=-]|$)|(?:^|[\s_=-])key(?:[\s_=-]|$)|"
@@ -83,6 +92,7 @@ CHECK_NAMES = {
     "no_orphan_terminal_events",
     "no_manual_toggles",
     "log_continuity",
+    "telemetry_complete",
 }
 INCIDENT_NAMES = {"verifier_execution", "artifact_integrity"}
 FAILURE_NAMES = CHECK_NAMES | INCIDENT_NAMES
@@ -93,6 +103,7 @@ FIRST_ATTEMPT_SUCCESS_PERCENT = 98
 ROUTING_P95_LIMIT_MS = 25
 PRESSURE_SKEW_RATIO_MILLI = 1500
 PRESSURE_SKEW_MAX_SECONDS = 5 * 60
+MIN_FAIR_ROUTE_SELECTIONS = 100
 
 
 def canonical_json(payload: Any) -> bytes:
@@ -267,6 +278,8 @@ def safe_event(fields: dict[str, str]) -> dict[str, str] | None:
     outcome = fields.get("routing_outcome", "")
     if stage not in OBSERVED_STAGES:
         return None
+    if fields.get("routing_schema_version") != "1" or fields.get("routing_mode") != "active":
+        return None
     if not REQUEST_BUCKET.fullmatch(fields.get("routing_request_bucket", "")):
         return None
     if stage in ACCOUNT_STAGES and not SEAT_BUCKET.fullmatch(fields.get("routing_seat_bucket", "")):
@@ -275,9 +288,16 @@ def safe_event(fields: dict[str, str]) -> dict[str, str] | None:
         return None
     if stage in SLO_STAGES and not NONNEGATIVE_INTEGER.fullmatch(fields.get("routing_attempt", "")):
         return None
-    if not SAFE_ROUTE_VALUE.fullmatch(fields.get("routing_provider", "")):
+    provider = fields.get("routing_provider", "")
+    model = fields.get("routing_model", "")
+    if stage != "model_decision" and (
+        not SAFE_ROUTE_VALUE.fullmatch(provider) or not SAFE_ROUTE_VALUE.fullmatch(model)
+    ):
         return None
-    if not SAFE_ROUTE_VALUE.fullmatch(fields.get("routing_model", "")):
+    if stage == "model_decision" and (
+        (provider and not SAFE_ROUTE_VALUE.fullmatch(provider))
+        or (model and not SAFE_ROUTE_VALUE.fullmatch(model))
+    ):
         return None
     allowed_outcomes = SELECTION_OUTCOMES if stage in {"account_selection", "model_decision"} else (
         ATTEMPT_OUTCOMES | {"started", "committed"}
@@ -327,7 +347,7 @@ def read_events(log_path: Path, cursor: dict[str, int]) -> tuple[list[dict[str, 
             continue
         pairs = TELEMETRY_FIELD.findall(line)
         names = [name for name, _ in pairs]
-        if len(names) != len(set(names)):
+        if len(names) != len(set(names)) or set(names) != ROUTING_FIELDS:
             counters["invalid"] += 1
             continue
         event = safe_event(dict(pairs))
@@ -358,8 +378,9 @@ def new_baseline(
     config_hash: str,
     verifier_hash: str,
     log_metadata: os.stat_result,
-    pressure_rows: list[dict[str, Any]],
+    pressure: dict[str, Any],
 ) -> dict[str, Any]:
+    pressure_rows = pressure.get("seats", [])
     allowance: dict[str, int] = {}
     for row in pressure_rows:
         seat = str(row.get("seat_bucket", ""))
@@ -383,6 +404,9 @@ def new_baseline(
         "initial_log_inode": int(log_metadata.st_ino),
         "initial_log_offset": int(log_metadata.st_size),
         "startup_allowance": allowance,
+        "telemetry_instance": pressure.get("telemetry_instance"),
+        "routing_events_dropped": pressure.get("routing_events_dropped"),
+        "routing_events_rejected": pressure.get("routing_events_rejected"),
     }
 
 
@@ -400,7 +424,8 @@ def validate_baseline(baseline: dict[str, Any], now: float) -> None:
     required = set(exact) | {
         "run_id", "started_at_epoch", "soak_cutoff_epoch", "expected_binary_sha256",
         "expected_config_sha256", "expected_verifier_sha256", "initial_log_inode",
-        "initial_log_offset", "startup_allowance",
+        "initial_log_offset", "startup_allowance", "telemetry_instance",
+        "routing_events_dropped", "routing_events_rejected",
     }
     if set(baseline) != required:
         raise RuntimeError("invalid baseline fields")
@@ -418,6 +443,12 @@ def validate_baseline(baseline: dict[str, Any], now: float) -> None:
         raise RuntimeError("invalid baseline hash")
     if int(baseline["initial_log_inode"]) < 0 or int(baseline["initial_log_offset"]) < 0:
         raise RuntimeError("invalid baseline cursor")
+    if not TELEMETRY_INSTANCE.fullmatch(str(baseline["telemetry_instance"])):
+        raise RuntimeError("invalid baseline telemetry instance")
+    for name in ("routing_events_dropped", "routing_events_rejected"):
+        value = baseline[name]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise RuntimeError("invalid baseline telemetry counter")
     allowance = baseline["startup_allowance"]
     if not isinstance(allowance, dict) or any(
         not SEAT_BUCKET.fullmatch(str(key)) or not isinstance(value, int) or value < 0
@@ -443,6 +474,7 @@ def new_state(baseline: dict[str, Any]) -> dict[str, Any]:
         "slo": {
             "terminal_requests": {}, "model_attempts": {}, "deterministic_latencies_ms": [],
             "selection_counts": {},
+            "eligible_routes": {},
             "pressure_skew_violation_seconds": 0.0, "pressure_skew_last_sample_epoch": None,
         },
         "samples": [],
@@ -483,12 +515,30 @@ def validate_sample(sample: dict[str, Any], state: dict[str, Any], index: int, p
     expected_failures = sorted([key for key, value in checks.items() if not value] + incidents)
     if sorted(failures) != expected_failures or sample.get("healthy") is not (not failures):
         raise RuntimeError("invalid evidence health")
-    if not isinstance(sample.get("observations"), dict):
+    observations = sample.get("observations")
+    if not isinstance(observations, dict):
         raise RuntimeError("invalid evidence observations")
     unsigned = dict(sample)
     actual_hash = str(unsigned.pop("sample_sha256", ""))
     if not HEX_64.fullmatch(actual_hash) or object_hash(unsigned) != actual_hash:
         raise RuntimeError("invalid evidence hash")
+    if not incidents:
+        if set(observations) != {"inventory", "pressure", "events", "reconciler", "manual_toggles", "telemetry"}:
+            raise RuntimeError("invalid evidence observation fields")
+        pressure = observations["pressure"]
+        if not isinstance(pressure, dict) or set(pressure) != {"active_leases", "active_seats"} or any(
+            not isinstance(pressure[name], int) or isinstance(pressure[name], bool) or pressure[name] < 0
+            for name in ("active_leases", "active_seats")
+        ):
+            raise RuntimeError("invalid evidence pressure")
+        if not isinstance(observations["manual_toggles"], int) or isinstance(observations["manual_toggles"], bool) or observations["manual_toggles"] < 0:
+            raise RuntimeError("invalid evidence manual toggles")
+        telemetry = observations.get("telemetry")
+        if not valid_telemetry_tuple(telemetry):
+            raise RuntimeError("invalid evidence telemetry")
+        expected_complete = telemetry == baseline_telemetry(state["baseline"])
+        if checks.get("telemetry_complete") is not expected_complete:
+            raise RuntimeError("invalid evidence telemetry check")
     return actual_hash
 
 
@@ -636,6 +686,7 @@ def validate_slo_state(slo: Any) -> None:
     if not isinstance(slo, dict) or set(slo) != {
         "terminal_requests", "model_attempts", "deterministic_latencies_ms",
         "selection_counts", "pressure_skew_violation_seconds", "pressure_skew_last_sample_epoch",
+        "eligible_routes",
     }:
         raise RuntimeError("invalid slo state")
     terminal_requests = slo["terminal_requests"]
@@ -657,18 +708,117 @@ def validate_slo_state(slo: Any) -> None:
         raise RuntimeError("invalid slo latencies")
     selection_counts = slo["selection_counts"]
     if not isinstance(selection_counts, dict) or any(
-        not SAFE_ROUTE_VALUE.fullmatch(str(group))
+        not ROUTE_BUCKET.fullmatch(str(group))
         or not isinstance(seats, dict)
-        or any(not SEAT_BUCKET.fullmatch(str(seat)) or not isinstance(count, int) or count < 0 for seat, count in seats.items())
+        or any(
+            not SEAT_BUCKET.fullmatch(str(seat)) or not isinstance(count, int)
+            or isinstance(count, bool) or count < 0
+            for seat, count in seats.items()
+        )
         for group, seats in selection_counts.items()
     ):
         raise RuntimeError("invalid slo selection counts")
+    validate_eligible_routes(slo["eligible_routes"])
     violation = slo["pressure_skew_violation_seconds"]
     last = slo["pressure_skew_last_sample_epoch"]
     if not isinstance(violation, (int, float)) or isinstance(violation, bool) or not math.isfinite(float(violation)) or violation < 0:
         raise RuntimeError("invalid slo pressure duration")
     if last is not None and (not isinstance(last, (int, float)) or isinstance(last, bool) or not math.isfinite(float(last))):
         raise RuntimeError("invalid slo pressure time")
+
+
+def validate_eligible_routes(routes: Any) -> None:
+    if not isinstance(routes, dict):
+        raise RuntimeError("invalid slo eligible routes")
+    for route, record in routes.items():
+        if not ROUTE_BUCKET.fullmatch(str(route)) or not isinstance(record, dict) or set(record) != {
+            "last_sample_epoch", "last_seats", "seats",
+        }:
+            raise RuntimeError("invalid slo eligible route")
+        last_sample = record["last_sample_epoch"]
+        if not isinstance(last_sample, (int, float)) or isinstance(last_sample, bool) or not math.isfinite(float(last_sample)):
+            raise RuntimeError("invalid slo eligible route time")
+        last_seats = record["last_seats"]
+        if not isinstance(last_seats, dict) or any(
+            not SEAT_BUCKET.fullmatch(str(seat))
+            or not isinstance(capacity, int) or isinstance(capacity, bool) or capacity <= 0
+            for seat, capacity in last_seats.items()
+        ):
+            raise RuntimeError("invalid slo eligible route snapshot")
+        seats = record["seats"]
+        if not isinstance(seats, dict):
+            raise RuntimeError("invalid slo eligible route seats")
+        for seat, exposure in seats.items():
+            if not SEAT_BUCKET.fullmatch(str(seat)) or not isinstance(exposure, dict) or set(exposure) != {
+                "capacity", "capacity_consistent", "mature", "streak_seconds",
+                "eligible_seconds", "fair_selections", "selection_cursor",
+            }:
+                raise RuntimeError("invalid slo eligible seat")
+            if not isinstance(exposure["capacity"], int) or isinstance(exposure["capacity"], bool) or exposure["capacity"] <= 0:
+                raise RuntimeError("invalid slo eligible seat capacity")
+            if not isinstance(exposure["capacity_consistent"], bool) or not isinstance(exposure["mature"], bool):
+                raise RuntimeError("invalid slo eligible seat state")
+            for name in ("streak_seconds", "eligible_seconds"):
+                value = exposure[name]
+                if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)) or value < 0:
+                    raise RuntimeError("invalid slo eligible seat duration")
+            for name in ("fair_selections", "selection_cursor"):
+                count = exposure[name]
+                if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                    raise RuntimeError("invalid slo eligible seat count")
+            if exposure["mature"] and float(exposure["eligible_seconds"]) < EXPECTED_INTERVAL_SECONDS:
+                raise RuntimeError("invalid slo mature seat")
+
+
+def valid_pressure_snapshot(pressure: Any) -> bool:
+    if not isinstance(pressure, dict) or set(pressure) != {
+        "schema_version", "selector", "telemetry_instance", "active_leases", "active_seats",
+        "seats", "eligible_routes", "routing_events_dropped", "routing_events_rejected",
+    }:
+        return False
+    pressure_rows = pressure["seats"]
+    eligible_routes = pressure["eligible_routes"]
+    return bool(
+        pressure["schema_version"] == 2
+        and pressure["selector"] == "least_pressure"
+        and isinstance(pressure["active_seats"], int) and not isinstance(pressure["active_seats"], bool)
+        and isinstance(pressure["active_leases"], int) and not isinstance(pressure["active_leases"], bool)
+        and isinstance(pressure_rows, list)
+        and pressure["active_seats"] == len(pressure_rows)
+        and isinstance(eligible_routes, list)
+        and len(eligible_routes) == len({route.get("route_bucket") for route in eligible_routes if isinstance(route, dict)})
+        and all(valid_pressure_route(route) for route in eligible_routes)
+        and valid_telemetry_tuple(telemetry_tuple(pressure))
+        and all(
+            isinstance(row, dict)
+            and set(row) == {"seat_bucket", "in_flight", "capacity", "concurrency_pressure_milli"}
+            and SEAT_BUCKET.fullmatch(str(row.get("seat_bucket", "")))
+            and all(isinstance(row.get(name), int) and not isinstance(row.get(name), bool) for name in (
+                "in_flight", "capacity", "concurrency_pressure_milli",
+            ))
+            and row["in_flight"] > 0 and row["capacity"] > 0 and row["concurrency_pressure_milli"] >= 0
+            for row in pressure_rows
+        )
+        and pressure["active_leases"] == sum(row["in_flight"] for row in pressure_rows)
+    )
+
+
+def valid_pressure_route(route: Any) -> bool:
+    if not isinstance(route, dict) or set(route) != {"route_bucket", "seats"}:
+        return False
+    seats = route["seats"]
+    if not ROUTE_BUCKET.fullmatch(str(route["route_bucket"])) or not isinstance(seats, list):
+        return False
+    if not all(
+        isinstance(seat, dict) and set(seat) == {"seat_bucket", "capacity"}
+        and SEAT_BUCKET.fullmatch(str(seat.get("seat_bucket", "")))
+        and isinstance(seat.get("capacity"), int) and not isinstance(seat.get("capacity"), bool)
+        and seat["capacity"] > 0
+        for seat in seats
+    ):
+        return False
+    buckets = [seat["seat_bucket"] for seat in seats]
+    return buckets == sorted(set(buckets))
 
 
 def apply_events(lifecycle: dict[str, Any], events: list[dict[str, str]], now: float, baseline: dict[str, Any]) -> dict[str, Any]:
@@ -739,6 +889,7 @@ def apply_slo_events(slo: dict[str, Any], events: list[dict[str, str]], pressure
     attempts = {key: dict(value) for key, value in slo["model_attempts"].items()}
     latencies = list(slo["deterministic_latencies_ms"])
     selection_counts = {group: dict(seats) for group, seats in slo["selection_counts"].items()}
+    eligible_routes = copy.deepcopy(slo["eligible_routes"])
     for item in events:
         stage = item["routing_stage"]
         request = item["routing_request_bucket"]
@@ -751,11 +902,63 @@ def apply_slo_events(slo: dict[str, Any], events: list[dict[str, str]], pressure
         elif stage == "model_decision":
             latencies.append(int(item["routing_duration_ms"]))
         elif stage == "account_selection":
-            group = item["routing_provider"] + ":" + item["routing_model"]
-            seats = selection_counts.setdefault(group, {})
+            route = routing_route_bucket(item["routing_provider"], item["routing_model"])
+            seats = selection_counts.setdefault(route, {})
             seat = item["routing_seat_bucket"]
             seats[seat] = int(seats.get(seat, 0)) + 1
     rows = pressure.get("seats", [])
+    current_routes = {
+        str(route["route_bucket"]): {
+            str(seat["seat_bucket"]): int(seat["capacity"])
+            for seat in route["seats"]
+        }
+        for route in pressure.get("eligible_routes", [])
+    }
+    for route, current_seats in current_routes.items():
+        record = eligible_routes.get(route)
+        if record is None:
+            record = {"last_sample_epoch": now, "last_seats": {}, "seats": {}}
+            eligible_routes[route] = record
+        previous_seats = record["last_seats"]
+        gap = now - float(record["last_sample_epoch"])
+        continuous = EXPECTED_INTERVAL_SECONDS <= gap <= MAX_SAMPLE_GAP_SECONDS
+        overlap = set(previous_seats) & set(current_seats) if continuous else set()
+        sustained = overlap if len(overlap) >= 2 else set()
+        exposures = record["seats"]
+        for seat, capacity in current_seats.items():
+            exposure = exposures.get(seat)
+            if exposure is None:
+                exposure = {
+                    "capacity": capacity, "capacity_consistent": True, "mature": False,
+                    "streak_seconds": 0.0, "eligible_seconds": 0.0,
+                    "fair_selections": 0, "selection_cursor": int(selection_counts.get(route, {}).get(seat, 0)),
+                }
+                exposures[seat] = exposure
+            if exposure["capacity"] != capacity:
+                exposure["capacity_consistent"] = False
+            if seat in sustained:
+                current_count = int(selection_counts.get(route, {}).get(seat, 0))
+                exposure["fair_selections"] += max(0, current_count - int(exposure["selection_cursor"]))
+                exposure["streak_seconds"] = float(exposure["streak_seconds"]) + gap
+                exposure["eligible_seconds"] = float(exposure["eligible_seconds"]) + gap
+                if float(exposure["streak_seconds"]) >= EXPECTED_INTERVAL_SECONDS:
+                    exposure["mature"] = True
+            else:
+                exposure["streak_seconds"] = 0.0
+            exposure["selection_cursor"] = int(selection_counts.get(route, {}).get(seat, 0))
+        for seat, exposure in exposures.items():
+            if seat not in current_seats:
+                exposure["streak_seconds"] = 0.0
+                exposure["selection_cursor"] = int(selection_counts.get(route, {}).get(seat, 0))
+        record["last_sample_epoch"] = now
+        record["last_seats"] = current_seats
+    for route, record in eligible_routes.items():
+        if route in current_routes:
+            continue
+        for exposure in record["seats"].values():
+            exposure["streak_seconds"] = 0.0
+        record["last_sample_epoch"] = now
+        record["last_seats"] = {}
     pressure_values = sorted(int(row.get("concurrency_pressure_milli", 0)) for row in rows)
     skewed = False
     if len(pressure_values) >= 2:
@@ -772,6 +975,13 @@ def apply_slo_events(slo: dict[str, Any], events: list[dict[str, str]], pressure
     slo["model_attempts"] = attempts
     slo["deterministic_latencies_ms"] = latencies
     slo["selection_counts"] = selection_counts
+    slo["eligible_routes"] = eligible_routes
+
+
+def routing_route_bucket(provider: str, model: str) -> str:
+    return "g1_" + hashlib.sha256(
+        ("cliproxy-routing-route-v1\x00" + provider + "\x00" + model).encode()
+    ).hexdigest()[:16]
 
 
 def percentile95(values: list[int]) -> int | None:
@@ -779,6 +989,32 @@ def percentile95(values: list[int]) -> int | None:
         return None
     ordered = sorted(values)
     return ordered[max(0, math.ceil(len(ordered) * 0.95) - 1)]
+
+
+def telemetry_tuple(pressure: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "instance": pressure.get("telemetry_instance"),
+        "dropped": pressure.get("routing_events_dropped"),
+        "rejected": pressure.get("routing_events_rejected"),
+    }
+
+
+def baseline_telemetry(baseline: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "instance": baseline["telemetry_instance"],
+        "dropped": baseline["routing_events_dropped"],
+        "rejected": baseline["routing_events_rejected"],
+    }
+
+
+def valid_telemetry_tuple(value: Any) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and set(value) == {"instance", "dropped", "rejected"}
+        and TELEMETRY_INSTANCE.fullmatch(str(value["instance"]))
+        and isinstance(value["dropped"], int) and not isinstance(value["dropped"], bool) and value["dropped"] >= 0
+        and isinstance(value["rejected"], int) and not isinstance(value["rejected"], bool) and value["rejected"] >= 0
+    )
 
 
 def slo_summary(slo: dict[str, Any]) -> dict[str, Any]:
@@ -797,15 +1033,40 @@ def slo_summary(slo: dict[str, Any]) -> dict[str, Any]:
     p95 = percentile95(latencies)
     comparable_groups = []
     fairness_ok = True
-    for group, seats in slo["selection_counts"].items():
-        counts = sorted(int(value) for value in seats.values() if int(value) > 0)
-        if len(counts) < 2:
+    for route, seats in slo["selection_counts"].items():
+        record = slo["eligible_routes"].get(route, {"seats": {}})
+        mature = {seat: exposure for seat, exposure in record["seats"].items() if exposure["mature"]}
+        if len(mature) < 2:
             continue
-        midpoint = len(counts) // 2
-        median = counts[midpoint] if len(counts) % 2 else (counts[midpoint - 1] + counts[midpoint]) / 2
-        ratio_milli = int(max(counts) * 1000 / median) if median else 2**31 - 1
-        comparable_groups.append({"group": group, "seats": len(counts), "selections": sum(counts), "max_median_ratio_milli": ratio_milli})
-        fairness_ok = fairness_ok and ratio_milli <= PRESSURE_SKEW_RATIO_MILLI
+        normalized_rates = []
+        selections = 0
+        for seat, exposure in mature.items():
+            count = int(exposure["fair_selections"])
+            selections += count
+            normalized_rates.append(
+                count * EXPECTED_INTERVAL_SECONDS
+                / (float(exposure["capacity"]) * float(exposure["eligible_seconds"]))
+            )
+        if selections < MIN_FAIR_ROUTE_SELECTIONS:
+            continue
+        normalized_rates.sort()
+        midpoint = len(normalized_rates) // 2
+        median = normalized_rates[midpoint] if len(normalized_rates) % 2 else (
+            normalized_rates[midpoint - 1] + normalized_rates[midpoint]
+        ) / 2
+        upper = median * PRESSURE_SKEW_RATIO_MILLI / 1000
+        lower = median * 1000 / PRESSURE_SKEW_RATIO_MILLI
+        balanced = (
+            all(exposure["capacity_consistent"] for exposure in mature.values())
+            and median > 0 and min(normalized_rates) >= lower and max(normalized_rates) <= upper
+        )
+        comparable_groups.append({
+            "route_bucket": route, "seats": len(normalized_rates), "selections": selections,
+            "min_rate_milli": int(min(normalized_rates) * 1000),
+            "median_rate_milli": int(median * 1000),
+            "max_rate_milli": int(max(normalized_rates) * 1000),
+        })
+        fairness_ok = fairness_ok and balanced
     checks = {
         "minimum_eligible_requests": len(eligible) >= MIN_ELIGIBLE_REQUESTS,
         "terminal_success_rate": len(eligible) > 0 and terminal_successes * 1000 >= len(eligible) * TERMINAL_SUCCESS_PERMILLE,
@@ -834,6 +1095,7 @@ def slo_summary(slo: dict[str, Any]) -> dict[str, Any]:
             "first_attempt_success_percent": FIRST_ATTEMPT_SUCCESS_PERCENT,
             "routing_p95_limit_ms": ROUTING_P95_LIMIT_MS,
             "pressure_skew_max_seconds": PRESSURE_SKEW_MAX_SECONDS,
+            "minimum_fair_route_selections": MIN_FAIR_ROUTE_SELECTIONS,
         },
     }
 
@@ -1034,19 +1296,8 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
     pressure = api_json("/v0/management/routing-pressure", management)
     reconcile = api_json("/v0/management/auth-files/reconcile-status", reconciler)["credentials"]
     pressure_rows = pressure.get("seats", [])
-    pressure_consistent = (
-        pressure.get("schema_version") == 1
-        and pressure.get("selector") == "least_pressure"
-        and pressure.get("active_seats") == len(pressure_rows)
-        and pressure.get("active_leases") == sum(int(row.get("in_flight", 0)) for row in pressure_rows)
-        and all(
-            SEAT_BUCKET.fullmatch(str(row.get("seat_bucket", "")))
-            and int(row.get("in_flight", -1)) > 0
-            and int(row.get("capacity", -1)) > 0
-            and int(row.get("concurrency_pressure_milli", -1)) >= 0
-            for row in pressure_rows
-        )
-    )
+    eligible_routes = pressure.get("eligible_routes", [])
+    pressure_consistent = valid_pressure_snapshot(pressure)
     reconcile_schema = isinstance(reconcile, list) and all(valid_reconcile_row(row) for row in reconcile)
     safe_reconcile = reconcile if reconcile_schema else []
     states = Counter(str(row["state"]) for row in safe_reconcile)
@@ -1067,6 +1318,7 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
     ) or "0")
     reconciler_result_observation = reconciler_result if reconciler_result in RECONCILER_RESULTS else "unknown"
     strategy, auto_mode = routing_modes(args.config.read_text(encoding="utf-8", errors="replace"))
+    telemetry_health = telemetry_tuple(pressure)
     checks = {
         "binary_hash": binary_hash == state["baseline"]["expected_binary_sha256"],
         "config_hash": config_hash == state["baseline"]["expected_config_sha256"],
@@ -1092,6 +1344,7 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
         "no_orphan_terminal_events": summary["unmatched_terminal"] == 0,
         "no_manual_toggles": state["lifecycle"]["manual_toggles"] == 0,
         "log_continuity": telemetry["discontinuity"] == 0,
+        "telemetry_complete": valid_telemetry_tuple(telemetry_health) and telemetry_health == baseline_telemetry(state["baseline"]),
     }
     observations = {
         "inventory": {"total": len(reconcile), "states": dict(states), "generation_mismatches": generation_mismatches, "ready_mismatches": ready_mismatches},
@@ -1099,6 +1352,7 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
         "events": summary,
         "reconciler": {"result": reconciler_result_observation, "exec_main_status": reconciler_status},
         "manual_toggles": state["lifecycle"]["manual_toggles"],
+        "telemetry": telemetry_health,
     }
     return state, checks, observations
 
@@ -1124,7 +1378,9 @@ def initialise_state(args: argparse.Namespace, now: float, verifier_hash: str, b
     log_metadata = args.log.stat()
     management = load_env(args.management_env)["MANAGEMENT_PASSWORD"]
     pressure = api_json("/v0/management/routing-pressure", management)
-    baseline = new_baseline(now, binary_hash, config_hash, verifier_hash, log_metadata, pressure.get("seats", []))
+    if not valid_pressure_snapshot(pressure):
+        raise RuntimeError("invalid baseline pressure")
+    baseline = new_baseline(now, binary_hash, config_hash, verifier_hash, log_metadata, pressure)
     return new_state(baseline)
 
 

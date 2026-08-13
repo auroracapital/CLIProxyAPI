@@ -35,8 +35,11 @@ func TestRoutingPressureSnapshotIsOpaqueSortedAndCapacityNormalized(t *testing.T
 	tracker.mu.Unlock()
 
 	snapshot := manager.RoutingPressureSnapshot()
-	if snapshot.SchemaVersion != 1 || snapshot.Selector != "least_pressure" || snapshot.ActiveLeases != 3 || snapshot.ActiveSeats != 2 || len(snapshot.Seats) != 2 {
+	if snapshot.SchemaVersion != 2 || snapshot.Selector != "least_pressure" || snapshot.ActiveLeases != 3 || snapshot.ActiveSeats != 2 || len(snapshot.Seats) != 2 {
 		t.Fatalf("snapshot = %#v", snapshot)
+	}
+	if !regexp.MustCompile(`^p1_[0-9a-f]{32}$`).MatchString(snapshot.TelemetryInstance) {
+		t.Fatalf("telemetry instance = %q, want opaque process marker", snapshot.TelemetryInstance)
 	}
 	opaque := regexp.MustCompile(`^h1_[0-9a-f]{16}$`)
 	pressures := map[int64]int64{}
@@ -63,8 +66,17 @@ func TestRoutingPressureSnapshotIsOpaqueSortedAndCapacityNormalized(t *testing.T
 	}
 }
 
+func TestRoutingPressureTelemetryInstanceIsStableWithinProcess(t *testing.T) {
+	manager := NewManager(nil, &LeastPressureSelector{}, nil)
+	first := manager.RoutingPressureSnapshot()
+	second := manager.RoutingPressureSnapshot()
+	if first.TelemetryInstance == "" || first.TelemetryInstance != second.TelemetryInstance {
+		t.Fatalf("telemetry instances = %q, %q, want one stable nonempty process marker", first.TelemetryInstance, second.TelemetryInstance)
+	}
+}
+
 func TestRoutingPressureSnapshotSchemaCannotCarrySensitiveMaterial(t *testing.T) {
-	for _, value := range []any{RoutingPressureSnapshot{}, RoutingPressureSeat{}} {
+	for _, value := range []any{RoutingPressureSnapshot{}, RoutingPressureSeat{}, RoutingEligibleRoute{}, RoutingEligibleSeat{}} {
 		typeOf := reflect.TypeOf(value)
 		for index := 0; index < typeOf.NumField(); index++ {
 			name := typeOf.Field(index).Name
@@ -73,6 +85,35 @@ func TestRoutingPressureSnapshotSchemaCannotCarrySensitiveMaterial(t *testing.T)
 					t.Fatalf("field %s can carry forbidden %s material", name, forbidden)
 				}
 			}
+		}
+	}
+}
+
+func TestRoutingPressureSnapshotIncludesOpaqueEligibleSeats(t *testing.T) {
+	manager := newLeastPressureManager(t, &leastPressureExecutor{})
+	snapshot := manager.RoutingPressureSnapshot()
+	if len(snapshot.EligibleRoutes) != 1 {
+		t.Fatalf("eligible routes = %#v, want one route", snapshot.EligibleRoutes)
+	}
+	route := snapshot.EligibleRoutes[0]
+	if !regexp.MustCompile(`^g1_[0-9a-f]{16}$`).MatchString(route.RouteBucket) {
+		t.Fatalf("route bucket = %q, want opaque bucket", route.RouteBucket)
+	}
+	if len(route.Seats) != 2 || route.Seats[0].SeatBucket >= route.Seats[1].SeatBucket {
+		t.Fatalf("eligible seats = %#v, want two sorted opaque seats", route.Seats)
+	}
+	for _, seat := range route.Seats {
+		if !regexp.MustCompile(`^h1_[0-9a-f]{16}$`).MatchString(seat.SeatBucket) || seat.Capacity <= 0 {
+			t.Fatalf("eligible seat = %#v, want opaque bucket and positive capacity", seat)
+		}
+	}
+	raw, errJSON := json.Marshal(snapshot)
+	if errJSON != nil {
+		t.Fatal(errJSON)
+	}
+	for _, forbidden := range []string{"auth-a", "auth-b", "gemini-test", "gemini"} {
+		if strings.Contains(string(raw), forbidden) {
+			t.Fatalf("eligible route leaked %q: %s", forbidden, raw)
 		}
 	}
 }

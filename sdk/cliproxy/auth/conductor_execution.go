@@ -904,6 +904,7 @@ func (m *Manager) beginAccountRoutingAttempt(request *accountRoutingRequest, pro
 	func() {
 		defer func() {
 			if recover() != nil {
+				cliproxyexecutor.RecordRoutingEventDropped()
 				log.Warn("routing observer panicked; account selection event dropped")
 			}
 		}()
@@ -929,6 +930,7 @@ func (a *accountRoutingAttempt) Finish(outcome string) {
 	a.once.Do(func() {
 		defer func() {
 			if recover() != nil {
+				cliproxyexecutor.RecordRoutingEventDropped()
 				log.Warn("routing observer panicked; account attempt event dropped")
 			}
 		}()

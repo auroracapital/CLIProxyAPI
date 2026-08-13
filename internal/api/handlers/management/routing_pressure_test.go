@@ -28,7 +28,7 @@ func TestGetRoutingPressureReturnsStrictPrivacySafeSchema(t *testing.T) {
 	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &body); errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	wantKeys := []string{"active_leases", "active_seats", "schema_version", "seats", "selector"}
+	wantKeys := []string{"active_leases", "active_seats", "eligible_routes", "routing_events_dropped", "routing_events_rejected", "schema_version", "seats", "selector", "telemetry_instance"}
 	gotKeys := make([]string, 0, len(body))
 	for key := range body {
 		gotKeys = append(gotKeys, key)

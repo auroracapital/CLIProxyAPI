@@ -41,7 +41,12 @@ class PureStateMachineTests(unittest.TestCase):
             "b" * 64,
             "c" * 64,
             Metadata(),  # type: ignore[arg-type]
-            [{"seat_bucket": "h1_0123456789abcdef", "in_flight": leases}],
+            {
+                "seats": [{"seat_bucket": "h1_0123456789abcdef", "in_flight": leases}],
+                "telemetry_instance": "p1_" + "a" * 32,
+                "routing_events_dropped": 0,
+                "routing_events_rejected": 0,
+            },
         )
 
     def sample(self, state: dict[str, object], when: float, healthy: bool = True) -> None:
@@ -50,9 +55,16 @@ class PureStateMachineTests(unittest.TestCase):
         state["samples"].append(  # type: ignore[union-attr]
             soak.make_sample(
                 state, when, "c" * 64, "a" * 64, "b" * 64, checks,
-                {"pressure": {"active_leases": 0, "active_seats": 0}},
+                self.observations(),
             )
         )
+
+    def observations(self, telemetry: dict[str, object] | None = None) -> dict[str, object]:
+        return {
+            "inventory": {}, "pressure": {"active_leases": 0, "active_seats": 0},
+            "events": {}, "reconciler": {}, "manual_toggles": 0,
+            "telemetry": telemetry or {"instance": "p1_" + "a" * 32, "dropped": 0, "rejected": 0},
+        }
 
     def fill_slo(self, state: dict[str, object], count: int = soak.MIN_ELIGIBLE_REQUESTS) -> None:
         for index in range(count):
@@ -60,12 +72,29 @@ class PureStateMachineTests(unittest.TestCase):
             state["slo"]["terminal_requests"][request] = "success"
             state["slo"]["model_attempts"][request] = {"0": "success"}
         state["slo"]["deterministic_latencies_ms"] = [10] * soak.MIN_DETERMINISTIC_DECISIONS
+        route = "g1_" + soak.hashlib.sha256(b"cliproxy-routing-route-v1\x00codex\x00gpt-5").hexdigest()[:16]
         state["slo"]["selection_counts"] = {
-            "codex:gpt-5": {
+            route: {
                 "h1_0123456789abcdef": count // 2,
                 "h1_fedcba9876543210": count - count // 2,
             }
         }
+        state["slo"]["eligible_routes"] = {route: {
+            "last_sample_epoch": 1060,
+            "last_seats": {"h1_0123456789abcdef": 1, "h1_fedcba9876543210": 1},
+            "seats": {
+                "h1_0123456789abcdef": {
+                    "capacity": 1, "capacity_consistent": True, "mature": True,
+                    "streak_seconds": 60.0, "eligible_seconds": 60.0,
+                    "fair_selections": count // 2, "selection_cursor": count // 2,
+                },
+                "h1_fedcba9876543210": {
+                    "capacity": 1, "capacity_consistent": True, "mature": True,
+                    "streak_seconds": 60.0, "eligible_seconds": 60.0,
+                    "fair_selections": count - count // 2, "selection_cursor": count - count // 2,
+                },
+            },
+        }}
 
     def test_baseline_contract_is_exact_and_hash_bound(self) -> None:
         baseline = self.baseline()
@@ -217,6 +246,159 @@ class PureStateMachineTests(unittest.TestCase):
         state["slo"]["deterministic_latencies_ms"][-10:] = [30] * 10
         self.assertFalse(soak.slo_summary(state["slo"])["checks"]["routing_overhead_p95"])
 
+    def test_slo_fails_for_starved_historically_eligible_seat(self) -> None:
+        state = soak.new_state(self.baseline())
+        self.fill_slo(state)
+        route = next(iter(state["slo"]["selection_counts"]))
+        group = state["slo"]["selection_counts"][route]
+        total = sum(group.values())
+        group["h1_0123456789abcdef"] = total
+        group["h1_fedcba9876543210"] = 0
+        exposures = state["slo"]["eligible_routes"][route]["seats"]
+        exposures["h1_0123456789abcdef"]["fair_selections"] = total
+        exposures["h1_fedcba9876543210"]["fair_selections"] = 0
+        self.assertFalse(soak.slo_summary(state["slo"])["checks"]["selection_balance"])
+
+    def test_telemetry_restart_and_counter_changes_are_sample_failures(self) -> None:
+        state = soak.new_state(self.baseline())
+        baseline = soak.baseline_telemetry(state["baseline"])
+        checks = {name: True for name in soak.CHECK_NAMES}
+        for telemetry in (
+            {**baseline, "dropped": 1},
+            {**baseline, "rejected": 1},
+            {**baseline, "instance": "p1_" + "b" * 32},
+        ):
+            candidate = dict(checks)
+            candidate["telemetry_complete"] = False
+            sample = soak.make_sample(
+                state, 1001 + len(state["samples"]), "c" * 64, "a" * 64, "b" * 64,
+                candidate, self.observations(telemetry),
+            )
+            state["samples"].append(sample)
+        soak.validate_state(state, 1003)
+        self.assertFalse(soak.evidence_aggregate(state)["window_healthy"])
+
+    def test_telemetry_check_cannot_claim_green_after_restart(self) -> None:
+        state = soak.new_state(self.baseline())
+        checks = {name: True for name in soak.CHECK_NAMES}
+        sample = soak.make_sample(
+            state, 1001, "c" * 64, "a" * 64, "b" * 64, checks,
+            self.observations({"instance": "p1_" + "b" * 32, "dropped": 0, "rejected": 0}),
+        )
+        state["samples"].append(sample)
+        with self.assertRaisesRegex(RuntimeError, "telemetry check"):
+            soak.validate_state(state, 1001)
+
+    def test_telemetry_failure_cannot_heal_after_counter_reset(self) -> None:
+        state = soak.new_state(self.baseline())
+        checks = {name: True for name in soak.CHECK_NAMES}
+        baseline = soak.baseline_telemetry(state["baseline"])
+        failed = dict(checks)
+        failed["telemetry_complete"] = False
+        state["samples"].append(soak.make_sample(
+            state, 1001, "c" * 64, "a" * 64, "b" * 64, failed,
+            self.observations({**baseline, "dropped": 1}),
+        ))
+        state["samples"].append(soak.make_sample(
+            state, 1061, "c" * 64, "a" * 64, "b" * 64, checks,
+            self.observations(baseline),
+        ))
+        soak.validate_state(state, 1061)
+        aggregate = soak.evidence_aggregate(state)
+        self.assertFalse(aggregate["window_healthy"])
+        self.assertEqual(aggregate["failure_counts"]["telemetry_complete"], 1)
+
+    def test_fairness_requires_sustained_overlap_and_retains_mature_seats(self) -> None:
+        state = soak.new_state(self.baseline())
+        route = "g1_" + soak.hashlib.sha256(b"cliproxy-routing-route-v1\x00codex\x00gpt-5").hexdigest()[:16]
+        a = {"seat_bucket": "h1_0123456789abcdef", "capacity": 1}
+        b = {"seat_bucket": "h1_fedcba9876543210", "capacity": 1}
+        c = {"seat_bucket": "h1_1111111111111111", "capacity": 1}
+
+        soak.apply_slo_events(state["slo"], [], {"seats": [], "eligible_routes": [{"route_bucket": route, "seats": [a, b]}]}, 1000)
+        soak.apply_slo_events(state["slo"], [], {"seats": [], "eligible_routes": []}, 1060)
+        exposures = state["slo"]["eligible_routes"][route]["seats"]
+        self.assertEqual(set(exposures), {a["seat_bucket"], b["seat_bucket"]})
+        self.assertFalse(any(value["mature"] for value in exposures.values()))
+
+        state = soak.new_state(self.baseline())
+        soak.apply_slo_events(state["slo"], [], {"seats": [], "eligible_routes": [{"route_bucket": route, "seats": [a, b]}]}, 1000)
+        soak.apply_slo_events(state["slo"], [], {"seats": [], "eligible_routes": [{"route_bucket": route, "seats": [a, c]}]}, 1060)
+        self.assertFalse(any(value["mature"] for value in state["slo"]["eligible_routes"][route]["seats"].values()))
+
+        state = soak.new_state(self.baseline())
+        soak.apply_slo_events(state["slo"], [], {"seats": [], "eligible_routes": [{"route_bucket": route, "seats": [a, b]}]}, 1000)
+        soak.apply_slo_events(state["slo"], [], {"seats": [], "eligible_routes": [{"route_bucket": route, "seats": [a, b]}]}, 1060)
+        soak.apply_slo_events(state["slo"], [], {"seats": [], "eligible_routes": []}, 1120)
+        exposures = state["slo"]["eligible_routes"][route]["seats"]
+        self.assertTrue(exposures[a["seat_bucket"]]["mature"])
+        self.assertTrue(exposures[b["seat_bucket"]]["mature"])
+
+    def test_fairness_normalizes_capacity_and_catches_minority_starvation(self) -> None:
+        state = soak.new_state(self.baseline())
+        self.fill_slo(state, 300)
+        route = next(iter(state["slo"]["eligible_routes"]))
+        group = state["slo"]["selection_counts"][route]
+        exposures = state["slo"]["eligible_routes"][route]["seats"]
+        exposures["h1_0123456789abcdef"]["capacity"] = 2
+        exposures["h1_0123456789abcdef"]["eligible_seconds"] = 60.0
+        exposures["h1_fedcba9876543210"]["eligible_seconds"] = 60.0
+        group["h1_0123456789abcdef"] = 200
+        group["h1_fedcba9876543210"] = 100
+        exposures["h1_0123456789abcdef"]["fair_selections"] = 200
+        exposures["h1_fedcba9876543210"]["fair_selections"] = 100
+        self.assertTrue(soak.slo_summary(state["slo"])["checks"]["selection_balance"])
+
+        for index in range(15):
+            seat = f"h1_{index + 2:016x}"
+            exposures[seat] = {
+                "capacity": 1, "capacity_consistent": True, "mature": True,
+                "streak_seconds": 60.0, "eligible_seconds": 60.0,
+                "fair_selections": 100, "selection_cursor": 100,
+            }
+            group[seat] = 100
+        group["h1_fedcba9876543210"] = 0
+        exposures["h1_fedcba9876543210"]["fair_selections"] = 0
+        self.assertFalse(soak.slo_summary(state["slo"])["checks"]["selection_balance"])
+
+    def test_fairness_requires_material_route_traffic_and_rejects_capacity_drift(self) -> None:
+        state = soak.new_state(self.baseline())
+        self.fill_slo(state)
+        route = next(iter(state["slo"]["eligible_routes"]))
+        group = state["slo"]["selection_counts"][route]
+        group["h1_0123456789abcdef"] = 1
+        group["h1_fedcba9876543210"] = 1
+        for exposure in state["slo"]["eligible_routes"][route]["seats"].values():
+            exposure["fair_selections"] = 1
+        self.assertFalse(soak.slo_summary(state["slo"])["checks"]["comparable_seat_coverage"])
+
+        group["h1_0123456789abcdef"] = 50
+        group["h1_fedcba9876543210"] = 50
+        for exposure in state["slo"]["eligible_routes"][route]["seats"].values():
+            exposure["fair_selections"] = 50
+        state["slo"]["eligible_routes"][route]["seats"]["h1_0123456789abcdef"]["capacity_consistent"] = False
+        self.assertFalse(soak.slo_summary(state["slo"])["checks"]["selection_balance"])
+
+    def test_pressure_schema_rejects_unknown_fields_bools_and_duplicates(self) -> None:
+        valid = {
+            "schema_version": 2, "selector": "least_pressure", "active_seats": 0,
+            "active_leases": 0, "seats": [], "eligible_routes": [],
+            "telemetry_instance": "p1_" + "a" * 32,
+            "routing_events_dropped": 0, "routing_events_rejected": 0,
+        }
+        self.assertTrue(soak.valid_pressure_snapshot(valid))
+        for mutation in (
+            {**valid, "debug": "private"},
+            {**valid, "routing_events_dropped": False},
+            {**valid, "active_leases": True},
+            {**valid, "telemetry_instance": "p1_short"},
+            {**valid, "eligible_routes": [
+                {"route_bucket": "g1_0123456789abcdef", "seats": []},
+                {"route_bucket": "g1_0123456789abcdef", "seats": []},
+            ]},
+        ):
+            self.assertFalse(soak.valid_pressure_snapshot(mutation))
+
     def test_cutoff_freezes_cohort_and_accepts_only_before_deadline(self) -> None:
         baseline = self.baseline(now=0)
         state = soak.new_state(baseline)
@@ -297,14 +479,33 @@ class PureStateMachineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "main.log"
             log.write_text(
-                "routing decision routing_stage=model_attempt routing_outcome=success "
-                "routing_request_bucket=r1_0123456789abcdef routing_attempt=0 "
-                "routing_seat_bucket= routing_provider=codex routing_model=gpt-5\n",
+                "routing decision routing_schema_version=1 routing_stage=model_attempt routing_mode=active "
+                "routing_task=code routing_score_version=v2 routing_model=gpt-5 routing_provider=codex "
+                "routing_reason= routing_outcome=success routing_attempt=0 routing_candidate_count=1 "
+                "routing_duration_ms=0 routing_selector=least_pressure routing_shadow_match=false "
+                "routing_seat_bucket= routing_predicted_seat_bucket= "
+                "routing_request_bucket=r1_0123456789abcdef\n",
                 encoding="utf-8",
             )
             events, _, counters = soak.read_events(log, {"inode": log.stat().st_ino, "offset": 0})
             self.assertEqual(counters["invalid"], 0)
             self.assertEqual(events[0]["routing_attempt"], "0")
+
+    def test_unknown_routing_field_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "main.log"
+            log.write_text(
+                "routing decision routing_schema_version=1 routing_stage=account_selection routing_mode=active "
+                "routing_task= routing_score_version= routing_model=gpt-5 routing_provider=codex "
+                "routing_reason= routing_outcome=selected routing_attempt=1 routing_candidate_count=0 "
+                "routing_duration_ms=0 routing_selector=least_pressure routing_shadow_match=false "
+                "routing_seat_bucket=h1_0123456789abcdef routing_predicted_seat_bucket= "
+                "routing_request_bucket=r1_0123456789abcdef routing_debug=sk-opaquevalue\n",
+                encoding="utf-8",
+            )
+            events, _, counters = soak.read_events(log, {"inode": log.stat().st_ino, "offset": 0})
+            self.assertEqual(events, [])
+            self.assertEqual(counters["invalid"], 1)
 
     def test_post_cutoff_selection_does_not_enlarge_frozen_cohort(self) -> None:
         baseline = self.baseline(now=0)
@@ -341,7 +542,12 @@ class MainTransactionTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def pressure(self) -> dict[str, object]:
-        return {"schema_version": 1, "selector": "least_pressure", "active_seats": 0, "active_leases": 0, "seats": []}
+        return {
+            "schema_version": 2, "selector": "least_pressure", "active_seats": 0,
+            "active_leases": 0, "seats": [], "eligible_routes": [],
+            "telemetry_instance": "p1_" + "a" * 32,
+            "routing_events_dropped": 0, "routing_events_rejected": 0,
+        }
 
     def reconcile(self) -> dict[str, object]:
         rows = [{

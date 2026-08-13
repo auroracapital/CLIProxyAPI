@@ -375,6 +375,7 @@ func TestRoutingEventNormalizationPreservesAccountAttemptOrdinalsThroughConfigur
 }
 
 func TestStructuredRoutingObserverNeverBlocksWhenQueueIsFull(t *testing.T) {
+	_, beforeDropped, _ := coreexecutor.RoutingEventHealth()
 	observer := &structuredRoutingObserver{events: make(chan coreexecutor.RoutingEvent, 1)}
 	observer.ObserveRouting(coreexecutor.RoutingEvent{Stage: "model_decision", Outcome: "selected"})
 	done := make(chan struct{})
@@ -389,6 +390,10 @@ func TestStructuredRoutingObserverNeverBlocksWhenQueueIsFull(t *testing.T) {
 	}
 	if observer.dropped.Load() != 1 {
 		t.Fatalf("dropped=%d, want 1", observer.dropped.Load())
+	}
+	_, afterDropped, _ := coreexecutor.RoutingEventHealth()
+	if afterDropped != beforeDropped+1 {
+		t.Fatalf("global dropped=%d, want %d", afterDropped, beforeDropped+1)
 	}
 }
 

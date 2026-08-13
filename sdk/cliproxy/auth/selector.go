@@ -870,6 +870,7 @@ func (s *ShadowLeastPressureSelector) Pick(ctx context.Context, provider, model 
 		func() {
 			defer func() {
 				if recover() != nil {
+					cliproxyexecutor.RecordRoutingEventDropped()
 					log.Warn("routing observer panicked; account prediction event dropped")
 				}
 			}()

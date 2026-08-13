@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 )
@@ -36,6 +37,30 @@ type RoutingEvent struct {
 const routingEventSchemaVersion = 1
 
 var routingRequestBucketKey, routingRequestBucketEnabled = newRoutingRequestBucketKey()
+var routingTelemetryInstance = newRoutingTelemetryInstance()
+var routingEventsDropped atomic.Uint64
+var routingEventsInvalid atomic.Uint64
+
+// RecordRoutingEventDropped records a routing event lost before publication.
+func RecordRoutingEventDropped() { routingEventsDropped.Add(1) }
+
+// RecordRoutingEventInvalid records a routing event rejected at publication.
+func RecordRoutingEventInvalid() { routingEventsInvalid.Add(1) }
+
+// RoutingEventHealth returns an opaque process instance and process-lifetime
+// telemetry completeness counters. An empty instance means secure randomness
+// was unavailable, so callers can fail closed instead of accepting continuity.
+func RoutingEventHealth() (instance string, dropped, invalid uint64) {
+	return routingTelemetryInstance, routingEventsDropped.Load(), routingEventsInvalid.Load()
+}
+
+func newRoutingTelemetryInstance() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("p1_%x", value[:])
+}
 
 func newRoutingRequestBucketKey() ([32]byte, bool) {
 	var key [32]byte

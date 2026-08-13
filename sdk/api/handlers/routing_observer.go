@@ -44,6 +44,7 @@ func (o *structuredRoutingObserver) ObserveRouting(event coreexecutor.RoutingEve
 	case o.events <- event:
 	default:
 		o.dropped.Add(1)
+		coreexecutor.RecordRoutingEventDropped()
 	}
 }
 
@@ -52,6 +53,7 @@ func (o *structuredRoutingObserver) run() {
 		fields, ok := routingLogFields(event)
 		if !ok {
 			o.invalid.Add(1)
+			coreexecutor.RecordRoutingEventInvalid()
 			continue
 		}
 		o.logger.WithFields(fields).Info("routing decision")
@@ -116,6 +118,7 @@ func emitRoutingEvent(observer coreexecutor.RoutingObserver, event coreexecutor.
 		func() {
 			defer func() {
 				if recover() != nil {
+					coreexecutor.RecordRoutingEventDropped()
 					log.Warn("routing observer panicked; event dropped")
 				}
 			}()
