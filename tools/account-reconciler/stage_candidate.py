@@ -101,7 +101,13 @@ def matching_seat(inventory: reconciler.Inventory, credential: dict[str, Any]) -
     return matches[0]
 
 
-def install_candidate(seat: reconciler.Seat, raw: bytes, uid: int, gid: int) -> None:
+def install_candidate(
+    seat: reconciler.Seat,
+    raw: bytes,
+    uid: int,
+    gid: int,
+    replace_existing: bool = False,
+) -> None:
     if seat.canonical_path is None or seat.candidate_path is None:
         raise StagingError("matched seat is not stageable")
     candidate = seat.candidate_path
@@ -116,62 +122,69 @@ def install_candidate(seat: reconciler.Seat, raw: bytes, uid: int, gid: int) -> 
             or canonical_parent.st_dev != candidate_parent.st_dev
         ):
             raise StagingError("credential directories are unsafe")
-        if candidate.exists() or candidate.is_symlink():
-            raise StagingError("candidate already exists")
     except OSError as exc:
         raise StagingError("credential directories are unavailable") from exc
 
-    fd, temp_name = tempfile.mkstemp(prefix=".staged-", dir=candidate.parent)
-    temp = Path(temp_name)
-    linked = False
     try:
-        os.fchmod(fd, 0o600)
-        os.fchown(fd, uid, gid)
-        with os.fdopen(fd, "wb", closefd=False) as output:
-            output.write(raw)
-            output.flush()
-            os.fsync(output.fileno())
-        os.close(fd)
-        fd = -1
-        os.link(temp, candidate, follow_symlinks=False)
-        linked = True
-        directory_fd = os.open(candidate.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except (OSError, StagingError) as exc:
-        if linked:
+        with reconciler.credential_file_lock(candidate):
+            exists = candidate.exists() or candidate.is_symlink()
+            if exists:
+                if not replace_existing:
+                    raise StagingError("candidate already exists")
+                try:
+                    reconciler.validate_candidate(seat)
+                except reconciler.PromotionError as exc:
+                    raise StagingError("existing candidate is invalid") from exc
+
+            fd, temp_name = tempfile.mkstemp(prefix=".staged-", dir=candidate.parent)
+            temp = Path(temp_name)
+            installed = False
             try:
-                candidate.unlink()
-            except OSError:
-                pass
+                os.fchmod(fd, 0o600)
+                os.fchown(fd, uid, gid)
+                with os.fdopen(fd, "wb", closefd=False) as output:
+                    output.write(raw)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.close(fd)
+                fd = -1
+                if exists:
+                    os.replace(temp, candidate)
+                else:
+                    os.link(temp, candidate, follow_symlinks=False)
+                installed = True
+                directory_fd = os.open(candidate.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+                if not installed or temp.exists():
+                    try:
+                        temp.unlink()
+                    except FileNotFoundError:
+                        pass
+    except (OSError, StagingError, reconciler.PromotionError) as exc:
+        if isinstance(exc, StagingError):
+            raise
         raise StagingError("candidate installation failed") from exc
-    finally:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            temp.unlink()
-        except FileNotFoundError:
-            pass
 
 
-def stage(source: Path, inventory_path: Path, uid: int, gid: int) -> None:
+def stage(
+    source: Path,
+    inventory_path: Path,
+    uid: int,
+    gid: int,
+    replace_existing: bool = False,
+) -> None:
     inventory = reconciler.load_inventory(inventory_path)
     credential, raw = read_credential(source, {os.geteuid(), uid})
     seat = matching_seat(inventory, credential)
-    install_candidate(seat, raw, uid, gid)
-    # Validate the installed artifact through the reconciler's exact candidate
-    # reader before reporting success. Never emit provider, identity, or paths.
-    try:
-        reconciler.validate_candidate(seat)
-    except reconciler.PromotionError as exc:
-        try:
-            assert seat.candidate_path is not None
-            seat.candidate_path.unlink()
-        except OSError:
-            pass
-        raise StagingError("installed candidate validation failed") from exc
+    install_candidate(seat, raw, uid, gid, replace_existing)
+    # The source is intentionally retained as the recovery copy. Never emit
+    # provider, identity, credential path, or candidate path.
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -179,6 +192,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("source", type=Path)
     parser.add_argument("--inventory", type=Path, default=Path("/etc/crsproxy/account-inventory.json"))
     parser.add_argument("--service-user", default="crsproxy")
+    parser.add_argument(
+        "--replace-existing",
+        action="store_true",
+        help="replace only an existing candidate that validates as the same unique inventory seat",
+    )
     return parser.parse_args(argv)
 
 
@@ -186,7 +204,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parse_args(argv)
         identity = pwd.getpwnam(args.service_user)
-        stage(args.source, args.inventory, identity.pw_uid, identity.pw_gid)
+        stage(
+            args.source,
+            args.inventory,
+            identity.pw_uid,
+            identity.pw_gid,
+            replace_existing=args.replace_existing,
+        )
         print(json.dumps({"status": "staged"}, separators=(",", ":")))
         return 0
     except (KeyError, RuntimeError, reconciler.InventoryError, StagingError):

@@ -14,11 +14,16 @@ without printing or manually selecting its identity:
 sudo /opt/crsproxy/bin/stage-account-candidate /protected/staging/auths/fresh.json
 ```
 
+If the same seat already has a stale, previously consumed candidate, use
+`--replace-existing`. Replacement occurs under the reconciler's shared path lock
+and only after the existing and incoming credentials both validate against the
+same unique inventory identity.
+
 The utility reads only a regular mode-`0600` file owned by root or the service
 user, validates the complete inventory, uniquely matches provider plus every
 stable expected identity field, and atomically creates only the matching
-mode-`0600` candidate. It refuses ambiguous identities and existing candidate
-paths. It does not delete the source, modify the canonical credential, reset
+mode-`0600` candidate. It refuses ambiguous identities and does not overwrite an
+existing candidate without the explicit same-seat replacement check. It does not delete the source, modify the canonical credential, reset
 attempts, or alter admission; the periodic reconciler owns refresh, exact probe,
 and readmission.
 

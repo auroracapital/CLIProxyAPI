@@ -100,6 +100,45 @@ class StageCandidateTests(unittest.TestCase):
                 stage_candidate.stage(source, inventory, os.getuid(), os.getgid())
             self.assertEqual((candidates / "claude.json").read_text(encoding="utf-8"), "existing")
 
+    def test_replace_existing_requires_same_valid_seat_and_shared_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory, source, candidates = self.fixture(root)
+            old = {
+                "type": "claude", "account_uuid": "account-a", "email": "a@example.test",
+                "access_token": "old-access", "refresh_token": "old-refresh",
+            }
+            new = dict(old, access_token="new-access", refresh_token="new-refresh")
+            candidate = candidates / "claude.json"
+            self.write_source(candidate, old)
+            self.write_source(source, new)
+
+            stage_candidate.stage(
+                source, inventory, os.getuid(), os.getgid(), replace_existing=True,
+            )
+
+            self.assertEqual(json.loads(candidate.read_text(encoding="utf-8")), new)
+            lock = Path(str(candidate) + ".reconcile.lock")
+            self.assertTrue(lock.is_file())
+            self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+            self.assertEqual(json.loads(source.read_text(encoding="utf-8")), new)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory, source, candidates = self.fixture(root)
+            candidate = candidates / "claude.json"
+            self.write_source(candidate, {"type": "claude", "access_token": "bad", "refresh_token": "bad"})
+            fresh = {
+                "type": "claude", "account_uuid": "account-a", "email": "a@example.test",
+                "access_token": "new-access", "refresh_token": "new-refresh",
+            }
+            self.write_source(source, fresh)
+            with self.assertRaises(stage_candidate.StagingError):
+                stage_candidate.stage(
+                    source, inventory, os.getuid(), os.getgid(), replace_existing=True,
+                )
+            self.assertNotEqual(json.loads(candidate.read_text(encoding="utf-8")), fresh)
+
     def test_rejects_symlink_source_and_ambiguous_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
