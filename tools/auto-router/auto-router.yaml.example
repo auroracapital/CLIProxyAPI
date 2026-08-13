@@ -9,22 +9,24 @@
     "provider": "cliproxy-base",
     "models": [
       "gpt-5.4",
-      "gpt-5.3-codex",
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
       "claude-opus-4-6",
       "claude-sonnet-4-6",
-      "gemini-3-pro-preview",
-      "gemini-3-flash-preview"
+      "gemini-3.1-pro-low",
+      "gemini-3.5-flash-low"
     ]
   },
   "routing": {
-    "default_models": ["claude-sonnet-4-6", "gpt-5.4", "gemini-3-flash-preview"],
+    "default_models": ["gpt-5.6-terra", "claude-sonnet-4-6", "gemini-3.5-flash-low"],
     "task_models": {
-      "code": ["gpt-5.3-codex", "claude-sonnet-4-6", "gpt-5.4"],
-      "reasoning": ["claude-opus-4-6", "gpt-5.4", "gemini-3-pro-preview"],
-      "research": ["gemini-3-pro-preview", "claude-opus-4-6"],
-      "agent": ["claude-sonnet-4-6", "gpt-5.3-codex"],
-      "writing": ["claude-sonnet-4-6", "gpt-5.4"],
-      "general": ["claude-sonnet-4-6", "gpt-5.4", "gemini-3-flash-preview"]
+      "code": ["gpt-5.6-sol", "claude-sonnet-4-6", "gpt-5.4"],
+      "reasoning": ["claude-opus-4-6", "gpt-5.6-sol", "gemini-3.1-pro-low"],
+      "research": ["gemini-3.1-pro-low", "claude-opus-4-6"],
+      "agent": ["gpt-5.6-sol", "claude-sonnet-4-6"],
+      "writing": ["claude-sonnet-4-6", "gpt-5.6-terra"],
+      "general": ["gpt-5.6-terra", "claude-sonnet-4-6", "gemini-3.5-flash-low"]
     },
     "objective": "balanced",
     "provider_strategy": "health"
