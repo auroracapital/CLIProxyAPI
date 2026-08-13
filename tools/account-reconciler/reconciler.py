@@ -853,6 +853,7 @@ class Controller:
         provider: str = "",
         seat_key: str = "",
         recover_rollbacks: bool = False,
+        periodic: bool = False,
     ):
         self.inventory = inventory
         self.api = api
@@ -870,6 +871,7 @@ class Controller:
         self.provider = provider.strip().lower()
         self.seat_key = seat_key.strip().lower()
         self.recover_rollbacks = recover_rollbacks
+        self.periodic = periodic
 
     def run(self) -> int:
         with file_lock(self.runtime_dir / "locks" / "global.lock") as global_acquired:
@@ -898,9 +900,28 @@ class Controller:
                 raise InventoryError("canary selection is empty")
             failures = 0
             for seat in seats:
-                if not self._reconcile_locked(seat, by_index[seat.auth_index]):
+                handled = self._reconcile_locked(seat, by_index[seat.auth_index])
+                if not handled and self.periodic:
+                    handled = self._periodic_failure_is_safely_quarantined(seat)
+                if not handled:
                     failures += 1
             return 1 if failures else 0
+
+    def _periodic_failure_is_safely_quarantined(self, seat: Seat) -> bool:
+        """Treat a proven future quarantine as successful periodic handling."""
+        persisted = self.store.read(opaque_key(self.hmac_key, "seat", seat.auth_index))
+        if persisted.get("state") != "cooling":
+            return False
+        expected = {
+            "refresh_failed": {"retryable", "cooling", "rejected", "auth_required"},
+            "probe_retryable": {"retryable", "cooling"},
+            "probe_rejected": {"rejected"},
+        }
+        reason = persisted.get("reason")
+        if reason not in expected or persisted.get("outcome") not in expected[reason]:
+            return False
+        next_attempt = _parse_time(persisted.get("next_attempt", ""))
+        return next_attempt is not None and next_attempt > self.now()
 
     def _recover_recorded_rollbacks(self) -> int:
         """Restore archived admission for every locally recorded rollback failure."""
@@ -1700,6 +1721,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--provider", default="", help="after full validation, reconcile only this provider")
     parser.add_argument("--seat-key", default="", help="after full validation, reconcile only this opaque seat key")
     parser.add_argument("--recover-rollbacks", action="store_true", help="recover all locally recorded rollback failures without refreshing or probing")
+    parser.add_argument("--periodic", action="store_true", help="exit successfully when provider failures are durably quarantined for a future retry")
     return parser.parse_args(argv)
 
 
@@ -1729,6 +1751,15 @@ def main(argv: list[str] | None = None) -> int:
             or seat_key
         ):
             raise InventoryError("rollback recovery cannot be combined with seat filters")
+        if args.periodic and (
+            args.recover_rollbacks
+            or args.max_seats
+            or args.only_healthy
+            or args.force_probe
+            or provider
+            or seat_key
+        ):
+            raise InventoryError("periodic mode cannot be combined with canary or recovery filters")
         api = APIAdapter(args.base_url, os.environ.get("CLIPROXY_RECONCILER_API_KEY", ""))
         controller = Controller(
             inventory,
@@ -1743,6 +1774,7 @@ def main(argv: list[str] | None = None) -> int:
             provider=provider,
             seat_key=seat_key,
             recover_rollbacks=args.recover_rollbacks,
+            periodic=args.periodic,
             logger=logger,
         )
         return controller.run()

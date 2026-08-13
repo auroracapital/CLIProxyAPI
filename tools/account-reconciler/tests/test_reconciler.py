@@ -1523,6 +1523,90 @@ class PromotionTests(unittest.TestCase):
                 self.assertGreaterEqual(controller.reload_calls, 1)
 
 
+class PeriodicModeTests(unittest.TestCase):
+    class RecordedFailureController(reconciler.Controller):
+        def __init__(self, *args, records, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.records = records
+
+        def _reconcile_locked(self, seat, remote):
+            state, reason, outcome, next_attempt = self.records[seat.auth_index]
+            seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+            self.store.write(seat_key, state, reason, outcome, 1, next_attempt)
+            return False
+
+    def run_records(self, root: Path, records: dict[str, tuple[str, str, str, str]]) -> int:
+        seats = tuple(
+            reconciler.Seat(auth_index, "claude", "probe-model")
+            for auth_index in records
+        )
+        rows = [remote_row(auth_index=seat.auth_index) for seat in seats]
+        controller = self.RecordedFailureController(
+            reconciler.Inventory(seats, 3, 10, 80),
+            FakeAPI(rows=rows),
+            root / "state",
+            root / "run",
+            HMAC_KEY,
+            apply=True,
+            periodic=True,
+            records=records,
+            logger=reconciler.configure_logging(io.StringIO()),
+            now=lambda: NOW,
+            rng=random.Random(1),
+        )
+        return controller.run()
+
+    def test_periodic_returns_zero_only_for_exact_future_cooling_failures(self):
+        future = (NOW + dt.timedelta(minutes=5)).isoformat()
+        accepted = (
+            ("refresh_failed", "retryable"),
+            ("probe_retryable", "cooling"),
+            ("probe_rejected", "rejected"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = {
+                f"seat-{number}": ("cooling", reason, outcome, future)
+                for number, (reason, outcome) in enumerate(accepted)
+            }
+            self.assertEqual(self.run_records(root, records), 0)
+
+    def test_periodic_keeps_actionable_or_malformed_failures_nonzero(self):
+        future = (NOW + dt.timedelta(minutes=5)).isoformat()
+        past = (NOW - dt.timedelta(seconds=1)).isoformat()
+        cases = {
+            "rollback_failed": ("ready", "rollback_failed", "failed", future),
+            "failed_outcome": ("cooling", "refresh_failed", "failed", future),
+            "misconfigured": ("misconfigured", "candidate_invalid", "failed", ""),
+            "auth_required": ("auth_required", "probe_auth_required", "auth_required", ""),
+            "attempt_budget": ("auth_required", "attempt_budget_exhausted", "skipped", ""),
+            "missing_next_attempt": ("cooling", "refresh_failed", "retryable", ""),
+            "invalid_next_attempt": ("cooling", "refresh_failed", "retryable", "not-a-time"),
+            "past_next_attempt": ("cooling", "refresh_failed", "retryable", past),
+            "wrong_reason": ("cooling", "refresh_succeeded", "retryable", future),
+            "wrong_outcome": ("cooling", "probe_rejected", "auth_required", future),
+        }
+        for name, record in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                self.assertEqual(self.run_records(Path(directory), {"index-alpha": record}), 1)
+
+    def test_periodic_does_not_hide_one_actionable_failure_among_expected_cooling(self):
+        future = (NOW + dt.timedelta(minutes=5)).isoformat()
+        records = {
+            "expected": ("cooling", "probe_retryable", "retryable", future),
+            "actionable": ("ready", "rollback_failed", "failed", future),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.run_records(Path(directory), records), 1)
+
+    def test_systemd_execstart_enables_periodic_exit_policy(self):
+        unit = (MODULE_PATH.parent / "systemd" / "cliproxy-account-reconciler.service").read_text(
+            encoding="utf-8"
+        )
+        exec_start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+        self.assertIn(" --periodic ", f" {exec_start} ")
+
+
 class ControllerTests(unittest.TestCase):
     def test_exact_opaque_seat_key_selects_only_that_seat_after_full_validation(self):
         with tempfile.TemporaryDirectory() as directory:
