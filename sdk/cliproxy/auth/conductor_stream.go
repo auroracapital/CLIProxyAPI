@@ -146,7 +146,7 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult, ephemeralResult bool) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult, ephemeralResult bool, accountAttempt *accountRoutingAttempt) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -159,6 +159,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
 				failed = true
+				accountAttempt.Finish(accountAttemptOutcomeForError(chunk.Err))
 				rerr := resultErrorFromError(chunk.Err)
 				m.recordExecutionResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}, auth, ephemeralResult)
 			}
@@ -200,12 +201,51 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		}
 		for _, chunk := range buffered {
 			if ok := emit(chunk); !ok {
+				accountAttempt.Finish("canceled")
 				discardStreamChunks(remaining)
 				return
 			}
 		}
-		for chunk := range remaining {
+		for {
+			var (
+				chunk cliproxyexecutor.StreamChunk
+				ok    bool
+			)
+			if ctx == nil {
+				chunk, ok = <-remaining
+			} else {
+				select {
+				case <-ctx.Done():
+					accountAttempt.Finish("canceled")
+				drain:
+					for {
+						select {
+						case chunk, open := <-remaining:
+							if !open {
+								break drain
+							}
+							if chunk.Err != nil && !failed {
+								failed = true
+								m.recordExecutionResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: resultErrorFromError(chunk.Err)}, auth, ephemeralResult)
+							}
+						default:
+							break drain
+						}
+					}
+					discardStreamChunks(remaining)
+					if !failed {
+						failed = true
+						m.recordExecutionResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: &Error{Code: requestScopedErrorCode, Message: ctx.Err().Error()}}, auth, ephemeralResult)
+					}
+					return
+				case chunk, ok = <-remaining:
+				}
+			}
+			if !ok {
+				break
+			}
 			if ok := emit(chunk); !ok {
+				accountAttempt.Finish("canceled")
 				discardStreamChunks(remaining)
 				return
 			}
@@ -213,11 +253,15 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		if tail := finishForceMappedStreamChunks(rewriter); len(tail) > 0 {
 			tailChunk := cliproxyexecutor.StreamChunk{Payload: tail}
 			if !emit(tailChunk) {
+				accountAttempt.Finish("canceled")
 				return
 			}
 		}
 		if !failed && (ephemeralResult || claudeOAuthRequestCancellation(ctx, auth, nil) == nil) {
 			m.recordExecutionResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true}, auth, ephemeralResult)
+			accountAttempt.Finish("success")
+		} else if !failed {
+			accountAttempt.Finish("canceled")
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
@@ -231,7 +275,7 @@ func (m *Manager) replaceHomeExecutionLifecycleAuth(lifecycle cliproxyexecutor.E
 	m.replaceHomeSelectionAuth(selection, auth)
 }
 
-func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel, executionModel string, execModels []string, pooled bool, aliasResult OAuthModelAliasResult, routing *apiKeyModelRoutingSnapshot, allowRetry bool, ephemeralResult bool, unauthorizedRefreshTried map[string]struct{}) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel, executionModel string, execModels []string, pooled bool, aliasResult OAuthModelAliasResult, routing *apiKeyModelRoutingSnapshot, allowRetry bool, ephemeralResult bool, unauthorizedRefreshTried map[string]struct{}, accountAttempt *accountRoutingAttempt) (*cliproxyexecutor.StreamResult, error) {
 	if executor == nil {
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
@@ -400,7 +444,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			remaining = closedCh
 		}
 		attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, execModel, aliasResult)
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, attemptAliasResult, ephemeralResult), nil
+		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, attemptAliasResult, ephemeralResult, accountAttempt), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}

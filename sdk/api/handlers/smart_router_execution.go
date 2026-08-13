@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -168,6 +169,11 @@ func cloneSchedulerMetadata(src map[string]any) map[string]any {
 	return out
 }
 
+func routingAttemptEvent(ctx context.Context, event coreexecutor.RoutingEvent) coreexecutor.RoutingEvent {
+	event.RequestBucket = coreexecutor.RoutingRequestBucket(logging.GetRequestID(ctx))
+	return event
+}
+
 func (h *BaseAPIHandler) executeModelSlate(ctx context.Context, providers []string, req coreexecutor.Request, opts coreexecutor.Options, decision modelRouteDecision) (coreexecutor.Response, string, error) {
 	if h == nil || h.AuthManager == nil {
 		return coreexecutor.Response{}, "", errors.New("auth manager is unavailable")
@@ -188,13 +194,13 @@ func (h *BaseAPIHandler) executeModelSlate(ctx context.Context, providers []stri
 		if len(modelProviders) > 0 {
 			provider = modelProviders[0]
 		}
-		emitRoutingEvent(attemptOpts.RoutingObserver, coreexecutor.RoutingEvent{Stage: "model_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Attempt: index, CandidateCount: len(models), Outcome: "started"})
+		emitRoutingEvent(attemptOpts.RoutingObserver, routingAttemptEvent(ctx, coreexecutor.RoutingEvent{Stage: "model_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Attempt: index, CandidateCount: len(models), Outcome: "started"}))
 		response, errExecute := h.AuthManager.Execute(ctx, modelProviders, attemptReq, attemptOpts)
 		if errExecute == nil {
-			emitRoutingEvent(attemptOpts.RoutingObserver, coreexecutor.RoutingEvent{Stage: "model_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Attempt: index, CandidateCount: len(models), Outcome: "success"})
+			emitRoutingEvent(attemptOpts.RoutingObserver, routingAttemptEvent(ctx, coreexecutor.RoutingEvent{Stage: "model_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Attempt: index, CandidateCount: len(models), Outcome: "success"}))
 			return response, model, nil
 		}
-		emitRoutingEvent(attemptOpts.RoutingObserver, coreexecutor.RoutingEvent{Stage: "model_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Reason: fallbackReason(errExecute), Attempt: index, CandidateCount: len(models), Outcome: "failed"})
+		emitRoutingEvent(attemptOpts.RoutingObserver, routingAttemptEvent(ctx, coreexecutor.RoutingEvent{Stage: "model_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Reason: fallbackReason(errExecute), Attempt: index, CandidateCount: len(models), Outcome: "failed"}))
 		lastErr = errExecute
 		if shouldStopModelFallback(ctx, errExecute) {
 			return coreexecutor.Response{}, model, errExecute
@@ -222,13 +228,13 @@ func (h *BaseAPIHandler) executeCountModelSlate(ctx context.Context, providers [
 	if len(modelProviders) > 0 {
 		provider = modelProviders[0]
 	}
-	emitRoutingEvent(attemptOpts.RoutingObserver, coreexecutor.RoutingEvent{Stage: "count_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Attempt: 0, CandidateCount: len(models), Outcome: "started"})
+	emitRoutingEvent(attemptOpts.RoutingObserver, routingAttemptEvent(ctx, coreexecutor.RoutingEvent{Stage: "count_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Attempt: 0, CandidateCount: len(models), Outcome: "started"}))
 	response, errExecute := h.AuthManager.ExecuteCount(ctx, modelProviders, attemptReq, attemptOpts)
 	if errExecute != nil {
-		emitRoutingEvent(attemptOpts.RoutingObserver, coreexecutor.RoutingEvent{Stage: "count_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Reason: fallbackReason(errExecute), Attempt: 0, CandidateCount: len(models), Outcome: "failed"})
+		emitRoutingEvent(attemptOpts.RoutingObserver, routingAttemptEvent(ctx, coreexecutor.RoutingEvent{Stage: "count_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Reason: fallbackReason(errExecute), Attempt: 0, CandidateCount: len(models), Outcome: "failed"}))
 		return coreexecutor.Response{}, model, errExecute
 	}
-	emitRoutingEvent(attemptOpts.RoutingObserver, coreexecutor.RoutingEvent{Stage: "count_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Attempt: 0, CandidateCount: len(models), Outcome: "success"})
+	emitRoutingEvent(attemptOpts.RoutingObserver, routingAttemptEvent(ctx, coreexecutor.RoutingEvent{Stage: "count_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Attempt: 0, CandidateCount: len(models), Outcome: "success"}))
 	return response, model, nil
 }
 
@@ -253,18 +259,18 @@ func (h *BaseAPIHandler) executeStreamModelSlate(ctx context.Context, providers 
 		if len(modelProviders) > 0 {
 			provider = modelProviders[0]
 		}
-		emitRoutingEvent(attemptOpts.RoutingObserver, coreexecutor.RoutingEvent{Stage: "stream_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Attempt: index, CandidateCount: len(models), Outcome: "started"})
+		emitRoutingEvent(attemptOpts.RoutingObserver, routingAttemptEvent(ctx, coreexecutor.RoutingEvent{Stage: "stream_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Attempt: index, CandidateCount: len(models), Outcome: "started"}))
 		result, errExecute := h.AuthManager.ExecuteStream(attemptCtx, modelProviders, attemptReq, attemptOpts)
 		if errExecute == nil && result != nil && result.Chunks != nil {
 			first, errFirst := firstStreamPayload(attemptCtx, result.Chunks)
 			if errFirst == nil {
-				emitRoutingEvent(attemptOpts.RoutingObserver, coreexecutor.RoutingEvent{Stage: "stream_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Attempt: index, CandidateCount: len(models), Outcome: "committed"})
+				emitRoutingEvent(attemptOpts.RoutingObserver, routingAttemptEvent(ctx, coreexecutor.RoutingEvent{Stage: "stream_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Attempt: index, CandidateCount: len(models), Outcome: "committed"}))
 				return prependStreamChunk(attemptCtx, result, first, cancelAttempt), model, nil
 			}
 			errExecute = errFirst
 		}
 		cancelAttempt()
-		emitRoutingEvent(attemptOpts.RoutingObserver, coreexecutor.RoutingEvent{Stage: "stream_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Reason: fallbackReason(errExecute), Attempt: index, CandidateCount: len(models), Outcome: "failed"})
+		emitRoutingEvent(attemptOpts.RoutingObserver, routingAttemptEvent(ctx, coreexecutor.RoutingEvent{Stage: "stream_attempt", Mode: "active", TaskClass: decision.TaskClass, ScoreVersion: decision.ScoreVersion, Model: model, Provider: provider, Reason: fallbackReason(errExecute), Attempt: index, CandidateCount: len(models), Outcome: "failed"}))
 		lastErr = errExecute
 		if shouldStopModelFallback(ctx, errExecute) {
 			return nil, model, errExecute

@@ -363,6 +363,17 @@ func TestRoutingEventNormalizationClosesEnumsAndSanitizesIdentifiers(t *testing.
 	}
 }
 
+func TestRoutingEventNormalizationPreservesAccountAttemptOrdinalsThroughConfiguredBound(t *testing.T) {
+	for _, attempt := range []int{99, 100, 101, 1000, 1001} {
+		normalized := coreexecutor.NormalizeRoutingEvent(coreexecutor.RoutingEvent{
+			Stage: "account_attempt", Outcome: "success", Attempt: attempt,
+		})
+		if normalized.Attempt != attempt {
+			t.Fatalf("attempt %d normalized to %d", attempt, normalized.Attempt)
+		}
+	}
+}
+
 func TestStructuredRoutingObserverNeverBlocksWhenQueueIsFull(t *testing.T) {
 	observer := &structuredRoutingObserver{events: make(chan coreexecutor.RoutingEvent, 1)}
 	observer.ObserveRouting(coreexecutor.RoutingEvent{Stage: "model_decision", Outcome: "selected"})

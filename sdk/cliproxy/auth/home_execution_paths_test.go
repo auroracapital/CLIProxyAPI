@@ -168,6 +168,36 @@ func TestHomeNonStreamingExecutionLogsPrivacySafeSelection(t *testing.T) {
 	}
 }
 
+func TestHomeNonStreamingAndCountRoutingEventsPairExactly(t *testing.T) {
+	for _, countTokens := range []bool{false, true} {
+		name := "execute"
+		if countTokens {
+			name = "count_tokens"
+		}
+		t.Run(name, func(t *testing.T) {
+			manager := NewManager(nil, nil, nil)
+			manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
+			manager.PublishHomeDispatch(homeExecutionDispatcher{}, executionregistry.New(), 1)
+			manager.RegisterExecutor(&homeExecutionExecutor{})
+			observer := &pressureRoutingObserver{}
+			opts := cliproxyexecutor.Options{RoutingObserver: observer}
+			var errExecute error
+			if countTokens {
+				_, errExecute = manager.ExecuteCount(context.Background(), []string{"home-execution"}, cliproxyexecutor.Request{Model: "model-a"}, opts)
+			} else {
+				_, errExecute = manager.Execute(context.Background(), []string{"home-execution"}, cliproxyexecutor.Request{Model: "model-a"}, opts)
+			}
+			if errExecute != nil {
+				t.Fatal(errExecute)
+			}
+			events := observer.Events()
+			if len(events) != 2 || events[0].Stage != "account_selection" || events[0].Outcome != "selected" || events[1].Stage != "account_attempt" || events[1].Outcome != "success" || events[0].Attempt != events[1].Attempt || events[0].SeatBucket != events[1].SeatBucket {
+				t.Fatalf("Home events = %#v, want one selected/success pair", events)
+			}
+		})
+	}
+}
+
 type homeOAuthLoggingDispatcher struct{}
 
 func (homeOAuthLoggingDispatcher) HeartbeatOK() bool { return true }

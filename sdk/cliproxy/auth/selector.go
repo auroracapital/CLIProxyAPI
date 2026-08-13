@@ -867,19 +867,26 @@ func (s *ShadowLeastPressureSelector) Pick(ctx context.Context, provider, model 
 		actual.pressureLease = &credentialPressureLease{tracker: tracker, authID: actual.ID, startedAt: time.Now()}
 	}
 	if opts.RoutingObserver != nil {
-		opts.RoutingObserver.ObserveRouting(cliproxyexecutor.RoutingEvent{
-			Stage:               "account_prediction",
-			Mode:                "shadow",
-			Model:               model,
-			Provider:            actual.Provider,
-			Outcome:             "predicted",
-			CandidateCount:      len(available),
-			Selector:            "shadow_least_pressure",
-			ShadowMatch:         predicted != nil && predicted.ID == actual.ID,
-			SeatBucket:          routingSeatBucket(actual.ID),
-			PredictedSeatBucket: predictedRoutingSeatBucket(predicted),
-			RequestBucket:       cliproxyexecutor.RoutingRequestBucket(logging.GetRequestID(ctx)),
-		})
+		func() {
+			defer func() {
+				if recover() != nil {
+					log.Warn("routing observer panicked; account prediction event dropped")
+				}
+			}()
+			opts.RoutingObserver.ObserveRouting(cliproxyexecutor.RoutingEvent{
+				Stage:               "account_prediction",
+				Mode:                "shadow",
+				Model:               model,
+				Provider:            actual.Provider,
+				Outcome:             "predicted",
+				CandidateCount:      len(available),
+				Selector:            "shadow_least_pressure",
+				ShadowMatch:         predicted != nil && predicted.ID == actual.ID,
+				SeatBucket:          routingSeatBucket(actual.ID),
+				PredictedSeatBucket: predictedRoutingSeatBucket(predicted),
+				RequestBucket:       cliproxyexecutor.RoutingRequestBucket(logging.GetRequestID(ctx)),
+			})
+		}()
 	}
 	return actual, nil
 }

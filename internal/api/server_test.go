@@ -1455,6 +1455,38 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 	}
 }
 
+func TestManagementRoutingPressureRouteUsesLiveManagerAndRequiresAuth(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+	server := newTestServer(t)
+
+	missingKeyReq := httptest.NewRequest(http.MethodGet, "/v0/management/routing-pressure", nil)
+	missingKeyRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(missingKeyRR, missingKeyReq)
+	if missingKeyRR.Code != http.StatusUnauthorized {
+		t.Fatalf("missing key status = %d, want %d body=%s", missingKeyRR.Code, http.StatusUnauthorized, missingKeyRR.Body.String())
+	}
+
+	authReq := httptest.NewRequest(http.MethodGet, "/v0/management/routing-pressure", nil)
+	authReq.Header.Set("Authorization", "Bearer test-management-key")
+	authRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(authRR, authReq)
+	if authRR.Code != http.StatusOK {
+		t.Fatalf("authenticated status = %d, want %d body=%s", authRR.Code, http.StatusOK, authRR.Body.String())
+	}
+	var payload struct {
+		SchemaVersion int           `json:"schema_version"`
+		ActiveLeases  int64         `json:"active_leases"`
+		ActiveSeats   int           `json:"active_seats"`
+		Seats         []interface{} `json:"seats"`
+	}
+	if errUnmarshal := json.Unmarshal(authRR.Body.Bytes(), &payload); errUnmarshal != nil {
+		t.Fatalf("unmarshal response: %v body=%s", errUnmarshal, authRR.Body.String())
+	}
+	if payload.SchemaVersion != 1 || payload.ActiveLeases != 0 || payload.ActiveSeats != 0 || len(payload.Seats) != 0 {
+		t.Fatalf("routing pressure payload = %#v", payload)
+	}
+}
+
 func TestManagementPluginsRouteRegistered(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 

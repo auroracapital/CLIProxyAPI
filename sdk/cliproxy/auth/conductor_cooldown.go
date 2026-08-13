@@ -711,16 +711,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		now := time.Now()
+		counterNeutral := !result.Success && (isRequestInvalidError(result.Error) || shouldSkipCredentialCooldown(result.Error))
 		var cooldownRecordsBefore []CooldownStateRecord
 		trackCooldownState := m.cooldownStore != nil
 		if trackCooldownState {
 			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
 		}
-		auth.recordRecentRequest(now, result.Success)
-		if result.Success {
-			auth.Success++
-		} else {
-			auth.Failed++
+		if !counterNeutral {
+			auth.recordRecentRequest(now, result.Success)
+			if result.Success {
+				auth.Success++
+			} else {
+				auth.Failed++
+			}
 		}
 
 		if result.Success {

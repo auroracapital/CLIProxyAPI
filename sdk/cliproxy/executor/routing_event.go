@@ -59,12 +59,12 @@ func RoutingRequestBucket(requestID string) string {
 }
 
 var routingEventEnums = map[string]map[string]struct{}{
-	"stage":    values("model_decision", "model_attempt", "stream_attempt", "count_attempt", "account_selection", "account_prediction"),
+	"stage":    values("model_decision", "model_attempt", "stream_attempt", "count_attempt", "account_selection", "account_attempt", "account_prediction"),
 	"mode":     values("active", "shadow"),
 	"task":     values("", "code", "reasoning", "research", "agent", "multimodal", "writing", "general"),
 	"score":    values("", "v1", "v2"),
 	"reason":   values("", "general_default", "hard_multimodal", "hard_tools", "keyword_code", "keyword_reasoning", "keyword_research", "keyword_agent", "keyword_writing", "keyword_general", "no_compatible_model", "transport", "request_fault", "unauthorized", "quota", "route_unavailable", "timeout", "too_early", "rate_limited", "upstream_unavailable", "terminal"),
-	"outcome":  values("selected", "unavailable", "started", "success", "failed", "committed", "predicted"),
+	"outcome":  values("selected", "unavailable", "started", "success", "failed", "canceled", "rejected", "committed", "predicted"),
 	"selector": values("", "custom", "round_robin", "shadow_least_pressure", "least_pressure", "weighted_round_robin", "fill_first", "session_affinity"),
 }
 
@@ -95,8 +95,6 @@ func NormalizeRoutingEvent(event RoutingEvent) RoutingEvent {
 	event.RequestBucket = routingRequestBucket(event.RequestBucket)
 	if event.Attempt < 0 {
 		event.Attempt = 0
-	} else if event.Attempt > 100 {
-		event.Attempt = 100
 	}
 	if event.CandidateCount < 0 {
 		event.CandidateCount = 0

@@ -28,7 +28,8 @@ jobs:
             ./internal/api/handlers/management \
             ./sdk/cliproxy/auth \
             ./sdk/cliproxy \
-            -run 'TestSmart|TestRouting|Test.*AutoRout|Test.*Reconcile|TestProbe|TestRefreshAuthCredential|Test.*LeastPressure' \
+            ./internal/runtime/executor \
+            -run 'TestSmart|TestRouting|TestAccountRouting|Test.*AutoRout|Test.*Reconcile|TestProbe|TestRefreshAuthCredential|Test.*LeastPressure|Test.*OpenAICompatRetryAfter|TestNewOpenAICompatStatusError' \
             -count=1
 
       - name: Vet changed routing packages
@@ -42,6 +43,7 @@ jobs:
             ./internal/config \
             ./internal/api \
             ./internal/api/handlers/management \
+            ./internal/runtime/executor \
             ./internal/watcher/synthesizer
 
   focused-routing-race:
@@ -60,8 +62,37 @@ jobs:
             ./sdk/api/handlers \
             ./internal/api/handlers/management \
             ./sdk/cliproxy/auth \
-            -run 'TestSmart|TestRouting|Test.*Reconcile|TestProbe|TestRefreshAuthCredential|Test.*LeastPressure' \
+            ./internal/runtime/executor \
+            -run 'TestSmart|TestRouting|TestAccountRouting|Test.*Reconcile|TestProbe|TestRefreshAuthCredential|Test.*LeastPressure|Test.*OpenAICompatRetryAfter|TestNewOpenAICompatStatusError' \
             -count=1
+
+  active-fault-fixture:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install fixture dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iproute2 jq util-linux
+          id crsproxy >/dev/null 2>&1 || sudo useradd --system --no-create-home crsproxy
+          test "$(uname -m)" = aarch64
+          for command in unshare ip setpriv python3 curl jq sha256sum awk; do
+            command -v "$command" >/dev/null
+          done
+          test -x tools/smart-router/verify_active_fault_fixture.sh
+          test -x tools/smart-router/verify_active_fault_fixture_inside.sh
+      - name: Build and run loopback-only active fault fixture
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o test-output ./cmd/server
+          sha256=$(sha256sum test-output | awk '{print $1}')
+          sudo timeout 75s tools/smart-router/verify_active_fault_fixture.sh "$PWD/test-output" "$sha256"
 
   linux-arm64-build:
     runs-on: ubuntu-latest

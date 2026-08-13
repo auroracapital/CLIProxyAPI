@@ -1,2 +1,4 @@
 e7c5b11ca671cc88ab9e92db4622248d53c15725:tools/smart-router/verify_shadow_fixture_inside.sh:curl-auth-header:130
 e7c5b11ca671cc88ab9e92db4622248d53c15725:tools/smart-router/verify_shadow_fixture_inside.sh:curl-auth-header:146
+a8bbbea2b9b53149f90710d59668a53b4b0427a4:internal/runtime/executor/helps/claude_client_detection.go:generic-api-key:155
+a8bbbea2b9b53149f90710d59668a53b4b0427a4:internal/runtime/executor/helps/claude_client_detection_test.go:generic-api-key:463

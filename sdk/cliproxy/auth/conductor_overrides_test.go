@@ -1340,8 +1340,8 @@ func TestManager_RequestScopedErrorStopsCredentialFallbackWithoutSuspendingAuth(
 			if state := updatedBad.ModelStates[model]; state != nil {
 				t.Fatalf("expected request-scoped error to avoid model cooldown state, got %#v", state)
 			}
-			if updatedBad.Failed != 1 {
-				t.Fatalf("failed count = %d, want 1", updatedBad.Failed)
+			if updatedBad.Failed != 0 {
+				t.Fatalf("failed count = %d, want request-scoped failure to remain counter-neutral", updatedBad.Failed)
 			}
 			updatedGood, ok := m.GetByID(goodAuth.ID)
 			if !ok || updatedGood == nil {

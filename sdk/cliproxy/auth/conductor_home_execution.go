@@ -9,7 +9,7 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-func (m *Manager) executeHome(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, countTokens bool) (cliproxyexecutor.Response, error) {
+func (m *Manager) executeHome(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, countTokens bool, routingRequest *accountRoutingRequest) (cliproxyexecutor.Response, error) {
 	if unlockSession := m.lockHomeWebsocketSession(ctx, opts); unlockSession != nil {
 		defer unlockSession()
 	}
@@ -28,11 +28,14 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 			return cliproxyexecutor.Response{}, errSelection
 		}
 		auth := selection.CloneAuthForRoute(routeModel)
+		accountAttempt := m.beginAccountRoutingAttempt(routingRequest, selection.Provider, routeModel, auth)
 		if auth == nil || selection.Executor == nil {
+			accountAttempt.Finish("unavailable")
 			selection.End("missing_execution_target")
 			return cliproxyexecutor.Response{}, &Error{Code: "executor_not_found", Message: "executor not registered"}
 		}
 		if _, seen := tried[auth.ID]; seen {
+			accountAttempt.Finish("unavailable")
 			selection.End("repeated_auth")
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
@@ -42,6 +45,7 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, selection.Provider, routeModel)
 		if errRuntimeAuth := m.bindHomeSelectionRuntimeAuth(ctx, opts, selection); errRuntimeAuth != nil {
+			accountAttempt.Finish(accountAttemptOutcomeForError(errRuntimeAuth))
 			selection.End("runtime_auth_bind_failed")
 			return cliproxyexecutor.Response{}, errRuntimeAuth
 		}
@@ -49,6 +53,7 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 		tried[auth.ID] = struct{}{}
 		execCtx, releaseAttempt, errBind := homeExecutionAttemptContext(ctx, selection)
 		if errBind != nil {
+			accountAttempt.Finish(accountAttemptOutcomeForError(errBind))
 			selection.End("attempt_bind_failed")
 			return cliproxyexecutor.Response{}, errBind
 		}
@@ -67,6 +72,7 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 			pooled = false
 		}
 		if len(models) == 0 {
+			accountAttempt.Finish("unavailable")
 			releaseAttempt()
 			if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "no_execution_models"); errEnd != nil {
 				return cliproxyexecutor.Response{}, errEnd
@@ -76,6 +82,7 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 		}
 		preparedAuth, errPrepare := m.prepareHomeRequestAuth(execCtx, selection.Executor, selection)
 		if errPrepare != nil {
+			accountAttempt.Finish(accountAttemptOutcomeForError(errPrepare))
 			m.reportHomeResult(execCtx, Result{AuthID: auth.ID, Provider: selection.Provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}, auth)
 			releaseAttempt()
 			if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "prepare_failed"); errEnd != nil {
@@ -97,6 +104,7 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 			var errIntercept error
 			execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, selection.Executor, selection.Provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			if errIntercept != nil {
+				accountAttempt.Finish(accountAttemptOutcomeForError(errIntercept))
 				releaseAttempt()
 				selection.End("request_intercepted")
 				return cliproxyexecutor.Response{}, errIntercept
@@ -105,6 +113,7 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 				execReq = attachResolvedAPIKeyModelInfo(routing, execReq, preparedAuth, routeModel, upstreamModel)
 			}
 			if errCtx := execCtx.Err(); errCtx != nil {
+				accountAttempt.Finish("canceled")
 				releaseAttempt()
 				selection.End("attempt_canceled")
 				return cliproxyexecutor.Response{}, errCtx
@@ -167,6 +176,7 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 			}
 			result := Result{AuthID: preparedAuth.ID, Provider: selection.Provider, Model: resultModel, Success: errExecute == nil}
 			if errExecute == nil {
+				accountAttempt.Finish("success")
 				m.reportHomeResult(execCtx, result, preparedAuth)
 				releaseAttempt()
 				attemptAliasResult := resolveAttemptAliasResult(routing, preparedAuth, routeModel, upstreamModel, aliasResult)
@@ -181,11 +191,13 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 			m.reportHomeResult(execCtx, result, preparedAuth)
 			lastErr = errExecute
 			if isRequestInvalidError(errExecute) {
+				accountAttempt.Finish(accountAttemptOutcomeForError(errExecute))
 				releaseAttempt()
 				selection.End("request_invalid")
 				return cliproxyexecutor.Response{}, errExecute
 			}
 		}
+		accountAttempt.Finish(accountAttemptOutcomeForError(lastErr))
 		releaseAttempt()
 		if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "execution_failed"); errEnd != nil {
 			return cliproxyexecutor.Response{}, errEnd

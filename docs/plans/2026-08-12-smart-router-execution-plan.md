@@ -1,6 +1,6 @@
 # Smart Model Router and Predictive Account Balancer
 
-Status: post-CAS rollback recovery patch verified locally; four-seat recovery rollout, active canary, and 24-hour soak pending
+Status: live `.7` reconciler recovery is healthy; account-attempt/pressure hardening passes local and isolated ARM64 fault gates; committed `.8` rollout, active canaries, and 24-hour soak pending
 Owner: primary agent
 Canonical runtime: `healify-hub` only
 Proxy path: nginx `:8317` -> CLIProxyAPI `127.0.0.1:8319`
@@ -388,12 +388,17 @@ Current verified evidence, 2026-08-13:
 - The current uncommitted diff passes gitleaks pre-commit and stdin scans with zero findings.
 - The service and timer templates pass `systemd-analyze verify` on the arm64 hub with systemd 255.
 - Live topology remains nginx `:8317` to loopback CLIProxyAPI `:8319`; the Mac has no local CLIProxy/crsproxy listener or refresh process.
-- The live hub runs `v7.2.130-smart-router.6` (`910878b7`) in shadow-only mode with all 19 desired/runtime generations converged. The reconciler timer/service remain disabled/inactive after four unhealthy-seat canaries exposed a stale post-CAS rollback fence; this patch fixes that fence and adds metadata-only automatic recovery, but it has not yet been deployed in this checkpoint.
+- The live hub runs `v7.2.130-smart-router.7` (`562ca896`) with SHA-256 `ba8de7414656821dbccbebc58aba2f2e81e52de8cc206d427d6d3c02081e441f`. nginx and crsproxy are active, backend and ingress `/v1/models` return the expected unauthenticated `401`, and the Mac has no local proxy listener.
+- The account reconciler timer is enabled and active. Three post-deployment periodic cycles and the latest live check completed with `Result=success`, `ExecMainStatus=0`, 19/19 desired seats processed, five objectively ready seats, fourteen objectively cooling seats, and no generation/admission mismatches or manual toggles.
+- Exactly-once account-attempt telemetry now pairs one `account_selection/selected` event with one terminal `account_attempt` event across ordinary, count, stream, pooled-model, Home, retry, rejection, cancellation, and panic paths. Request faults and cancellations are excluded from recent/total failure pressure.
+- A protected, privacy-safe `/v0/management/routing-pressure` endpoint exposes only active opaque seat buckets and capacity-normalized in-flight pressure. The strengthened fault fixture proves a live one-seat/one-lease/1000-milli snapshot during a held cancellation and zero residual leases afterward.
+- The exact Linux/arm64 precommit candidate with SHA-256 `5eff8c6dbe810bc1912da0f9ff4cf293fe99e8194de16d9752730322bdac7525` passed eight loopback-only fault cases: 429 with `Retry-After`, 503, timeout, cancellation, stream bootstrap failure, post-payload terminal error, invalid/policy rejection, and model/provider fallback. This hash is precommit evidence only and must not be deployed; deployment requires a rebuild from the final commit.
+- The final local precommit gate passes the full Go suite, focused race suites, 72/72 reconciler tests, changed-package vet, formatting, workflow/action validation, shell lint, Linux/arm64 build, Windows SDK cross-compile, recent branch history and current-diff secret scans, and live systemd unit validation. The exact focused PR gate completes in five seconds locally and its race counterpart in six seconds.
 
 Remaining production evidence:
 
-- Deploy the patched controller and provenance-pinned binary, dry-run and apply automatic recovery for the four recorded rollback failures, then repeat only those exact-seat canaries.
-- Run semantic and account shadow modes, fixed-model least-pressure canary, controlled fault injection, rollback rehearsal, and a 24-hour zero-manual-toggle soak.
+- Commit the reviewed patch, rebuild a provenance-pinned `.8` artifact from that exact commit, and deploy it reversibly while retaining `.7` as the binary rollback target.
+- Run a genuinely multi-seat fixed-model least-pressure canary, activate and validate semantic `auto`, rehearse both rollback layers, and complete a fresh 24-hour zero-manual-toggle soak on the final artifact.
 
 ### Functional
 

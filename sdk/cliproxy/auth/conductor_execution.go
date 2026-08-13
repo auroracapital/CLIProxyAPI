@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -37,12 +38,13 @@ func claudeOAuthRequestCancellation(ctx context.Context, auth *Auth, err error) 
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	req, opts = cliproxysession.Enrich(req, opts)
+	routingRequest := newAccountRoutingRequest(ctx, opts.RoutingObserver)
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	if m.HomeEnabled() {
-		return m.executeHome(ctx, normalized, req, opts, false)
+		return m.executeHome(ctx, normalized, req, opts, false, routingRequest)
 	}
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
@@ -50,7 +52,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	for attempt := 0; ; attempt++ {
-		resp, errExec := m.executeMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
+		resp, errExec := m.executeMixedOnce(ctx, normalized, req, opts, maxRetryCredentials, routingRequest)
 		if errExec == nil {
 			return resp, nil
 		}
@@ -82,12 +84,13 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	req, opts = cliproxysession.Enrich(req, opts)
+	routingRequest := newAccountRoutingRequest(ctx, opts.RoutingObserver)
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	if m.HomeEnabled() {
-		return m.executeHome(ctx, normalized, req, opts, true)
+		return m.executeHome(ctx, normalized, req, opts, true, routingRequest)
 	}
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
@@ -95,7 +98,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	for attempt := 0; ; attempt++ {
-		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
+		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, opts, maxRetryCredentials, routingRequest)
 		if errExec == nil {
 			return resp, nil
 		}
@@ -121,6 +124,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	req, opts = cliproxysession.Enrich(req, opts)
+	routingRequest := newAccountRoutingRequest(ctx, opts.RoutingObserver)
 	if m.HomeEnabled() {
 		if unlockSession := m.lockHomeWebsocketSession(ctx, opts); unlockSession != nil {
 			defer unlockSession()
@@ -136,7 +140,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	for attempt := 0; ; attempt++ {
-		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
+		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, maxRetryCredentials, routingRequest)
 		if errStream == nil {
 			return result, nil
 		}
@@ -272,7 +276,7 @@ func mergeRequestHeaders(current, updates http.Header, clear []string) http.Head
 	return out
 }
 
-func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int) (cliproxyexecutor.Response, error) {
+func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, routingRequest *accountRoutingRequest) (cliproxyexecutor.Response, error) {
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -303,6 +307,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			return cliproxyexecutor.Response{}, errPick
 		}
 		lease := takeCredentialPressureLease(auth)
+		if lease != nil {
+			defer lease.Release()
+		}
 		releasePressure := func() {
 			if lease != nil {
 				lease.Release()
@@ -310,7 +317,14 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 
 		entry := logEntryWithRequestID(ctx)
-		m.emitAccountRoutingEvent(ctx, opts.RoutingObserver, "account_selection", provider, routeModel, auth, "selected", len(attempted), 0)
+		accountAttempt := m.beginAccountRoutingAttempt(routingRequest, provider, routeModel, auth)
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				accountAttempt.Finish("failed")
+				releasePressure()
+				panic(recovered)
+			}
+		}()
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
@@ -324,6 +338,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
+			accountAttempt.Finish("unavailable")
 			releasePressure()
 			continue
 		}
@@ -333,8 +348,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		if errPrepare != nil {
 			releasePressure()
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
+				accountAttempt.Finish("canceled")
 				return cliproxyexecutor.Response{}, errCancel
 			}
+			accountAttempt.Finish(accountAttemptOutcomeForError(errPrepare))
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
@@ -353,6 +370,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			var errIntercept error
 			execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			if errIntercept != nil {
+				accountAttempt.Finish(accountAttemptOutcomeForError(errIntercept))
 				releasePressure()
 				return cliproxyexecutor.Response{}, errIntercept
 			}
@@ -362,6 +380,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					accountAttempt.Finish("canceled")
 					releasePressure()
 					return cliproxyexecutor.Response{}, errCtx
 				}
@@ -371,6 +390,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
 					if errExec != nil {
 						if errCtx := execCtx.Err(); errCtx != nil {
+							accountAttempt.Finish("canceled")
 							releasePressure()
 							return cliproxyexecutor.Response{}, errCtx
 						}
@@ -378,6 +398,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 			}
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errExec); errCancel != nil {
+				accountAttempt.Finish("canceled")
 				releasePressure()
 				return cliproxyexecutor.Response{}, errCancel
 			}
@@ -389,6 +410,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
+					accountAttempt.Finish(accountAttemptOutcomeForError(errExec))
 					releasePressure()
 					return cliproxyexecutor.Response{}, errExec
 				}
@@ -396,12 +418,14 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			accountAttempt.Finish("success")
 			releasePressure()
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			return resp, nil
 		}
 		if authErr != nil {
+			accountAttempt.Finish(accountAttemptOutcomeForError(authErr))
 			releasePressure()
 			if isRequestInvalidError(authErr) {
 				return cliproxyexecutor.Response{}, authErr
@@ -415,7 +439,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	}
 }
 
-func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int) (cliproxyexecutor.Response, error) {
+func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, routingRequest *accountRoutingRequest) (cliproxyexecutor.Response, error) {
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -446,6 +470,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			return cliproxyexecutor.Response{}, errPick
 		}
 		lease := takeCredentialPressureLease(auth)
+		if lease != nil {
+			defer lease.Release()
+		}
 		releasePressure := func() {
 			if lease != nil {
 				lease.Release()
@@ -453,7 +480,14 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 
 		entry := logEntryWithRequestID(ctx)
-		m.emitAccountRoutingEvent(ctx, opts.RoutingObserver, "account_selection", provider, routeModel, auth, "selected", len(attempted), 0)
+		accountAttempt := m.beginAccountRoutingAttempt(routingRequest, provider, routeModel, auth)
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				accountAttempt.Finish("failed")
+				releasePressure()
+				panic(recovered)
+			}
+		}()
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
@@ -467,6 +501,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
+			accountAttempt.Finish("unavailable")
 			releasePressure()
 			continue
 		}
@@ -476,8 +511,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		if errPrepare != nil {
 			releasePressure()
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
+				accountAttempt.Finish("canceled")
 				return cliproxyexecutor.Response{}, errCancel
 			}
+			accountAttempt.Finish(accountAttemptOutcomeForError(errPrepare))
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
@@ -496,6 +533,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			var errIntercept error
 			execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			if errIntercept != nil {
+				accountAttempt.Finish(accountAttemptOutcomeForError(errIntercept))
 				releasePressure()
 				return cliproxyexecutor.Response{}, errIntercept
 			}
@@ -505,6 +543,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					accountAttempt.Finish("canceled")
 					releasePressure()
 					return cliproxyexecutor.Response{}, errCtx
 				}
@@ -514,6 +553,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					resp, errExec = executor.CountTokens(execCtx, auth, execReq, execOpts)
 					if errExec != nil {
 						if errCtx := execCtx.Err(); errCtx != nil {
+							accountAttempt.Finish("canceled")
 							releasePressure()
 							return cliproxyexecutor.Response{}, errCtx
 						}
@@ -521,6 +561,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				}
 			}
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errExec); errCancel != nil {
+				accountAttempt.Finish("canceled")
 				releasePressure()
 				return cliproxyexecutor.Response{}, errCancel
 			}
@@ -540,6 +581,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					m.MarkResult(execCtx, result)
 				}
 				if isRequestInvalidError(errExec) {
+					accountAttempt.Finish(accountAttemptOutcomeForError(errExec))
 					releasePressure()
 					return cliproxyexecutor.Response{}, errExec
 				}
@@ -547,12 +589,14 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			accountAttempt.Finish("success")
 			releasePressure()
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			return resp, nil
 		}
 		if authErr != nil {
+			accountAttempt.Finish(accountAttemptOutcomeForError(authErr))
 			releasePressure()
 			if isRequestInvalidError(authErr) {
 				return cliproxyexecutor.Response{}, authErr
@@ -566,7 +610,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 }
 
-func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, routingRequest *accountRoutingRequest) (*cliproxyexecutor.StreamResult, error) {
 	if len(providers) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -614,7 +658,20 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			return nil, errPick
 		}
 		lease := takeCredentialPressureLease(auth)
+		leaseOwned := lease != nil
+		var accountAttempt *accountRoutingAttempt
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				accountAttempt.Finish("failed")
+				if leaseOwned {
+					lease.Release()
+				}
+				panic(recovered)
+			}
+		}()
+		accountAttempt = m.beginAccountRoutingAttempt(routingRequest, provider, routeModel, auth)
 		if auth == nil || executor == nil {
+			accountAttempt.Finish("unavailable")
 			if lease != nil {
 				lease.Release()
 			}
@@ -634,10 +691,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 
 		entry := logEntryWithRequestID(ctx)
-		m.emitAccountRoutingEvent(ctx, opts.RoutingObserver, "account_selection", provider, routeModel, auth, "selected", len(attempted), 0)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		if selection != nil {
 			if errRuntimeAuth := m.bindHomeSelectionRuntimeAuth(ctx, opts, selection); errRuntimeAuth != nil {
+				accountAttempt.Finish(accountAttemptOutcomeForError(errRuntimeAuth))
 				selection.End("runtime_auth_bind_failed")
 				return nil, errRuntimeAuth
 			}
@@ -651,6 +708,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			var errBind error
 			execCtx, releaseAttempt, errBind = homeExecutionAttemptContext(ctx, selection)
 			if errBind != nil {
+				accountAttempt.Finish(accountAttemptOutcomeForError(errBind))
 				selection.End("attempt_bind_failed")
 				return nil, errBind
 			}
@@ -666,6 +724,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			aliasResult.OriginalAlias = responseAlias
 		}
 		if len(models) == 0 {
+			accountAttempt.Finish("unavailable")
 			if lease != nil {
 				lease.Release()
 			}
@@ -687,12 +746,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if errPrepare != nil {
 			if selection == nil {
 				if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
+					accountAttempt.Finish("canceled")
 					if lease != nil {
 						lease.Release()
 					}
 					return nil, errCancel
 				}
 			}
+			accountAttempt.Finish(accountAttemptOutcomeForError(errPrepare))
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			if selection != nil {
 				m.reportHomeResult(execCtx, result, auth)
@@ -724,8 +785,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			models = models[:1]
 			pooled = false
 		}
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil, unauthorizedRefreshTried)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil, unauthorizedRefreshTried, accountAttempt)
 		if errStream != nil {
+			accountAttempt.Finish(accountAttemptOutcomeForError(errStream))
 			if lease != nil {
 				lease.Release()
 			}
@@ -753,14 +815,39 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return wrapHomeStream(ctx, streamResult, selection, releaseAttempt), nil
 		}
+		leaseOwned = false
 		return wrapPressureStream(ctx, streamResult, lease), nil
 	}
 }
 
-func (m *Manager) emitAccountRoutingEvent(ctx context.Context, observer cliproxyexecutor.RoutingObserver, stage, provider, model string, auth *Auth, outcome string, attempt, candidates int) {
-	if observer == nil || auth == nil {
-		return
+type accountRoutingRequest struct {
+	observer      cliproxyexecutor.RoutingObserver
+	requestBucket string
+	nextAttempt   atomic.Uint64
+}
+
+type accountRoutingAttempt struct {
+	observer      cliproxyexecutor.RoutingObserver
+	requestBucket string
+	provider      string
+	model         string
+	selector      string
+	seatBucket    string
+	ordinal       int
+	once          sync.Once
+}
+
+func newAccountRoutingRequest(ctx context.Context, observer cliproxyexecutor.RoutingObserver) *accountRoutingRequest {
+	if observer == nil {
+		return nil
 	}
+	return &accountRoutingRequest{
+		observer:      observer,
+		requestBucket: cliproxyexecutor.RoutingRequestBucket(logging.GetRequestID(ctx)),
+	}
+}
+
+func (m *Manager) accountRoutingSelector() string {
 	selector := "custom"
 	switch m.Selector().(type) {
 	case *LeastPressureSelector:
@@ -773,12 +860,79 @@ func (m *Manager) emitAccountRoutingEvent(ctx context.Context, observer cliproxy
 		selector = "weighted_round_robin"
 	case *FillFirstSelector:
 		selector = "fill_first"
+	case *SessionAffinitySelector:
+		selector = "session_affinity"
 	}
-	observer.ObserveRouting(cliproxyexecutor.RoutingEvent{
-		Stage: stage, Mode: "active", Provider: provider, Model: model,
-		Outcome: outcome, Attempt: attempt, CandidateCount: candidates, Selector: selector, SeatBucket: routingSeatBucket(auth.ID),
-		RequestBucket: cliproxyexecutor.RoutingRequestBucket(logging.GetRequestID(ctx)),
+	return selector
+}
+
+func (m *Manager) beginAccountRoutingAttempt(request *accountRoutingRequest, provider, model string, auth *Auth) *accountRoutingAttempt {
+	if request == nil || request.observer == nil || auth == nil {
+		return nil
+	}
+	ordinal := int(request.nextAttempt.Add(1))
+	attempt := &accountRoutingAttempt{
+		observer:      request.observer,
+		requestBucket: request.requestBucket,
+		provider:      provider,
+		model:         model,
+		selector:      m.accountRoutingSelector(),
+		seatBucket:    routingSeatBucket(auth.ID),
+		ordinal:       ordinal,
+	}
+	func() {
+		defer func() {
+			if recover() != nil {
+				log.Warn("routing observer panicked; account selection event dropped")
+			}
+		}()
+		attempt.observer.ObserveRouting(cliproxyexecutor.RoutingEvent{
+			Stage:         "account_selection",
+			Mode:          "active",
+			Provider:      provider,
+			Model:         model,
+			Outcome:       "selected",
+			Attempt:       ordinal,
+			Selector:      attempt.selector,
+			SeatBucket:    attempt.seatBucket,
+			RequestBucket: attempt.requestBucket,
+		})
+	}()
+	return attempt
+}
+
+func (a *accountRoutingAttempt) Finish(outcome string) {
+	if a == nil || a.observer == nil {
+		return
+	}
+	a.once.Do(func() {
+		defer func() {
+			if recover() != nil {
+				log.Warn("routing observer panicked; account attempt event dropped")
+			}
+		}()
+		a.observer.ObserveRouting(cliproxyexecutor.RoutingEvent{
+			Stage:         "account_attempt",
+			Mode:          "active",
+			Provider:      a.provider,
+			Model:         a.model,
+			Outcome:       outcome,
+			Attempt:       a.ordinal,
+			Selector:      a.selector,
+			SeatBucket:    a.seatBucket,
+			RequestBucket: a.requestBucket,
+		})
 	})
+}
+
+func accountAttemptOutcomeForError(err error) string {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "canceled"
+	}
+	if isRequestInvalidError(err) {
+		return "rejected"
+	}
+	return "failed"
 }
 
 func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel string) cliproxyexecutor.Options {

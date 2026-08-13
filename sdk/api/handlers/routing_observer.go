@@ -113,6 +113,13 @@ func routingProviderCategory(provider string) string {
 
 func emitRoutingEvent(observer coreexecutor.RoutingObserver, event coreexecutor.RoutingEvent) {
 	if observer != nil {
-		observer.ObserveRouting(event)
+		func() {
+			defer func() {
+				if recover() != nil {
+					log.Warn("routing observer panicked; event dropped")
+				}
+			}()
+			observer.ObserveRouting(event)
+		}()
 	}
 }

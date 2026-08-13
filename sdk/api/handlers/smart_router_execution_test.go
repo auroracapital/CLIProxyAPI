@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -176,6 +178,63 @@ func TestSmartRoutingExhaustsDistinctAccountsBeforeNextModel(t *testing.T) {
 	}
 	if authCalls[0] == authCalls[1] {
 		t.Fatalf("primary repeated credential: %#v", authCalls)
+	}
+}
+
+func TestSmartModelAndAccountAttemptsShareOpaqueRequestBucket(t *testing.T) {
+	executor := &smartSlateExecutor{
+		failModel: "primary",
+		failErr:   &coreauth.Error{HTTPStatus: http.StatusServiceUnavailable, Message: "busy"},
+	}
+	manager := coreauth.NewManager(nil, &coreauth.LeastPressureSelector{}, nil)
+	manager.SetRetryConfig(0, 0, 0)
+	manager.RegisterExecutor(executor)
+	for _, id := range []string{"correlation-account-a", "correlation-account-b"} {
+		registry.GetGlobalRegistry().RegisterClient(id, executor.Identifier(), []*registry.ModelInfo{{ID: "primary"}, {ID: "fallback"}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+		if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{ID: id, Provider: executor.Identifier(), Status: coreauth.StatusActive}); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+	}
+	handler := NewBaseAPIHandlers(nil, manager)
+	observer := &captureRoutingObserver{}
+	ctx := logging.WithRequestID(context.Background(), "private-correlation-id")
+	decision := modelRouteDecision{Models: []string{"primary", "fallback"}, TaskClass: smartTaskCode, ScoreVersion: smartRouteScoreVersion}
+
+	response, model, errExecute := handler.executeModelSlate(ctx, []string{executor.Identifier()}, coreexecutor.Request{Model: "primary"}, coreexecutor.Options{RoutingObserver: observer}, decision)
+	if errExecute != nil || model != "fallback" || string(response.Payload) != "fallback" {
+		t.Fatalf("model=%q response=%q err=%v", model, response.Payload, errExecute)
+	}
+	events := append([]coreexecutor.RoutingEvent(nil), observer.events...)
+	if len(events) < 5 {
+		t.Fatalf("routing events = %#v, want model and account attempts", events)
+	}
+	bucket := events[0].RequestBucket
+	if bucket == "" || strings.Contains(bucket, "private") {
+		t.Fatalf("opaque request bucket = %q", bucket)
+	}
+	seenModelAttempt := false
+	seenAccountSelection := false
+	for _, event := range events {
+		if event.RequestBucket != bucket {
+			t.Fatalf("event request bucket = %q, want %q: %#v", event.RequestBucket, bucket, event)
+		}
+		seenModelAttempt = seenModelAttempt || event.Stage == "model_attempt"
+		seenAccountSelection = seenAccountSelection || event.Stage == "account_selection"
+	}
+	if !seenModelAttempt || !seenAccountSelection {
+		t.Fatalf("events = %#v, want model_attempt and account_selection", events)
+	}
+}
+
+func TestAllSmartAttemptKindsCarryOpaqueRequestBucket(t *testing.T) {
+	ctx := logging.WithRequestID(context.Background(), "private-attempt-id")
+	want := coreexecutor.RoutingRequestBucket("private-attempt-id")
+	for _, stage := range []string{"model_attempt", "count_attempt", "stream_attempt"} {
+		event := routingAttemptEvent(ctx, coreexecutor.RoutingEvent{Stage: stage, Outcome: "started"})
+		if event.RequestBucket != want || strings.Contains(event.RequestBucket, "private") {
+			t.Fatalf("%s request bucket = %q, want opaque %q", stage, event.RequestBucket, want)
+		}
 	}
 }
 
