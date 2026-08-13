@@ -1837,10 +1837,15 @@ class Controller:
     def _remote_credential_is_healthy(remote: dict[str, Any]) -> bool:
         status = remote.get("credential_status")
         return (
-            isinstance(status, str)
+            remote.get("state") == "ready"
+            and isinstance(status, str)
             and status.strip().lower() in {"active", "ready"}
             and remote.get("disabled") is False
+            and remote.get("durable_disabled") is False
             and remote.get("unavailable") is False
+            and isinstance(remote.get("generation"), str)
+            and remote.get("generation") != ""
+            and remote.get("runtime_generation") == remote.get("generation")
         )
 
     def _wait_for_generation(self, auth_index: str, generation: str, disabled: bool) -> None:
