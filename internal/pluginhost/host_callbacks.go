@@ -161,7 +161,7 @@ func (h *Host) callHostHTTPDoStream(ctx context.Context, request []byte) ([]byte
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	streamCtx, cancel := context.WithCancel(ctx)
+	streamCtx, cancel := newOwnedStreamContext(ctx)
 	resp, errDo := h.newHTTPClient(nil).DoStream(streamCtx, httpReq)
 	if errDo != nil {
 		cancel()
