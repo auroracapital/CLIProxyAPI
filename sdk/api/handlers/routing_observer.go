@@ -18,12 +18,20 @@ var defaultRoutingLogObserver = newStructuredRoutingObserver()
 // to provider dispatch.
 type structuredRoutingObserver struct {
 	events  chan coreexecutor.RoutingEvent
+	logger  *log.Logger
 	dropped atomic.Uint64
 	invalid atomic.Uint64
 }
 
 func newStructuredRoutingObserver() *structuredRoutingObserver {
-	observer := &structuredRoutingObserver{events: make(chan coreexecutor.RoutingEvent, routingEventQueueSize)}
+	return newStructuredRoutingObserverWithLogger(log.StandardLogger())
+}
+
+func newStructuredRoutingObserverWithLogger(logger *log.Logger) *structuredRoutingObserver {
+	if logger == nil {
+		logger = log.StandardLogger()
+	}
+	observer := &structuredRoutingObserver{events: make(chan coreexecutor.RoutingEvent, routingEventQueueSize), logger: logger}
 	go observer.run()
 	return observer
 }
@@ -46,7 +54,7 @@ func (o *structuredRoutingObserver) run() {
 			o.invalid.Add(1)
 			continue
 		}
-		log.WithFields(fields).Info("routing decision")
+		o.logger.WithFields(fields).Info("routing decision")
 	}
 }
 

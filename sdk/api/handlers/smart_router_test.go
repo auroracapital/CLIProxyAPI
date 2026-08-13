@@ -173,20 +173,12 @@ func TestSmartRouterShadowComputesWithoutChangingDispatch(t *testing.T) {
 func TestStructuredRoutingObserverDoesNotLogSensitiveRequestData(t *testing.T) {
 	registerSmartRouterModel(t, "routing-log-safe-client", "codex", "safe-model", nil)
 	var output lockedRoutingLogBuffer
-	logger := log.StandardLogger()
-	oldOutput := logger.Out
-	oldLevel := logger.Level
-	oldFormatter := logger.Formatter
+	logger := log.New()
 	logger.SetOutput(&output)
 	logger.SetLevel(log.InfoLevel)
 	logger.SetFormatter(&logging.LogFormatter{})
-	t.Cleanup(func() {
-		logger.SetOutput(oldOutput)
-		logger.SetLevel(oldLevel)
-		logger.SetFormatter(oldFormatter)
-	})
 
-	observer := defaultRoutingLogObserver
+	observer := newStructuredRoutingObserverWithLogger(logger)
 	observer.ObserveRouting(coreexecutor.RoutingEvent{
 		Stage: "model_attempt", Mode: "active", TaskClass: "code", ScoreVersion: "v1",
 		Model: "safe-model", Provider: "safe-provider", Reason: "rate_limited", Outcome: "failed",
