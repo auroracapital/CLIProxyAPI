@@ -98,6 +98,9 @@ CHECK_NAMES = {
     "telemetry_complete",
     "single_reauth_owner",
     "no_competing_reauth_processes",
+    "canary_timer_active",
+    "canary_timer_enabled",
+    "canary_last_run_success",
 }
 INCIDENT_NAMES = {"verifier_execution", "artifact_integrity"}
 FAILURE_NAMES = CHECK_NAMES | INCIDENT_NAMES
@@ -140,6 +143,9 @@ ARTIFACT_ARGUMENTS = {
     "soak_timer_unit": "soak_timer_unit",
     "legacy_reauth_service_guard": "legacy_reauth_service_guard",
     "legacy_reauth_timer_guard": "legacy_reauth_timer_guard",
+    "canary_program": "canary_program",
+    "canary_service_unit": "canary_service_unit",
+    "canary_timer_unit": "canary_timer_unit",
 }
 ARTIFACT_CHECKS = {name: name + "_hash" for name in ARTIFACT_ARGUMENTS}
 CHECK_NAMES.update(ARTIFACT_CHECKS.values())
@@ -781,8 +787,22 @@ def validate_sample(sample: dict[str, Any], state: dict[str, Any], index: int, p
     if not HEX_64.fullmatch(actual_hash) or object_hash(unsigned) != actual_hash:
         raise RuntimeError("invalid evidence hash")
     if not incidents:
-        if set(observations) != {"inventory", "pressure", "events", "reconciler", "manual_toggles", "telemetry", "artifacts"}:
+        if set(observations) != {"inventory", "pressure", "events", "reconciler", "canary", "manual_toggles", "telemetry", "artifacts"}:
             raise RuntimeError("invalid evidence observation fields")
+        canary = observations["canary"]
+        if (
+            not isinstance(canary, dict)
+            or set(canary) != {"result", "exec_main_status"}
+            or canary["result"] not in RECONCILER_RESULTS | {"unknown"}
+            or not isinstance(canary["exec_main_status"], int)
+            or isinstance(canary["exec_main_status"], bool)
+            or canary["exec_main_status"] < 0
+        ):
+            raise RuntimeError("invalid canary observation")
+        if checks.get("canary_last_run_success") is not (
+            canary["result"] == "success" and canary["exec_main_status"] == 0
+        ):
+            raise RuntimeError("invalid canary health check")
         pressure = observations["pressure"]
         if not isinstance(pressure, dict) or set(pressure) != {
             "active_leases", "active_seats", "frozen_active_leases", "maximum_skew_streak_seconds",
@@ -1774,6 +1794,10 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
     reconciler_status = int(command(
         "systemctl", "show", "cliproxy-account-reconciler.service", "-p", "ExecMainStatus", "--value"
     ) or "0")
+    canary_result = command("systemctl", "show", "cliproxy-smart-router-canary.service", "-p", "Result", "--value")
+    canary_status = int(command(
+        "systemctl", "show", "cliproxy-smart-router-canary.service", "-p", "ExecMainStatus", "--value"
+    ) or "0")
     reconciler_result_observation = reconciler_result if reconciler_result in RECONCILER_RESULTS else "unknown"
     strategy, base_auto_mode = routing_modes(args.config.read_text(encoding="utf-8", errors="replace"))
     router_policy = json.loads(args.router_config.read_text(encoding="utf-8"))
@@ -1825,6 +1849,9 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
         ),
         "single_reauth_owner": legacy_reauth_is_fenced(),
         "no_competing_reauth_processes": competing_reauth_processes_absent(args.proc_root),
+        "canary_timer_active": command("systemctl", "is-active", "cliproxy-smart-router-canary.timer") == "active",
+        "canary_timer_enabled": command("systemctl", "is-enabled", "cliproxy-smart-router-canary.timer") == "enabled",
+        "canary_last_run_success": canary_result == "success" and canary_status == 0,
         "reconciler_journal_valid": True,
         "route_pressure_streak": state["pressure"]["maximum_skew_streak_seconds"] <= PRESSURE_SKEW_MAX_SECONDS,
         "auto_router_active": command("systemctl", "is-active", "cliproxy-auto-router.service") == "active",
@@ -1839,6 +1866,7 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
         },
         "events": summary,
         "reconciler": {"result": reconciler_result_observation, "exec_main_status": reconciler_status},
+        "canary": {"result": canary_result if canary_result in RECONCILER_RESULTS else "unknown", "exec_main_status": canary_status},
         "manual_toggles": state["lifecycle"]["manual_toggles"],
         "telemetry": {"base": telemetry_health, "front": front_telemetry_health},
         "artifacts": current_artifact_hashes,
@@ -1954,6 +1982,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--soak-timer-unit", type=Path, default=Path("/etc/systemd/system/cliproxy-smart-router-soak.timer"))
     parser.add_argument("--legacy-reauth-service-guard", type=Path, default=Path("/etc/systemd/system/crsproxy-reauth.service.d/00-cliproxy-single-owner.conf"))
     parser.add_argument("--legacy-reauth-timer-guard", type=Path, default=Path("/etc/systemd/system/crsproxy-reauth.timer.d/00-cliproxy-single-owner.conf"))
+    parser.add_argument("--canary-program", type=Path, default=Path("/opt/crsproxy/bin/smart-router-soak-canary"))
+    parser.add_argument("--canary-service-unit", type=Path, default=Path("/etc/systemd/system/cliproxy-smart-router-canary.service"))
+    parser.add_argument("--canary-timer-unit", type=Path, default=Path("/etc/systemd/system/cliproxy-smart-router-canary.timer"))
     parser.add_argument("--proc-root", type=Path, default=Path("/proc"))
     return parser.parse_args(argv)
 

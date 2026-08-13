@@ -1,0 +1,12 @@
+[Unit]
+Description=Generate CLIProxy smart-router soak traffic every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+AccuracySec=10s
+Persistent=true
+Unit=cliproxy-smart-router-canary.service
+
+[Install]
+WantedBy=timers.target

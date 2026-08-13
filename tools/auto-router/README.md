@@ -72,3 +72,23 @@ start the front on loopback. Verify:
 
 Rollback disables/removes only the `:8321` nginx configuration and stops
 `cliproxy-auto-router.service`. The `:8317 -> :8319` path is not reloaded or changed.
+
+## Production soak traffic
+
+Install `tools/smart-router/soak_canary.py` as
+`/opt/crsproxy/bin/smart-router-soak-canary` and the matching canary service and
+timer units from `tools/smart-router/systemd/`. The timer is disabled by default.
+After the complete account pool is authentication-valid, enable the timer and
+require one successful service run before starting the schema-v3 soak verifier.
+
+The timer sends one deterministic coding request to loopback `:8320` every five
+minutes. Over 24 hours this produces 288 decisions, above the verifier's minimum
+100 semantic decisions and account selections while remaining low-rate. The
+request must resolve to `gpt-5.6-sol`, whose equivalent authenticated seats make
+the selection stream suitable for least-pressure fairness evidence. The client
+key is provided only through a systemd credential; the service emits only a
+categorical success/failure result and never logs the key or response body.
+
+Schema-v3 hash-binds the canary program and units and requires the timer to be
+enabled and active and the latest service result to be successful. A stopped,
+failed, or drifted generator therefore makes the entire soak fail closed.

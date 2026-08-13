@@ -1,0 +1,41 @@
+[Unit]
+Description=Generate one deterministic CLIProxy smart-router soak canary
+After=network-online.target crsproxy.service cliproxy-auto-router.service
+Wants=network-online.target
+Requires=crsproxy.service cliproxy-auto-router.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=180s
+DynamicUser=yes
+UMask=0077
+LoadCredential=client-key:/etc/crsproxy/auto-router-client-key
+ExecStart=/usr/bin/python3 /opt/crsproxy/bin/smart-router-soak-canary --key-file %d/client-key
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadOnlyPaths=/opt/crsproxy/bin/smart-router-soak-canary
+
+[Install]
+WantedBy=multi-user.target

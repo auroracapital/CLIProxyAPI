@@ -75,7 +75,8 @@ class PureStateMachineTests(unittest.TestCase):
                 "active_leases": 0, "active_seats": 0, "frozen_active_leases": 0,
                 "maximum_skew_streak_seconds": 0.0,
             },
-            "events": {}, "reconciler": {}, "manual_toggles": 0,
+            "events": {}, "reconciler": {}, "canary": {"result": "success", "exec_main_status": 0},
+            "manual_toggles": 0,
             "telemetry": {
                 "base": telemetry or {"instance": "p1_" + "a" * 32, "dropped": 0, "rejected": 0},
                 "front": {"instance": "p1_" + "a" * 32, "dropped": 0, "rejected": 0},
