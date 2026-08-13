@@ -655,6 +655,8 @@ class MainTransactionTests(unittest.TestCase):
         self.front_management = root / "front-management.env"
         self.front_log = root / "front-main.log"
         self.journal = root / "journal.jsonl"
+        self.proc = root / "proc"
+        self.proc.mkdir()
         self.artifacts = [root / f"artifact-{index}" for index in range(len(soak.ARTIFACT_ARGUMENTS))]
         self.log.write_text("", encoding="utf-8")
         self.front_log.write_text("", encoding="utf-8")
@@ -685,6 +687,7 @@ class MainTransactionTests(unittest.TestCase):
             "--management-env", str(self.management), "--reconciler-env", str(self.reconciler),
             "--front-log", str(self.front_log), "--front-management-env", str(self.front_management),
             "--reconciler-journal", str(self.journal), *artifact_args,
+            "--proc-root", str(self.proc),
         ]
 
     def tearDown(self) -> None:
@@ -710,6 +713,10 @@ class MainTransactionTests(unittest.TestCase):
         return self.pressure() if path.endswith("routing-pressure") else self.reconcile()
 
     def command(self, *args: str) -> str:
+        if "ConditionResult" in args:
+            return "no"
+        if "ActiveState" in args:
+            return "inactive"
         if "ExecMainStatus" in args:
             return "0"
         if "Result" in args:
@@ -850,6 +857,38 @@ class MainTransactionTests(unittest.TestCase):
             self.assertEqual(soak.main(self.argv, now=1000), 1)
         sample = self.read_state()["samples"][-1]
         self.assertFalse(sample["checks"]["reconcile_schema"])
+
+    def test_not_all_desired_accounts_ready_cannot_green(self) -> None:
+        def degraded_api(path: str, _token: str, _base_url: str = "") -> object:
+            if path.endswith("routing-pressure"):
+                return self.pressure()
+            rows = self.reconcile()["credentials"]
+            rows[0] = {**rows[0], "state": "auth_required"}
+            return {"credentials": rows}
+
+        with mock.patch.object(soak, "api_json", side_effect=degraded_api), mock.patch.object(soak, "unauthenticated_status", return_value=401), mock.patch.object(soak, "command", side_effect=self.command):
+            self.assertEqual(soak.main(self.argv, now=1000), 1)
+        sample = self.read_state()["samples"][-1]
+        self.assertFalse(sample["checks"]["all_desired_accounts_ready"])
+
+    def test_competing_reauth_process_fails_closed(self) -> None:
+        process = self.proc / "123"
+        process.mkdir()
+        (process / "cmdline").write_bytes(b"python\0/opt/crsproxy/auto_reauth.py\0")
+        self.assertEqual(self.invoke(1000), 1)
+        sample = self.read_state()["samples"][-1]
+        self.assertFalse(sample["checks"]["no_competing_reauth_processes"])
+
+    def test_unfenced_legacy_reauth_unit_fails_closed(self) -> None:
+        def command(*args: str) -> str:
+            if "ConditionResult" in args:
+                return "yes"
+            return self.command(*args)
+
+        with mock.patch.object(soak, "api_json", side_effect=self.api), mock.patch.object(soak, "unauthenticated_status", return_value=401), mock.patch.object(soak, "command", side_effect=command):
+            self.assertEqual(soak.main(self.argv, now=1000), 1)
+        sample = self.read_state()["samples"][-1]
+        self.assertFalse(sample["checks"]["single_reauth_owner"])
 
 
 if __name__ == "__main__":

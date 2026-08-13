@@ -83,6 +83,7 @@ CHECK_NAMES = {
     "inventory_complete",
     "reconcile_schema",
     "routable_capacity",
+    "all_desired_accounts_ready",
     "generation_converged",
     "ready_admission_converged",
     "pressure_consistent",
@@ -95,6 +96,8 @@ CHECK_NAMES = {
     "no_manual_toggles",
     "log_continuity",
     "telemetry_complete",
+    "single_reauth_owner",
+    "no_competing_reauth_processes",
 }
 INCIDENT_NAMES = {"verifier_execution", "artifact_integrity"}
 FAILURE_NAMES = CHECK_NAMES | INCIDENT_NAMES
@@ -135,6 +138,8 @@ ARTIFACT_ARGUMENTS = {
     "reconciler_timer_unit": "reconciler_timer_unit",
     "soak_service_unit": "soak_service_unit",
     "soak_timer_unit": "soak_timer_unit",
+    "legacy_reauth_service_guard": "legacy_reauth_service_guard",
+    "legacy_reauth_timer_guard": "legacy_reauth_timer_guard",
 }
 ARTIFACT_CHECKS = {name: name + "_hash" for name in ARTIFACT_ARGUMENTS}
 CHECK_NAMES.update(ARTIFACT_CHECKS.values())
@@ -162,6 +167,47 @@ def sha256(path: Path) -> str:
 
 def command(*args: str) -> str:
     return subprocess.run(args, check=True, text=True, capture_output=True).stdout.strip()
+
+
+def legacy_reauth_is_fenced() -> bool:
+    """Require both unsupported legacy reauth units to be condition-fenced and inactive."""
+    try:
+        for unit in ("crsproxy-reauth.timer", "crsproxy-reauth.service"):
+            if command("systemctl", "show", unit, "-p", "ActiveState", "--value") != "inactive":
+                return False
+            if command("systemctl", "show", unit, "-p", "ConditionResult", "--value") != "no":
+                return False
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
+def competing_reauth_processes_absent(proc_root: Path = Path("/proc")) -> bool:
+    """Fail closed if an unsupported writer or live-config xAI login is running."""
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()[:65536]
+        except OSError:
+            continue
+        command_line = raw.replace(b"\0", b" ").decode("utf-8", errors="replace")
+        if any(
+            name in command_line
+            for name in ("auto_reauth.py", "bu_reauth_lib.py", "xai_oauth_reauth.py", "bu_reauth.py")
+        ):
+            return False
+        if (
+            "cli-proxy-api" in command_line
+            and "-xai-login" in command_line
+            and "-config /opt/crsproxy/config.yaml" in command_line
+        ):
+            return False
+    return True
 
 
 def journal_record_hash(record: dict[str, Any]) -> str:
@@ -1690,6 +1736,18 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
             or row.get("unavailable") is True or row.get("credential_status") != "active"
         ) for row in safe_reconcile
     )
+    all_desired_accounts_ready = bool(
+        len(safe_reconcile) == 20
+        and all(
+            row.get("state") == "ready"
+            and row.get("credential_status") == "active"
+            and row.get("disabled") is False
+            and row.get("durable_disabled") is False
+            and row.get("unavailable") is False
+            and row.get("generation") == row.get("runtime_generation")
+            for row in safe_reconcile
+        )
+    )
     summary = apply_events(state["lifecycle"], events, now, state["baseline"])
     apply_slo_events(state["slo"], events, pressure, now)
     apply_route_pressure(state["pressure"], pressure, now)
@@ -1732,6 +1790,7 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
         "inventory_complete": len(reconcile) == 20,
         "reconcile_schema": reconcile_schema,
         "routable_capacity": states.get("ready", 0) > 0,
+        "all_desired_accounts_ready": all_desired_accounts_ready,
         "generation_converged": generation_mismatches == 0,
         "ready_admission_converged": ready_mismatches == 0,
         "pressure_consistent": pressure_consistent,
@@ -1751,6 +1810,8 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
             and valid_telemetry_tuple(front_telemetry_health)
             and front_telemetry_health == front_baseline_telemetry(state["baseline"])
         ),
+        "single_reauth_owner": legacy_reauth_is_fenced(),
+        "no_competing_reauth_processes": competing_reauth_processes_absent(args.proc_root),
         "reconciler_journal_valid": True,
         "route_pressure_streak": state["pressure"]["maximum_skew_streak_seconds"] <= PRESSURE_SKEW_MAX_SECONDS,
         "auto_router_active": command("systemctl", "is-active", "cliproxy-auto-router.service") == "active",
@@ -1878,6 +1939,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reconciler-timer-unit", type=Path, default=Path("/etc/systemd/system/cliproxy-account-reconciler.timer"))
     parser.add_argument("--soak-service-unit", type=Path, default=Path("/etc/systemd/system/cliproxy-smart-router-soak.service"))
     parser.add_argument("--soak-timer-unit", type=Path, default=Path("/etc/systemd/system/cliproxy-smart-router-soak.timer"))
+    parser.add_argument("--legacy-reauth-service-guard", type=Path, default=Path("/etc/systemd/system/crsproxy-reauth.service.d/00-cliproxy-single-owner.conf"))
+    parser.add_argument("--legacy-reauth-timer-guard", type=Path, default=Path("/etc/systemd/system/crsproxy-reauth.timer.d/00-cliproxy-single-owner.conf"))
+    parser.add_argument("--proc-root", type=Path, default=Path("/proc"))
     return parser.parse_args(argv)
 
 
