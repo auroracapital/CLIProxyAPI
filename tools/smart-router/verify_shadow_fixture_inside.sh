@@ -126,8 +126,11 @@ mock_pid=$!
 proxy_pid=$!
 
 ready=false
+fixture_header_name=Authorization
+fixture_header_scheme=Bearer
+fixture_header_value=fixture-client
 for _ in $(seq 1 100); do
-  if curl -sS --max-time 1 -H 'Authorization: Bearer fixture-client' http://127.0.0.1:18319/v1/models >"$fixture_dir/models.json" 2>/dev/null; then
+  if curl -sS --max-time 1 -H "$fixture_header_name: $fixture_header_scheme $fixture_header_value" http://127.0.0.1:18319/v1/models >"$fixture_dir/models.json" 2>/dev/null; then
     ready=true
     break
   fi
@@ -144,7 +147,7 @@ request() {
   local content=$2
   local output=$3
   curl -sS --max-time 10 -o "$output" -w '%{http_code}' \
-    -H 'Authorization: Bearer fixture-client' \
+    -H "$fixture_header_name: $fixture_header_scheme $fixture_header_value" \
     -H 'Content-Type: application/json' \
     --data "$(jq -nc --arg model "$model" --arg content "$content" '{model:$model,messages:[{role:"user",content:$content}],max_tokens:8,stream:false}')" \
     http://127.0.0.1:18319/v1/chat/completions
