@@ -102,6 +102,7 @@ class AutoRouterArtifactTests(unittest.TestCase):
     def test_systemd_unit_uses_credentials_and_has_no_secret_environment(self) -> None:
         unit = (ROOT / "systemd" / "cliproxy-auto-router.service").read_text(encoding="utf-8")
         self.assertIn("DynamicUser=yes", unit)
+        self.assertIn("SupplementaryGroups=crsproxy", unit)
         self.assertIn("LoadCredential=client-key:/etc/crsproxy/auto-router-client-key", unit)
         self.assertIn("LoadCredential=base-api-key:/etc/crsproxy/auto-router-base-api-key", unit)
         self.assertIn("IPAddressAllow=localhost", unit)

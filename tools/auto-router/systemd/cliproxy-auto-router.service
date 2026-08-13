@@ -8,6 +8,7 @@ Requires=crsproxy.service
 [Service]
 Type=simple
 DynamicUser=yes
+SupplementaryGroups=crsproxy
 UMask=0077
 RuntimeDirectory=cliproxy-auto-router
 RuntimeDirectoryMode=0700
