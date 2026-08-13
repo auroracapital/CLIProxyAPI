@@ -142,7 +142,7 @@ jobs:
           python-version: "3.13"
       - name: Verify reconciler and systemd units
         run: |
-          python -m compileall -q tools/account-reconciler/reconciler.py tools/account-reconciler/tests
+          python -m compileall -q tools/account-reconciler/reconciler.py tools/account-reconciler/stage_candidate.py tools/account-reconciler/tests
           python -m py_compile tools/smart-router/verify_production_soak.py
           python -m py_compile tools/auto-router/render_config.py
           python -m unittest discover -s tools/account-reconciler/tests -q

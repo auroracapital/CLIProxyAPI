@@ -6,6 +6,22 @@ The inventory is sensitive configuration because it contains auth indexes, expec
 
 Candidate files must be regular JSON files with mode `0600`, on the same filesystem as the canonical credential directory, with `disabled` absent or false. Required keys and expected identity fields are matched before promotion. The promoted copy is atomically marked `disabled=false` and `reconcile_state=probing` before it becomes visible, then refreshed and pinned-probed before admission. A failed refresh or probe restores the mode-`0600` rollback archive. The candidate is deleted only after a successful admitted probe.
 
+Install `stage_candidate.py` as `/opt/crsproxy/bin/stage-account-candidate`.
+After an isolated provider authorization writes one protected credential, stage it
+without printing or manually selecting its identity:
+
+```sh
+sudo /opt/crsproxy/bin/stage-account-candidate /protected/staging/auths/fresh.json
+```
+
+The utility reads only a regular mode-`0600` file owned by root or the service
+user, validates the complete inventory, uniquely matches provider plus every
+stable expected identity field, and atomically creates only the matching
+mode-`0600` candidate. It refuses ambiguous identities and existing candidate
+paths. It does not delete the source, modify the canonical credential, reset
+attempts, or alter admission; the periodic reconciler owns refresh, exact probe,
+and readmission.
+
 The inventory must exactly match the runtime `auth_index` and provider set. Missing, duplicate, extra, provider-mismatched, or path-ambiguous entries fail closed before mutation. Attempts are capped per seat per UTC day; failures use exponential backoff with jitter. Global, provider, and seat locks live below `RuntimeDirectory`.
 
 Applied lifecycle work is also recorded in `journal.jsonl` below
@@ -43,6 +59,6 @@ sudo --preserve-env=CLIPROXY_RECONCILER_API_KEY /usr/bin/python3 /opt/crsproxy/b
 Run its fast verification with:
 
 ```sh
-python3 -m compileall -q reconciler.py tests
+python3 -m compileall -q reconciler.py stage_candidate.py tests
 python3 -m unittest discover -s tests -v
 ```
