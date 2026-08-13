@@ -385,29 +385,28 @@ Only one owner edits a given file set at a time. The primary agent owns integrat
 
 Current verified evidence, 2026-08-13:
 
-- `go test ./... -count=1` passes across the repository.
-- Focused routing, management, config, reconciliation, and least-pressure race tests pass.
-- Changed-package `go vet` passes. Repository-wide vet still reports pre-existing warnings in untouched logging/plugin-host files.
-- The controller compiles and all 64 Python unit tests pass, including delayed watcher publication, candidate token rotation, generation-fenced rollback/restaging, response-loss recovery, failed-refresh mutation handling, automatic rollback-failure recovery, and two-run first-install recovery.
+- Exact head `01ac81b3` passes `go test ./... -count=1`, repository-wide `go vet ./...`, and focused race tests for `sdk/api/handlers`, `sdk/cliproxy/auth`, and `internal/pluginhost`.
+- The controller compiles and 89 reconciler tests, 44 schema-v3 verifier tests, and seven endpoint-artifact tests pass, including delayed watcher publication, candidate token rotation, generation-fenced rollback/restaging, response-loss recovery, failed-refresh mutation handling, automatic rollback-failure recovery, and two-run first-install recovery.
 - Durable reconcile mutations use opaque HMAC generations and compare-and-swap; status fails closed without a generation-capable file store, probe endpoints cannot admit directly, and committed-but-unpublished CAS results are explicit.
 - File credential saves/deletes participate in the shared per-seat lock protocol; atomic writes fsync the file and directory, reject symlink-substituted staging, and watcher deletes retain a runtime seat only after validating the authoritative replacement generation/provider.
 - Formatting, `git diff --check`, workflow YAML parsing, and changed-file credential-pattern scan pass.
-- A static `linux/arm64` server build succeeds; current uncommitted candidate SHA-256 is `732c2b6786ef8359b6c2e0e79de1f7d4246ee4533357c92b1b69a969ad45ee75` (must be rebuilt from the final commit before rollout).
-- The focused Go+vet fast gate completes locally in 2.47 seconds and the Python reconciler gate in 0.31 seconds, comfortably below the one-minute critical-path target on this machine.
-- The current uncommitted diff passes gitleaks pre-commit and stdin scans with zero findings.
+- A static `linux/arm64` server build from exact head `01ac81b3` succeeds with SHA-256 `fdcdf95707c8f1e58a6fa2fdde9c4304c1e64072a3493eed61b108b4134e7b12`.
+- The combined focused Go, vet, reconciler, verifier, and artifact critical path completes locally in 20 seconds, below the one-minute target.
+- Gitleaks scans all 37 feature commits with zero findings.
 - The service and timer templates pass `systemd-analyze verify` on the arm64 hub with systemd 255.
 - Live topology remains nginx `:8317` to loopback CLIProxyAPI `:8319`; the Mac has no local CLIProxy/crsproxy listener or refresh process.
-- The live hub runs `v7.2.130-smart-router.7` (`562ca896`) with SHA-256 `ba8de7414656821dbccbebc58aba2f2e81e52de8cc206d427d6d3c02081e441f`. nginx and crsproxy are active, backend and ingress `/v1/models` return the expected unauthenticated `401`, and the Mac has no local proxy listener.
-- The account reconciler timer is enabled and active. Three post-deployment periodic cycles and the latest live check completed with `Result=success`, `ExecMainStatus=0`, 19/19 desired seats processed, five objectively ready seats, fourteen objectively cooling seats, and no generation/admission mismatches or manual toggles.
+- The live hub runs `v7.2.130-smart-router.12` (`ec71bc70`) at both base and front paths with SHA-256 `d4a386a31afb4f59ee0d4739d64df53531bc8b37369270dc3b02f1a4f0bff939`. nginx, crsproxy, and the separate auto-router are active; `:8317` rejects `model:auto`, and `:8321` rejects named models.
+- The account reconciler from exact head `01ac81b3` is deployed with SHA-256 `0da01c916d480d7746c580e0c9fc0877ad6c11137d6955af72723cce5b92eee4`. Its timer is enabled and active, and a real single-seat canary produced the complete `refresh -> probe -> readmission` journal chain without a manual toggle.
 - Exactly-once account-attempt telemetry now pairs one `account_selection/selected` event with one terminal `account_attempt` event across ordinary, count, stream, pooled-model, Home, retry, rejection, cancellation, and panic paths. Request faults and cancellations are excluded from recent/total failure pressure.
 - A protected, privacy-safe `/v0/management/routing-pressure` endpoint exposes only active opaque seat buckets and capacity-normalized in-flight pressure. The strengthened fault fixture proves a live one-seat/one-lease/1000-milli snapshot during a held cancellation and zero residual leases afterward.
-- The exact Linux/arm64 precommit candidate with SHA-256 `5eff8c6dbe810bc1912da0f9ff4cf293fe99e8194de16d9752730322bdac7525` passed eight loopback-only fault cases: 429 with `Retry-After`, 503, timeout, cancellation, stream bootstrap failure, post-payload terminal error, invalid/policy rejection, and model/provider fallback. This hash is precommit evidence only and must not be deployed; deployment requires a rebuild from the final commit.
-- The final local precommit gate passes the full Go suite, focused race suites, 72/72 reconciler tests, changed-package vet, formatting, workflow/action validation, shell lint, Linux/arm64 build, Windows SDK cross-compile, recent branch history and current-diff secret scans, and live systemd unit validation. The exact focused PR gate completes in five seconds locally and its race counterpart in six seconds.
+- The exact deployed binary passed eight loopback-only fault cases: 429 with `Retry-After`, 503, timeout, cancellation, stream bootstrap failure, post-payload terminal error, invalid/policy rejection, and model/provider fallback. The result proves distinct-account retries, safe fallback, zero cancellation retry, zero post-output replay, and zero leaked leases.
+- A front-only rollback rehearsal stopped `cliproxy-auto-router.service`: `:8321` returned 502 while explicit-model `:8317` remained 200; restarting the front restored both endpoints to 200.
+- A disposable schema-v3 preflight passes every integrity, topology, telemetry, reconciler, journal, and single-owner check except `all_desired_accounts_ready`; the declarative pool is currently six ready and fourteen `auth_required` seats.
 
 Remaining production evidence:
 
-- Commit the reviewed patch, rebuild a provenance-pinned `.8` artifact from that exact commit, and deploy it reversibly while retaining `.7` as the binary rollback target.
-- Run a genuinely multi-seat fixed-model least-pressure canary, activate and validate semantic `auto`, rehearse both rollback layers, and complete a fresh 24-hour zero-manual-toggle soak on the final artifact.
+- Complete identity-bound provider authorization and automatic readmission for the remaining fourteen seats without manual admission toggles.
+- Require a zero-failure disposable schema-v3 preflight, then enable and complete a fresh 24-hour zero-manual-toggle soak with sufficient multi-seat traffic for the terminal SLO and fairness gates.
 
 ### Functional
 
