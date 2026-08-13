@@ -379,6 +379,7 @@ class StateStore:
             "outcome": "skipped",
             "attempt_day": today,
             "attempts": 0,
+            "candidate_generation": "",
             "next_attempt": "",
             "updated_at": "",
         }
@@ -393,14 +394,28 @@ class StateStore:
             value["attempts"] = 0
         return {**default, **{key: value.get(key, default[key]) for key in default}}
 
-    def write(self, seat_key: str, state: str, reason: str, outcome: str, attempts: int, next_attempt: str) -> None:
+    def write(
+        self,
+        seat_key: str,
+        state: str,
+        reason: str,
+        outcome: str,
+        attempts: int,
+        next_attempt: str,
+        candidate_generation: str | None = None,
+    ) -> None:
         if state not in ALLOWED_STATES or reason not in ALLOWED_REASONS or outcome not in SAFE_OUTCOMES:
             raise ReconcileError("refusing unsafe state value")
+        if candidate_generation is None:
+            candidate_generation = str(self.read(seat_key).get("candidate_generation", ""))
+        if candidate_generation and not re.fullmatch(r"[0-9a-f]{64}", candidate_generation):
+            raise ReconcileError("refusing unsafe candidate generation")
         _atomic_json(
             self.path(seat_key),
             {
                 "attempt_day": self.now().date().isoformat(),
                 "attempts": int(attempts),
+                "candidate_generation": candidate_generation,
                 "next_attempt": next_attempt,
                 "outcome": outcome,
                 "reason": reason,
@@ -1421,7 +1436,16 @@ class Controller:
             log_event(self.logger, "seat_skipped", seat_key=seat_key, state=state, reason="not_due")
             return True
         attempts = int(persisted.get("attempts", 0))
-        if attempts >= self.inventory.max_attempts_per_day:
+        candidate_generation = ""
+        fresh_candidate = False
+        if candidate_exists:
+            try:
+                assert seat.candidate_path is not None
+                candidate_generation = file_generation(seat.candidate_path, self.hmac_key)
+                fresh_candidate = candidate_generation != persisted.get("candidate_generation", "")
+            except (OSError, PromotionError):
+                fresh_candidate = False
+        if attempts >= self.inventory.max_attempts_per_day and not fresh_candidate:
             try:
                 self._transition(
                     seat.auth_index,
@@ -1448,6 +1472,20 @@ class Controller:
                 "attempt_budget_exhausted",
             )
             return True
+        if fresh_candidate:
+            # Persist the opaque generation receipt before promotion. A newly
+            # authorized candidate gets one recovery attempt even after the
+            # routine daily budget is exhausted, while the same rejected
+            # candidate cannot bypass that budget on every timer tick.
+            self.store.write(
+                seat_key,
+                persisted["state"],
+                persisted["reason"],
+                persisted["outcome"],
+                attempts,
+                persisted["next_attempt"],
+                candidate_generation,
+            )
         attempts += 1
         archive: Path | None = None
         promoted = False
@@ -1652,6 +1690,7 @@ class Controller:
                 if restored is None:
                     return self._record_local_failure(seat_key, attempts, "rollback_failed", "misconfigured", "failed")
                 generation, durable_disabled = restored
+                self._bind_candidate_receipt(seat, seat_key)
             elif promoted:
                 # A successful refresh may rotate the refresh token. Keep that
                 # newest credential generation, but restore the archived
@@ -1678,6 +1717,7 @@ class Controller:
                     if restored is None:
                         return self._record_local_failure(seat_key, attempts, "rollback_failed", "misconfigured", "failed")
                     generation, durable_disabled = restored
+                    self._bind_candidate_receipt(seat, seat_key)
                 elif refresh_succeeded:
                     durable_disabled = archived_disabled(archive)
                 else:
@@ -1696,6 +1736,22 @@ class Controller:
                         return self._record_local_failure(seat_key, attempts, "rollback_failed", "misconfigured", "failed")
                     generation, durable_disabled = restored
             return self._fail(seat, seat_key, attempts, "probe_retryable", "cooling", "retryable", generation, durable_disabled)
+
+    def _bind_candidate_receipt(self, seat: Seat, seat_key: str) -> None:
+        """Bind a controller-restaged candidate so it is not treated as new authorization."""
+        if seat.candidate_path is None:
+            raise ReconcileError("candidate path is unavailable")
+        generation = file_generation(seat.candidate_path, self.hmac_key)
+        persisted = self.store.read(seat_key)
+        self.store.write(
+            seat_key,
+            persisted["state"],
+            persisted["reason"],
+            persisted["outcome"],
+            persisted["attempts"],
+            persisted["next_attempt"],
+            generation,
+        )
 
     def _restage_candidate_and_restore(
         self,

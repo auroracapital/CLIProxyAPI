@@ -1628,6 +1628,52 @@ class PromotionTests(unittest.TestCase):
             self.assertEqual(staged["refresh_token"], "rotated-refresh")
             self.assertEqual(staged["access_token"], "rotated-access")
 
+    def test_rotated_rejected_candidate_receipt_prevents_budget_bypass_loop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            write_json(
+                seat.canonical_path,
+                {
+                    "provider": "claude",
+                    "access_token": "canonical-access",
+                    "refresh_token": "canonical-refresh",
+                    "disabled": True,
+                },
+            )
+            write_json(
+                seat.candidate_path,
+                {
+                    "provider": "claude",
+                    "access_token": "candidate-access",
+                    "refresh_token": "candidate-refresh",
+                },
+            )
+            api = RotatingInspectingAPI(
+                seat.canonical_path,
+                rows=[remote_row(credential_status="disabled", disabled=True)],
+                probe="rejected",
+            )
+            controller = ImmediateReloadController(
+                reconciler.Inventory((seat,), max_attempts_per_day=1),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+
+            self.assertEqual(controller.run(), 1)
+            seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+            receipt = controller.store.read(seat_key)["candidate_generation"]
+            self.assertEqual(receipt, reconciler.file_generation(seat.candidate_path, HMAC_KEY))
+            api.calls.clear()
+            self.assertEqual(controller.run(), 0)
+            self.assertFalse(any(call[:2] == ("refresh", "index-alpha") for call in api.calls))
+
     def test_rollback_refuses_to_overwrite_newer_canonical_generation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2467,6 +2513,88 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(api.calls[0], ("status",))
             self.assertEqual(api.calls[1][0:3], ("set_state", "index-alpha", "auth_required"))
             self.assertEqual(controller.store.read(seat_key)["state"], "auth_required")
+
+    def test_fresh_candidate_bypasses_exhausted_attempt_budget_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical = root / "auths" / "canonical.json"
+            candidate = root / "auths" / "candidate.json"
+            write_json(canonical, {"provider": "claude", "refresh_token": "old", "account_id": "expected"})
+            write_json(candidate, {"provider": "claude", "refresh_token": "fresh", "account_id": "expected"})
+            seat = reconciler.Seat(
+                "index-alpha",
+                "claude",
+                "probe-model",
+                canonical,
+                candidate,
+                ("refresh_token",),
+                (("account_id", "expected"),),
+            )
+            api = InspectingAPI(
+                canonical,
+                rows=[remote_row(state="auth_required", credential_status="error", unavailable=True)],
+            )
+            controller = ImmediateReloadController(
+                reconciler.Inventory((seat,), max_attempts_per_day=1),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+            )
+            seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+            controller.store.write(seat_key, "auth_required", "attempt_budget_exhausted", "skipped", 1, "")
+
+            self.assertEqual(controller.run(), 0)
+            self.assertIn(("refresh", "index-alpha"), api.calls)
+            self.assertIn(("probe", "index-alpha", "probe-model"), api.calls)
+            persisted = controller.store.read(seat_key)
+            self.assertRegex(persisted["candidate_generation"], r"^[0-9a-f]{64}$")
+            self.assertEqual(persisted["attempts"], 2)
+
+    def test_same_candidate_cannot_repeatedly_bypass_exhausted_attempt_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical = root / "auths" / "canonical.json"
+            candidate = root / "auths" / "candidate.json"
+            write_json(canonical, {"provider": "claude", "refresh_token": "old", "account_id": "expected"})
+            write_json(candidate, {"provider": "claude", "refresh_token": "rejected", "account_id": "expected"})
+            seat = reconciler.Seat(
+                "index-alpha",
+                "claude",
+                "probe-model",
+                canonical,
+                candidate,
+                ("refresh_token",),
+                (("account_id", "expected"),),
+            )
+            api = InspectingAPI(
+                canonical,
+                rows=[remote_row(state="auth_required", credential_status="error", unavailable=True)],
+                refresh="auth_required",
+            )
+            controller = ImmediateReloadController(
+                reconciler.Inventory((seat,), max_attempts_per_day=1),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+            )
+            seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+            controller.store.write(seat_key, "auth_required", "attempt_budget_exhausted", "skipped", 1, "")
+
+            self.assertEqual(controller.run(), 1)
+            first_refreshes = [call for call in api.calls if call[:2] == ("refresh", "index-alpha")]
+            self.assertEqual(len(first_refreshes), 1)
+            api.calls.clear()
+            self.assertEqual(controller.run(), 0)
+            self.assertFalse(any(call[:2] == ("refresh", "index-alpha") for call in api.calls))
+            self.assertTrue(candidate.exists())
 
     def test_failed_remote_state_write_preserves_last_confirmed_local_state(self):
         with tempfile.TemporaryDirectory() as directory:
