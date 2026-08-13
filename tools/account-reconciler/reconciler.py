@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import stat
 import tempfile
@@ -711,6 +712,7 @@ class Controller:
         only_healthy: bool = False,
         force_probe: bool = False,
         provider: str = "",
+        seat_key: str = "",
     ):
         self.inventory = inventory
         self.api = api
@@ -726,6 +728,7 @@ class Controller:
         self.only_healthy = only_healthy
         self.force_probe = force_probe
         self.provider = provider.strip().lower()
+        self.seat_key = seat_key.strip().lower()
 
     def run(self) -> int:
         with file_lock(self.runtime_dir / "locks" / "global.lock") as global_acquired:
@@ -736,6 +739,12 @@ class Controller:
             validate_complete_inventory(self.inventory, remote)
             by_index = {row["auth_index"]: row for row in remote}
             seats = list(self.inventory.seats)
+            if self.seat_key:
+                seats = [
+                    seat
+                    for seat in seats
+                    if opaque_key(self.hmac_key, "seat", seat.auth_index) == self.seat_key
+                ]
             if self.provider:
                 seats = [seat for seat in seats if seat.provider == self.provider]
             if self.only_healthy:
@@ -982,7 +991,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--only-healthy", action="store_true", help="select canary seats from currently healthy runtime credentials")
     parser.add_argument("--force-probe", action="store_true", help="atomically normalize and exact-probe selected seats even when healthy")
     parser.add_argument("--provider", default="", help="after full validation, reconcile only this provider")
+    parser.add_argument("--seat-key", default="", help="after full validation, reconcile only this opaque seat key")
     return parser.parse_args(argv)
+
+
+def validate_seat_key_filter(value: str) -> str:
+    seat_key = value.strip().lower()
+    if seat_key and not re.fullmatch(r"[0-9a-f]{24}", seat_key):
+        raise InventoryError("seat key filter is invalid")
+    return seat_key
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -995,6 +1012,7 @@ def main(argv: list[str] | None = None) -> int:
         provider = args.provider.strip().lower()
         if provider and provider not in {seat.provider for seat in inventory.seats}:
             raise InventoryError("provider filter is invalid")
+        seat_key = validate_seat_key_filter(args.seat_key)
         api = APIAdapter(args.base_url, os.environ.get("CLIPROXY_RECONCILER_API_KEY", ""))
         controller = Controller(
             inventory,
@@ -1007,6 +1025,7 @@ def main(argv: list[str] | None = None) -> int:
             only_healthy=args.only_healthy,
             force_probe=args.force_probe,
             provider=provider,
+            seat_key=seat_key,
             logger=logger,
         )
         return controller.run()

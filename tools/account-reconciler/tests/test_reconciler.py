@@ -505,6 +505,65 @@ class PromotionTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
+    def test_exact_opaque_seat_key_selects_only_that_seat_after_full_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seats = (
+                reconciler.Seat("index-alpha", "claude", "probe-model"),
+                reconciler.Seat("index-beta", "codex", "probe-model"),
+            )
+            api = FakeAPI(
+                rows=[
+                    remote_row(auth_index="index-alpha", provider="claude"),
+                    remote_row(auth_index="index-beta", provider="codex"),
+                ]
+            )
+            target = reconciler.opaque_key(HMAC_KEY, "seat", "index-beta")
+            controller = reconciler.Controller(
+                reconciler.Inventory(seats),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                seat_key=target,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+            )
+            self.assertEqual(controller.run(), 0)
+            self.assertEqual(api.calls, [("status",)])
+            self.assertFalse((root / "state").exists())
+
+    def test_unknown_or_contradictory_opaque_seat_key_fails_before_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = reconciler.Seat("index-alpha", "claude", "probe-model")
+            api = FakeAPI(rows=[remote_row()])
+            for target, provider in [
+                ("0" * 24, ""),
+                (reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index), "codex"),
+            ]:
+                with self.subTest(target=target, provider=provider):
+                    controller = reconciler.Controller(
+                        reconciler.Inventory((seat,)),
+                        api,
+                        root / "state",
+                        root / "run",
+                        HMAC_KEY,
+                        seat_key=target,
+                        provider=provider,
+                        logger=reconciler.configure_logging(io.StringIO()),
+                        now=lambda: NOW,
+                    )
+                    with self.assertRaises(reconciler.InventoryError):
+                        controller.run()
+                    self.assertFalse((root / "state").exists())
+
+    def test_seat_key_argument_accepts_only_opaque_hex(self):
+        for value in ["raw-auth-index", "a" * 23, "g" * 24]:
+            with self.assertRaises(reconciler.InventoryError):
+                reconciler.validate_seat_key_filter(value)
+        self.assertEqual(reconciler.validate_seat_key_filter(" A" + "b" * 23 + " "), "a" + "b" * 23)
+
     def test_apply_canary_validates_full_inventory_but_reconciles_one_healthy_seat(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
