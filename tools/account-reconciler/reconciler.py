@@ -82,6 +82,12 @@ JOURNAL_STATES = ALLOWED_STATES | {"unknown"}
 JOURNAL_FILE = "journal.jsonl"
 MAX_JOURNAL_BYTES = 64 * 1024 * 1024
 MAX_JOURNAL_LINE_BYTES = 4096
+CONTROLLER_LIFECYCLE_FIELDS = {
+    "disabled",
+    "reconcile_state",
+    "reconcile_reason",
+    "reconcile_next_attempt",
+}
 UTC = dt.timezone.utc
 
 
@@ -1395,6 +1401,19 @@ class Controller:
         if not self.apply:
             log_event(self.logger, "seat_dry_run", seat_key=seat_key, state=state, outcome="skipped")
             return True
+        if persisted.get("reason") == "rollback_failed" and persisted.get("outcome") == "failed":
+            # Rollback ambiguity is a sticky fail-closed condition. Ordinary
+            # timer runs must not hide it behind budget or backoff state; only
+            # the explicit rollback-recovery workflow may clear this record.
+            log_event(
+                self.logger,
+                "seat_skipped",
+                seat_key=seat_key,
+                state=str(persisted.get("state", "misconfigured")),
+                outcome="failed",
+                reason="rollback_failed",
+            )
+            return False
 
         canonical_exists = bool(seat.canonical_path and seat.canonical_path.exists())
         canonical_needs_normalization = False
@@ -1494,6 +1513,7 @@ class Controller:
         canonical_raw_generation = ""
         refresh_attempted = False
         refresh_succeeded = False
+        promoted_candidate: dict[str, Any] | None = None
         generation = remote["generation"]
         durable_disabled = remote["durable_disabled"]
         if candidate_exists:
@@ -1511,6 +1531,7 @@ class Controller:
                     )
                     promoted_raw_generation = raw_file_generation(seat.canonical_path)
                     generation = file_generation(seat.canonical_path, self.api.api_key.encode())
+                    promoted_candidate = dict(candidate)
                 promoted = True
                 self._wait_for_generation(seat.auth_index, generation, False)
                 durable_disabled = False
@@ -1553,13 +1574,23 @@ class Controller:
                     )
                 return self._fail(seat, seat_key, attempts, "candidate_invalid", "misconfigured", "failed")
         try:
-            generation = self._transition(
-                seat.auth_index,
-                generation,
-                "refreshing",
-                "candidate_promoted" if candidate_exists else "",
-                disabled=False,
-            )
+            if candidate_exists:
+                if promoted_candidate is None:
+                    raise PromotionError("promoted candidate snapshot is unavailable")
+                generation = self._transition_promoted_candidate(
+                    seat,
+                    generation,
+                    candidate_raw_generation,
+                    promoted_candidate,
+                )
+            else:
+                generation = self._transition(
+                    seat.auth_index,
+                    generation,
+                    "refreshing",
+                    "",
+                    disabled=False,
+                )
             if candidate_exists:
                 self._journal(
                     seat_key,
@@ -1892,6 +1923,54 @@ class Controller:
                     return raw_generation, generation, disabled
             time.sleep(0.2)
         raise PromotionError("credential did not converge after failed refresh")
+
+    def _transition_promoted_candidate(
+        self,
+        seat: Seat,
+        generation: str,
+        expected_candidate_generation: str,
+        promoted_candidate: dict[str, Any],
+    ) -> str:
+        """Start refresh, rebasing once across a benign publication rewrite."""
+        try:
+            return self._transition(
+                seat.auth_index,
+                generation,
+                "refreshing",
+                "candidate_promoted",
+                disabled=False,
+            )
+        except APIError as exc:
+            if exc.status != 412:
+                raise
+
+        converged_raw, converged_generation, converged_disabled = self._converged_canonical_generation(seat)
+        if converged_disabled:
+            raise PromotionError("promoted credential admission changed before refresh")
+        if seat.canonical_path is None or seat.candidate_path is None:
+            raise PromotionError("managed credential paths are unavailable")
+        with credential_file_lock(seat.canonical_path), credential_file_lock(seat.candidate_path):
+            if raw_file_generation(seat.candidate_path) != expected_candidate_generation:
+                raise PromotionError("staged candidate generation changed before refresh")
+            validate_candidate(seat)
+            canonical = validate_canonical(seat)
+            if raw_file_generation(seat.canonical_path) != converged_raw:
+                raise PromotionError("canonical generation changed before refresh retry")
+            canonical_material = {
+                key: value for key, value in canonical.items() if key not in CONTROLLER_LIFECYCLE_FIELDS
+            }
+            promoted_material = {
+                key: value for key, value in promoted_candidate.items() if key not in CONTROLLER_LIFECYCLE_FIELDS
+            }
+            if canonical_material != promoted_material:
+                raise PromotionError("promoted credential material changed before refresh")
+        return self._transition(
+            seat.auth_index,
+            converged_generation,
+            "refreshing",
+            "candidate_promoted",
+            disabled=False,
+        )
 
     def _restore_and_reload(
         self,
