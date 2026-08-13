@@ -539,7 +539,7 @@ class ControllerTests(unittest.TestCase):
             seat = reconciler.Seat("index-alpha", "claude", "probe-model")
             api = FakeAPI(rows=[remote_row()])
             for target, provider in [
-                ("0" * 24, ""),
+                ("0" * 32, ""),
                 (reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index), "codex"),
             ]:
                 with self.subTest(target=target, provider=provider):
@@ -559,10 +559,10 @@ class ControllerTests(unittest.TestCase):
                     self.assertFalse((root / "state").exists())
 
     def test_seat_key_argument_accepts_only_opaque_hex(self):
-        for value in ["raw-auth-index", "a" * 23, "g" * 24]:
+        for value in ["raw-auth-index", "a" * 31, "g" * 32]:
             with self.assertRaises(reconciler.InventoryError):
                 reconciler.validate_seat_key_filter(value)
-        self.assertEqual(reconciler.validate_seat_key_filter(" A" + "b" * 23 + " "), "a" + "b" * 23)
+        self.assertEqual(reconciler.validate_seat_key_filter(" A" + "b" * 31 + " "), "a" + "b" * 31)
 
     def test_apply_canary_validates_full_inventory_but_reconciles_one_healthy_seat(self):
         with tempfile.TemporaryDirectory() as directory:

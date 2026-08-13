@@ -8,7 +8,7 @@ Candidate files must be regular JSON files with mode `0600`, on the same filesys
 
 The inventory must exactly match the runtime `auth_index` and provider set. Missing, duplicate, extra, provider-mismatched, or path-ambiguous entries fail closed before mutation. Attempts are capped per seat per UTC day; failures use exponential backoff with jitter. Global, provider, and seat locks live below `RuntimeDirectory`.
 
-Use `--seat-key` for a single-seat canary. The value is the controller's 24-character opaque HMAC seat key from its categorical logs or state filename, never an auth index, identity, or path. The controller validates the complete inventory first and then applies the seat, provider, health, and maximum-seat filters together; an invalid, unknown, or contradictory selection fails before mutation.
+Use `--seat-key` for a single-seat canary. The value is the controller's 32-character opaque HMAC seat key from its categorical logs or state filename, never an auth index, identity, or path. The controller validates the complete inventory first and then applies the seat, provider, health, and maximum-seat filters together; an invalid, unknown, or contradictory selection fails before mutation.
 
 Install `reconciler.py` as `/opt/crsproxy/bin/account-reconciler`, create `/etc/crsproxy/account-inventory.json`, and install the templates from `systemd/`. The supplied unit runs with `--apply`; invoking the program manually without it is a safe dry run.
 

@@ -997,7 +997,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def validate_seat_key_filter(value: str) -> str:
     seat_key = value.strip().lower()
-    if seat_key and not re.fullmatch(r"[0-9a-f]{24}", seat_key):
+    if seat_key and not re.fullmatch(r"[0-9a-f]{32}", seat_key):
         raise InventoryError("seat key filter is invalid")
     return seat_key
 
