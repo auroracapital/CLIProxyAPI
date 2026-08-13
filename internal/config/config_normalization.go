@@ -43,7 +43,7 @@ func (cfg *Config) NormalizeAutoRoutingConfig() {
 	auto := &cfg.Routing.Auto
 	auto.Mode = strings.ToLower(strings.TrimSpace(auto.Mode))
 	switch auto.Mode {
-	case "off", "shadow", "active":
+	case "off", "reject", "shadow", "active", "exclusive":
 	case "":
 		if auto.Enabled {
 			auto.Mode = "active"

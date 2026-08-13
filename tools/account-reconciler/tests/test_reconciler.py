@@ -376,6 +376,11 @@ def lock_child(path: str, ready: multiprocessing.Event, release: multiprocessing
             release.wait(5)
 
 
+def journal_child(directory: str, number: int) -> None:
+    journal = reconciler.TransitionJournal(Path(directory), lambda: NOW)
+    journal.append("a" * 32, "refresh", "started", "cooling", "refreshing", "none")
+
+
 class InventoryTests(unittest.TestCase):
     def test_valid_inventory_and_exact_runtime_match(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -473,6 +478,259 @@ class LockAndBackoffTests(unittest.TestCase):
         self.assertLessEqual(second, 20)
         self.assertGreaterEqual(capped, 20)
         self.assertLessEqual(capped, 40)
+
+
+class TransitionJournalTests(unittest.TestCase):
+    def read_records(self, root: Path) -> list[dict]:
+        path = root / reconciler.JOURNAL_FILE
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def test_append_is_0600_hash_chained_categorical_and_private(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "state"
+            secret = "person@example.test-/private/auth.json-token"
+            bucket = reconciler.opaque_key(HMAC_KEY, "seat", secret)
+            journal = reconciler.TransitionJournal(root, lambda: NOW)
+            journal.append(bucket, "refresh", "started", "cooling", "refreshing", "none")
+            journal.append(bucket, "probe_start", "started", "probing", "probing", "refresh_succeeded")
+
+            path = root / reconciler.JOURNAL_FILE
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            records = self.read_records(root)
+            self.assertEqual([row["seq"] for row in records], [1, 2])
+            self.assertEqual(records[0]["previous_hash"], "0" * 64)
+            self.assertEqual(records[1]["previous_hash"], records[0]["hash"])
+            self.assertEqual(reconciler.TransitionJournal._validated_tail(path.read_bytes()), (2, records[1]["hash"]))
+            cursor = reconciler.TransitionJournal.validated_cursor(path)
+            self.assertEqual(cursor["inode"], path.stat().st_ino)
+            self.assertEqual(cursor["offset"], path.stat().st_size)
+            self.assertEqual(cursor["seq"], 2)
+            self.assertEqual(cursor["hash"], records[1]["hash"])
+            serialized = path.read_text(encoding="utf-8")
+            self.assertNotIn(secret, serialized)
+            self.assertNotIn("example.test", serialized)
+            self.assertNotIn("/private", serialized)
+            self.assertEqual(
+                set(records[0]),
+                {"version", "seq", "timestamp", "seat_bucket", "action", "outcome", "prior", "result", "reason", "previous_hash", "hash"},
+            )
+
+    def test_tamper_truncation_symlink_and_oversize_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "state"
+            bucket = "a" * 32
+            journal = reconciler.TransitionJournal(root, lambda: NOW)
+            journal.append(bucket, "refresh", "started", "cooling", "refreshing", "none")
+            path = root / reconciler.JOURNAL_FILE
+
+            tampered = json.loads(path.read_text(encoding="utf-8"))
+            tampered["result"] = "ready"
+            path.write_text(json.dumps(tampered) + "\n", encoding="utf-8")
+            with self.assertRaises(reconciler.ReconcileError):
+                journal.append(bucket, "probe_start", "started", "probing", "probing", "refresh_succeeded")
+
+            path.unlink()
+            path.write_bytes(b"{}")
+            with self.assertRaises(reconciler.ReconcileError):
+                journal.append(bucket, "probe_start", "started", "probing", "probing", "refresh_succeeded")
+
+            path.unlink()
+            target = root / "target"
+            target.write_text("safe", encoding="utf-8")
+            path.symlink_to(target)
+            with self.assertRaises(reconciler.ReconcileError):
+                journal.append(bucket, "probe_start", "started", "probing", "probing", "refresh_succeeded")
+            self.assertEqual(target.read_text(encoding="utf-8"), "safe")
+
+            self.assertRaises(
+                reconciler.ReconcileError,
+                reconciler.TransitionJournal._validated_tail,
+                b"x" * (reconciler.MAX_JOURNAL_BYTES + 1),
+            )
+
+    def test_concurrent_process_appends_keep_one_contiguous_chain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "state"
+            workers = [multiprocessing.Process(target=journal_child, args=(str(root), number)) for number in range(12)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(5)
+                self.assertEqual(worker.exitcode, 0)
+            records = self.read_records(root)
+            self.assertEqual([row["seq"] for row in records], list(range(1, 13)))
+            self.assertEqual(
+                reconciler.TransitionJournal._validated_tail((root / reconciler.JOURNAL_FILE).read_bytes()),
+                (12, records[-1]["hash"]),
+            )
+
+    def test_controller_success_and_auth_required_emit_state_machine(self):
+        cases = [
+            ("succeeded", ["refresh", "refresh", "probe_start", "probe_result", "readmission"]),
+            ("auth_required", ["refresh", "refresh", "probe_start", "probe_result", "terminal_auth_required"]),
+        ]
+        for probe, expected_actions in cases:
+            with self.subTest(probe=probe), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                api = FakeAPI(probe=probe)
+                seat = reconciler.Seat("index-alpha", "claude", "probe-model")
+                controller = reconciler.Controller(
+                    reconciler.Inventory((seat,), 3, 10, 80),
+                    api,
+                    root / "state",
+                    root / "run",
+                    HMAC_KEY,
+                    apply=True,
+                    logger=reconciler.configure_logging(io.StringIO()),
+                    now=lambda: NOW,
+                    rng=random.Random(1),
+                )
+                self.assertEqual(controller.run(), 0 if probe == "succeeded" else 1)
+                records = self.read_records(root / "state")
+                self.assertEqual([row["action"] for row in records], expected_actions)
+                self.assertTrue(all(row["seat_bucket"] == reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index) for row in records))
+
+    def test_controller_quarantine_and_candidate_promotion_emit_required_actions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            auths = root / "auths"
+            canonical = auths / "canonical.json"
+            candidate = auths / "candidate.json"
+            write_json(canonical, {"provider": "claude", "refresh_token": "old", "account_id": "expected"})
+            write_json(candidate, {"provider": "claude", "refresh_token": "new", "account_id": "expected"})
+            seat = reconciler.Seat(
+                "index-alpha",
+                "claude",
+                "probe-model",
+                canonical,
+                candidate,
+                ("refresh_token",),
+                (("account_id", "expected"),),
+            )
+            api = InspectingAPI(canonical, probe="retryable")
+            controller = ImmediateReloadController(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+            self.assertEqual(controller.run(), 1)
+            actions = [row["action"] for row in self.read_records(root / "state")]
+            self.assertIn("staged_reauth", actions)
+            self.assertIn("candidate_promotion", actions)
+            self.assertIn("quarantine", actions)
+
+    def test_controller_fails_closed_when_journal_cannot_append(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            (state / reconciler.JOURNAL_FILE).symlink_to(root / "outside")
+            seat = reconciler.Seat("index-alpha", "claude", "probe-model")
+            controller = reconciler.Controller(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                FakeAPI(),
+                state,
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+            with self.assertRaises(reconciler.ReconcileError):
+                controller.run()
+
+    def test_failed_authoritative_transition_never_claims_result_state(self):
+        class FailProbingAPI(FakeAPI):
+            def set_state(self, auth_index, state, reason="", next_attempt="", generation="", disabled=None):
+                if state == "probing":
+                    raise reconciler.APIError(412, "retryable")
+                return super().set_state(auth_index, state, reason, next_attempt, generation, disabled)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = reconciler.Seat("index-alpha", "claude", "probe-model")
+            controller = reconciler.Controller(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                FailProbingAPI(),
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+            self.assertEqual(controller.run(), 1)
+            records = self.read_records(root / "state")
+            self.assertFalse(any(row["action"] == "refresh" and row["outcome"] == "succeeded" for row in records))
+            self.assertFalse(any(row["action"] in {"probe_start", "probe_result", "readmission"} for row in records))
+            self.assertFalse(any(row["result"] in {"probing", "ready"} for row in records))
+
+    def test_failed_ready_transition_never_claims_probe_success_or_readmission(self):
+        class FailReadyAPI(FakeAPI):
+            def set_state(self, auth_index, state, reason="", next_attempt="", generation="", disabled=None):
+                if state == "ready":
+                    raise reconciler.APIError(412, "retryable")
+                return super().set_state(auth_index, state, reason, next_attempt, generation, disabled)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = reconciler.Seat("index-alpha", "claude", "probe-model")
+            controller = reconciler.Controller(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                FailReadyAPI(),
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+            self.assertEqual(controller.run(), 1)
+            records = self.read_records(root / "state")
+            self.assertTrue(any(row["action"] == "probe_start" for row in records))
+            self.assertFalse(any(row["action"] == "probe_result" and row["outcome"] == "succeeded" for row in records))
+            self.assertFalse(any(row["action"] == "readmission" for row in records))
+
+    def test_candidate_promotion_does_not_claim_refreshing_before_transition(self):
+        class FailRefreshingAPI(InspectingAPI):
+            def set_state(self, auth_index, state, reason="", next_attempt="", generation="", disabled=None):
+                if state == "refreshing":
+                    raise reconciler.APIError(412, "retryable")
+                return super().set_state(auth_index, state, reason, next_attempt, generation, disabled)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical = root / "auths" / "canonical.json"
+            candidate = root / "auths" / "candidate.json"
+            write_json(canonical, {"provider": "claude", "refresh_token": "old", "account_id": "expected"})
+            write_json(candidate, {"provider": "claude", "refresh_token": "new", "account_id": "expected"})
+            seat = reconciler.Seat("index-alpha", "claude", "probe-model", canonical, candidate, ("refresh_token",), (("account_id", "expected"),))
+            controller = ImmediateReloadController(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                FailRefreshingAPI(canonical),
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+            self.assertEqual(controller.run(), 1)
+            records = self.read_records(root / "state")
+            promotions = [row for row in records if row["action"] == "candidate_promotion"]
+            self.assertEqual(len(promotions), 1)
+            self.assertEqual(promotions[0]["prior"], promotions[0]["result"])
+            self.assertFalse(any(row["action"] in {"staged_reauth", "refresh"} for row in records))
 
 
 class RollbackRecoveryTests(unittest.TestCase):

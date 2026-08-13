@@ -138,7 +138,7 @@ func (h *BaseAPIHandler) providersForExecution(modelName, originalRequestedModel
 		if routeDecision.AutoRouted {
 			normalizedModel = strings.TrimSpace(routeDecision.Model)
 			if normalizedModel == "" {
-				return nil, "", autoRouteUnavailableError()
+				return nil, "", autoRouteUnavailableError(routeDecision.Reason)
 			}
 		}
 		if normalizedModel == "" {
@@ -163,12 +163,24 @@ func (h *BaseAPIHandler) providersForExecution(modelName, originalRequestedModel
 		return h.getRequestDetailsWithOptions(routeModel, allowImageModel)
 	}
 	if routeDecision.AutoRouted {
-		return nil, "", autoRouteUnavailableError()
+		return nil, "", autoRouteUnavailableError(routeDecision.Reason)
 	}
 	return h.getRequestDetailsWithOptions(modelName, allowImageModel)
 }
 
-func autoRouteUnavailableError() *interfaces.ErrorMessage {
+func autoRouteUnavailableError(reason string) *interfaces.ErrorMessage {
+	if reason == "auto_model_required" {
+		return &interfaces.ErrorMessage{
+			StatusCode: http.StatusBadRequest,
+			Error:      errors.New(`{"error":{"message":"the auto-router endpoint accepts only model auto; use the explicit-model endpoint for named models","type":"invalid_request_error","code":"auto_router_model_required"}}`),
+		}
+	}
+	if reason == "separate_endpoint_required" {
+		return &interfaces.ErrorMessage{
+			StatusCode: http.StatusBadRequest,
+			Error:      errors.New(`{"error":{"message":"model auto is available only on the separate auto-router endpoint","type":"invalid_request_error","code":"auto_router_endpoint_required"}}`),
+		}
+	}
 	return &interfaces.ErrorMessage{
 		StatusCode: http.StatusServiceUnavailable,
 		Error:      errors.New(`{"error":{"message":"no compatible model is currently available for auto routing","type":"service_unavailable","code":"auto_route_unavailable"}}`),
@@ -395,6 +407,9 @@ func (h *BaseAPIHandler) applyModelRouter(ctx context.Context, handlerType, mode
 			smart.Models = filteredModels
 			smart.Providers = filteredProviders
 		}
+		decision.TaskClass = smart.TaskClass
+		decision.Reason = smart.Reason
+		decision.ScoreVersion = smart.ScoreVersion
 		if len(smart.Models) == 0 {
 			return decision
 		}
@@ -404,9 +419,6 @@ func (h *BaseAPIHandler) applyModelRouter(ctx context.Context, handlerType, mode
 		for model, providers := range smart.Providers {
 			decision.Providers[model] = append([]string(nil), providers...)
 		}
-		decision.TaskClass = smart.TaskClass
-		decision.Reason = smart.Reason
-		decision.ScoreVersion = smart.ScoreVersion
 	}
 	return decision
 }

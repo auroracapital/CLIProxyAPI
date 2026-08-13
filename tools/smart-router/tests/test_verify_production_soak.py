@@ -61,12 +61,17 @@ class PureStateMachineTests(unittest.TestCase):
 
     def observations(self, telemetry: dict[str, object] | None = None) -> dict[str, object]:
         return {
-            "inventory": {}, "pressure": {"active_leases": 0, "active_seats": 0},
+            "inventory": {}, "pressure": {
+                "active_leases": 0, "active_seats": 0, "frozen_active_leases": 0,
+                "maximum_skew_streak_seconds": 0.0,
+            },
             "events": {}, "reconciler": {}, "manual_toggles": 0,
             "telemetry": telemetry or {"instance": "p1_" + "a" * 32, "dropped": 0, "rejected": 0},
+            "artifacts": {name: "0" * 64 for name in soak.ARTIFACT_ARGUMENTS},
         }
 
     def fill_slo(self, state: dict[str, object], count: int = soak.MIN_ELIGIBLE_REQUESTS) -> None:
+        state["recovery"]["completed"] = 1
         for index in range(count):
             request = f"r1_{index:016x}"
             state["slo"]["terminal_requests"][request] = "success"
@@ -399,6 +404,97 @@ class PureStateMachineTests(unittest.TestCase):
         ):
             self.assertFalse(soak.valid_pressure_snapshot(mutation))
 
+    def test_route_pressure_streak_is_route_scoped_zero_filled_and_resets(self) -> None:
+        route = "g1_0123456789abcdef"
+        a = {"seat_bucket": "h1_0123456789abcdef", "capacity": 1}
+        b = {"seat_bucket": "h1_fedcba9876543210", "capacity": 1}
+        state = {"routes": {}, "maximum_skew_streak_seconds": 0.0}
+
+        def pressure(active: int, seats: list[dict[str, object]]) -> dict[str, object]:
+            rows = [] if active == 0 else [{
+                "seat_bucket": a["seat_bucket"], "in_flight": 1, "capacity": 1,
+                "concurrency_pressure_milli": active,
+            }]
+            return {"seats": rows, "eligible_routes": [{"route_bucket": route, "seats": seats}]}
+
+        soak.apply_route_pressure(state, pressure(1000, [a, b]), 1000)
+        for when in (1060, 1120, 1180, 1240, 1300, 1360):
+            soak.apply_route_pressure(state, pressure(1000, [a, b]), when)
+        self.assertEqual(state["routes"][route]["streak_seconds"], 360)
+        self.assertGreater(state["maximum_skew_streak_seconds"], soak.PRESSURE_SKEW_MAX_SECONDS)
+        soak.apply_route_pressure(state, pressure(0, [a, b]), 1420)
+        self.assertEqual(state["routes"][route]["streak_seconds"], 0)
+        soak.apply_route_pressure(state, pressure(1000, [a]), 1480)
+        self.assertEqual(state["routes"][route]["streak_seconds"], 0)
+
+    def test_journal_anchor_chain_recovery_and_prefix_mutation_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / "journal.jsonl"
+            journal.write_bytes(b"")
+            os.chmod(journal, 0o600)
+            cursor = soak.journal_anchor(journal)
+            previous = "0" * 64
+            records = []
+            specs = [
+                ("refresh", "started", "ready", "refreshing", "none"),
+                ("refresh", "succeeded", "refreshing", "probing", "refresh_succeeded"),
+                ("probe_start", "started", "probing", "probing", "refresh_succeeded"),
+                ("probe_result", "succeeded", "probing", "ready", "none"),
+                ("readmission", "succeeded", "probing", "ready", "none"),
+            ]
+            for seq, (action, outcome, prior, result, reason) in enumerate(specs, 1):
+                unsigned = {
+                    "version": 1, "seq": seq, "timestamp": f"2026-08-13T00:0{seq}:00+00:00",
+                    "seat_bucket": "a" * 32, "action": action, "outcome": outcome,
+                    "prior": prior, "result": result, "reason": reason, "previous_hash": previous,
+                }
+                previous = soak.journal_record_hash(unsigned)
+                records.append({**unsigned, "hash": previous})
+            with journal.open("ab") as handle:
+                handle.write(b"".join(soak.canonical_json(record) for record in records))
+            events, next_cursor = soak.read_reconciler_journal(journal, cursor)
+            recovery = {"journal_cursor": cursor, "seats": {}, "completed": 0, "events_sha256": "0" * 64}
+            soak.apply_recovery_events(recovery, events)
+            recovery["journal_cursor"] = next_cursor
+            self.assertEqual(recovery["completed"], 1)
+
+            replacement = Path(directory) / "replacement"
+            replacement.write_bytes(journal.read_bytes())
+            os.chmod(replacement, 0o600)
+            os.replace(replacement, journal)
+            with self.assertRaisesRegex(RuntimeError, "discontinuity"):
+                soak.read_reconciler_journal(journal, next_cursor)
+
+    def test_recovery_chain_is_same_seat_and_requires_readmission(self) -> None:
+        recovery = {"journal_cursor": self.baseline()["reconciler_journal_cursor"], "seats": {}, "completed": 0, "events_sha256": "0" * 64}
+        events = [
+            {"seat_bucket": "a" * 32, "action": "refresh", "outcome": "started", "prior": "ready", "result": "refreshing", "reason": "none"},
+            {"seat_bucket": "b" * 32, "action": "probe_result", "outcome": "succeeded", "prior": "probing", "result": "ready", "reason": "none"},
+            {"seat_bucket": "a" * 32, "action": "readmission", "outcome": "succeeded", "prior": "probing", "result": "ready", "reason": "none"},
+        ]
+        soak.apply_recovery_events(recovery, events)
+        self.assertEqual(recovery["completed"], 0)
+
+    def test_journal_rejects_sequence_gap_and_partial_append(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / "journal.jsonl"
+            journal.write_bytes(b"")
+            os.chmod(journal, 0o600)
+            cursor = soak.journal_anchor(journal)
+            unsigned = {
+                "version": 1, "seq": 2, "timestamp": "2026-08-13T00:01:00+00:00",
+                "seat_bucket": "a" * 32, "action": "refresh", "outcome": "started",
+                "prior": "ready", "result": "refreshing", "reason": "none",
+                "previous_hash": "0" * 64,
+            }
+            journal.write_bytes(soak.canonical_json({**unsigned, "hash": soak.journal_record_hash(unsigned)}))
+            with self.assertRaisesRegex(RuntimeError, "record"):
+                soak.read_reconciler_journal(journal, cursor)
+
+            journal.write_bytes(b'{"partial":')
+            with self.assertRaisesRegex(RuntimeError, "mutation"):
+                soak.read_reconciler_journal(journal, cursor)
+
     def test_cutoff_freezes_cohort_and_accepts_only_before_deadline(self) -> None:
         baseline = self.baseline(now=0)
         state = soak.new_state(baseline)
@@ -516,6 +612,32 @@ class PureStateMachineTests(unittest.TestCase):
         soak.apply_events(state["lifecycle"], [late], soak.EXPECTED_DURATION_SECONDS + 1, baseline)
         self.assertEqual(soak.lifecycle_summary(state["lifecycle"])["frozen_remaining"], 0)
 
+    def test_post_cutoff_unrelated_pressure_does_not_block_frozen_drain(self) -> None:
+        baseline = self.baseline(now=0)
+        state = soak.new_state(baseline)
+        selected = event("account_selection", "selected")
+        terminal = event("account_attempt", "success")
+        soak.apply_events(state["lifecycle"], [selected], soak.EXPECTED_DURATION_SECONDS, baseline)
+        soak.apply_events(state["lifecycle"], [terminal], soak.EXPECTED_DURATION_SECONDS + 30, baseline)
+        self.fill_slo(state)
+        for when in range(60, soak.EXPECTED_DURATION_SECONDS + 1, 60):
+            self.sample(state, when)
+        self.sample(state, soak.EXPECTED_DURATION_SECONDS + 30)
+        self.sample(state, soak.EXPECTED_DURATION_SECONDS + 90)
+        for sample in state["samples"][-2:]:
+            sample["observations"]["pressure"]["active_leases"] = 7
+            sample["observations"]["pressure"]["active_seats"] = 3
+            unsigned = dict(sample)
+            unsigned.pop("sample_sha256")
+            sample["sample_sha256"] = soak.object_hash(unsigned)
+        state["samples"][-1]["previous_sample_sha256"] = state["samples"][-2]["sample_sha256"]
+        unsigned = dict(state["samples"][-1])
+        unsigned.pop("sample_sha256")
+        state["samples"][-1]["sample_sha256"] = soak.object_hash(unsigned)
+        decision = soak.terminal_decision(state, soak.EXPECTED_DURATION_SECONDS + 90)
+        self.assertIsNotNone(decision)
+        self.assertTrue(decision["accepted"])
+
 
 class MainTransactionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -527,15 +649,34 @@ class MainTransactionTests(unittest.TestCase):
         self.config = root / "config.yaml"
         self.management = root / "management.env"
         self.reconciler = root / "reconciler.env"
+        self.journal = root / "journal.jsonl"
+        self.artifacts = [root / f"artifact-{index}" for index in range(len(soak.ARTIFACT_ARGUMENTS))]
         self.log.write_text("", encoding="utf-8")
         self.binary.write_bytes(b"binary")
-        self.config.write_text("routing:\n  strategy: least-pressure\n  auto:\n    mode: active\n", encoding="utf-8")
+        self.config.write_text("routing:\n  strategy: least-pressure\n  auto:\n    mode: reject\n", encoding="utf-8")
         self.management.write_text("MANAGEMENT_PASSWORD=x\n", encoding="utf-8")
         self.reconciler.write_text("CLIPROXY_RECONCILER_API_KEY=y\n", encoding="utf-8")
+        self.journal.write_bytes(b"")
+        os.chmod(self.journal, 0o600)
+        for artifact in self.artifacts:
+            artifact.write_bytes(b"artifact")
+        router_config = self.artifacts[list(soak.ARTIFACT_ARGUMENTS).index("router_config")]
+        router_config.write_text(json.dumps({
+            "schema_version": 1,
+            "listen": {"host": "127.0.0.1", "port": 8320},
+            "base": {"url": "http://127.0.0.1:8319/v1", "provider": "base", "models": ["model"]},
+            "routing": {"default_models": ["model"], "task_models": {}, "objective": "balanced", "provider_strategy": "health"},
+        }), encoding="utf-8")
+        router_runtime_config = self.artifacts[list(soak.ARTIFACT_ARGUMENTS).index("router_runtime_config")]
+        router_runtime_config.write_text("routing:\n  auto:\n    mode: exclusive\n", encoding="utf-8")
+        artifact_args = []
+        for (name, argument), path in zip(soak.ARTIFACT_ARGUMENTS.items(), self.artifacts):
+            artifact_args.extend(["--" + argument.replace("_", "-"), str(path)])
         self.argv = [
             "--state-directory", str(self.state), "--log", str(self.log),
             "--binary", str(self.binary), "--config", str(self.config),
             "--management-env", str(self.management), "--reconciler-env", str(self.reconciler),
+            "--reconciler-journal", str(self.journal), *artifact_args,
         ]
 
     def tearDown(self) -> None:
@@ -554,7 +695,7 @@ class MainTransactionTests(unittest.TestCase):
             "state": "ready", "generation": "gen", "runtime_generation": "gen",
             "credential_status": "active", "disabled": False,
             "durable_disabled": False, "unavailable": False,
-        } for _ in range(19)]
+        } for _ in range(20)]
         return {"credentials": rows}
 
     def api(self, path: str, _token: str) -> object:
@@ -585,6 +726,18 @@ class MainTransactionTests(unittest.TestCase):
         self.assertEqual(status["run_id"], state["run_id"])
         self.assertEqual(status["baseline_sha256"], state["baseline_sha256"])
         self.assertEqual(status["aggregate"]["last_sample_sha256"], state["samples"][-1]["sample_sha256"])
+
+    def test_pinned_router_and_reconciler_artifact_drift_is_sticky(self) -> None:
+        self.assertEqual(self.invoke(1000), 0)
+        router = self.artifacts[list(soak.ARTIFACT_ARGUMENTS).index("router_binary")]
+        original = router.read_bytes()
+        router.write_bytes(b"drift")
+        self.assertEqual(self.invoke(1060), 1)
+        state = self.read_state()
+        self.assertIn("router_binary_hash", state["samples"][-1]["failures"])
+        router.write_bytes(original)
+        self.assertEqual(self.invoke(1120), 0)
+        self.assertFalse(soak.evidence_aggregate(self.read_state())["window_healthy"])
 
     def test_snapshot_failure_records_incident_without_advancing_cursor(self) -> None:
         self.assertEqual(self.invoke(1000), 0)
@@ -656,7 +809,7 @@ class MainTransactionTests(unittest.TestCase):
 
     def test_empty_reconcile_rows_cannot_green(self) -> None:
         def bad_api(path: str, _token: str) -> object:
-            return self.pressure() if path.endswith("routing-pressure") else {"credentials": [{} for _ in range(19)]}
+            return self.pressure() if path.endswith("routing-pressure") else {"credentials": [{} for _ in range(20)]}
 
         with mock.patch.object(soak, "api_json", side_effect=bad_api), mock.patch.object(soak, "unauthenticated_status", return_value=401), mock.patch.object(soak, "command", side_effect=self.command):
             self.assertEqual(soak.main(self.argv, now=1000), 1)

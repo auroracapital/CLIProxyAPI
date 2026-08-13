@@ -67,6 +67,21 @@ SAFE_OUTCOMES = {
     "admission_rejected",
     "skipped",
 }
+JOURNAL_ACTIONS = {
+    "candidate_promotion",
+    "probe_result",
+    "probe_start",
+    "quarantine",
+    "readmission",
+    "refresh",
+    "staged_reauth",
+    "terminal_auth_required",
+}
+JOURNAL_OUTCOMES = SAFE_OUTCOMES | {"started"}
+JOURNAL_STATES = ALLOWED_STATES | {"unknown"}
+JOURNAL_FILE = "journal.jsonl"
+MAX_JOURNAL_BYTES = 64 * 1024 * 1024
+MAX_JOURNAL_LINE_BYTES = 4096
 UTC = dt.timezone.utc
 
 
@@ -394,6 +409,217 @@ class StateStore:
                 "updated_at": self.now().replace(microsecond=0).isoformat(),
             },
         )
+
+
+class TransitionJournal:
+    """Append-only, privacy-safe authoritative lifecycle transition journal."""
+
+    def __init__(self, directory: Path, now: Any = None):
+        self.path = directory / JOURNAL_FILE
+        self.now = now or (lambda: dt.datetime.now(UTC))
+
+    @staticmethod
+    def _record_hash(record: dict[str, Any]) -> str:
+        payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(b"cliproxy-reconcile-journal-v1\0" + payload).hexdigest()
+
+    @classmethod
+    def _validated_tail(cls, raw: bytes) -> tuple[int, str]:
+        if len(raw) > MAX_JOURNAL_BYTES:
+            raise ReconcileError("transition journal exceeds size bound")
+        if not raw:
+            return 0, "0" * 64
+        if not raw.endswith(b"\n"):
+            raise ReconcileError("transition journal is truncated")
+        sequence = 0
+        previous_hash = "0" * 64
+        for line in raw.splitlines():
+            if not line or len(line) > MAX_JOURNAL_LINE_BYTES:
+                raise ReconcileError("transition journal record exceeds size bound")
+            try:
+                record = json.loads(line)
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise ReconcileError("transition journal is malformed") from exc
+            if not isinstance(record, dict) or set(record) != {
+                "action",
+                "hash",
+                "outcome",
+                "previous_hash",
+                "prior",
+                "reason",
+                "result",
+                "seat_bucket",
+                "seq",
+                "timestamp",
+                "version",
+            }:
+                raise ReconcileError("transition journal schema is invalid")
+            expected_seq = sequence + 1
+            if (
+                record.get("version") != 1
+                or record.get("seq") != expected_seq
+                or record.get("previous_hash") != previous_hash
+                or record.get("action") not in JOURNAL_ACTIONS
+                or record.get("outcome") not in JOURNAL_OUTCOMES
+                or record.get("prior") not in JOURNAL_STATES
+                or record.get("result") not in JOURNAL_STATES
+                or record.get("reason") not in ALLOWED_REASONS
+                or not re.fullmatch(r"[0-9a-f]{32}", str(record.get("seat_bucket", "")))
+                or _parse_time(record.get("timestamp")) is None
+            ):
+                raise ReconcileError("transition journal contract is invalid")
+            supplied_hash = record.get("hash")
+            unsigned = {key: value for key, value in record.items() if key != "hash"}
+            expected_hash = cls._record_hash(unsigned)
+            if not isinstance(supplied_hash, str) or not hmac.compare_digest(supplied_hash, expected_hash):
+                raise ReconcileError("transition journal hash chain is invalid")
+            sequence = expected_seq
+            previous_hash = supplied_hash
+        return sequence, previous_hash
+
+    @classmethod
+    def validated_cursor(cls, path: Path) -> dict[str, int | str]:
+        """Return a verifier baseline pinned to one validated file snapshot."""
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            raise ReconcileError("transition journal cannot be inspected") from exc
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            before = os.fstat(fd)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_size > MAX_JOURNAL_BYTES
+            ):
+                raise ReconcileError("transition journal snapshot is unsafe")
+            raw = bytearray()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            after = os.fstat(fd)
+            if before.st_ino != after.st_ino or before.st_size != after.st_size or len(raw) != after.st_size:
+                raise ReconcileError("transition journal changed during inspection")
+            sequence, record_hash = cls._validated_tail(bytes(raw))
+            return {
+                "inode": after.st_ino,
+                "offset": after.st_size,
+                "seq": sequence,
+                "hash": record_hash,
+            }
+        except OSError as exc:
+            raise ReconcileError("transition journal inspection failed") from exc
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def append(
+        self,
+        seat_bucket: str,
+        action: str,
+        outcome: str,
+        prior: str,
+        result: str,
+        reason: str = "none",
+    ) -> None:
+        if (
+            not re.fullmatch(r"[0-9a-f]{32}", seat_bucket)
+            or action not in JOURNAL_ACTIONS
+            or outcome not in JOURNAL_OUTCOMES
+            or prior not in JOURNAL_STATES
+            or result not in JOURNAL_STATES
+            or reason not in ALLOWED_REASONS
+        ):
+            raise ReconcileError("refusing unsafe transition journal value")
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # StateDirectory is service-owned. Tighten a service-owned directory
+        # that may have been created through a nested test/install path before
+        # rejecting any ownership or symlink ambiguity.
+        with contextlib.suppress(OSError):
+            os.chmod(self.path.parent, 0o700, follow_symlinks=False)
+        try:
+            parent_info = self.path.parent.lstat()
+        except OSError as exc:
+            raise ReconcileError("transition journal directory is unavailable") from exc
+        if (
+            not stat.S_ISDIR(parent_info.st_mode)
+            or stat.S_ISLNK(parent_info.st_mode)
+            or parent_info.st_uid != os.geteuid()
+            or parent_info.st_gid != os.getegid()
+            or stat.S_IMODE(parent_info.st_mode) & 0o077
+        ):
+            raise ReconcileError("transition journal directory is unsafe")
+        flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        created = False
+        try:
+            fd = os.open(self.path, flags | os.O_EXCL, 0o600)
+            created = True
+        except FileExistsError:
+            try:
+                fd = os.open(self.path, flags, 0o600)
+            except OSError as exc:
+                raise ReconcileError("transition journal cannot be opened") from exc
+        except OSError as exc:
+            raise ReconcileError("transition journal cannot be opened") from exc
+        try:
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_gid != os.getegid()
+                or info.st_size > MAX_JOURNAL_BYTES
+            ):
+                raise ReconcileError("transition journal file is unsafe")
+            os.fchmod(fd, 0o600)
+            if created:
+                directory_fd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            os.lseek(fd, 0, os.SEEK_SET)
+            raw = bytearray()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            sequence, previous_hash = self._validated_tail(bytes(raw))
+            unsigned = {
+                "action": action,
+                "outcome": outcome,
+                "previous_hash": previous_hash,
+                "prior": prior,
+                "reason": reason,
+                "result": result,
+                "seat_bucket": seat_bucket,
+                "seq": sequence + 1,
+                "timestamp": self.now().replace(microsecond=0).isoformat(),
+                "version": 1,
+            }
+            record = {**unsigned, "hash": self._record_hash(unsigned)}
+            encoded = json.dumps(record, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+            if len(encoded) > MAX_JOURNAL_LINE_BYTES or info.st_size + len(encoded) > MAX_JOURNAL_BYTES:
+                raise ReconcileError("transition journal capacity exhausted")
+            written = 0
+            while written < len(encoded):
+                written += os.write(fd, encoded[written:])
+            os.fsync(fd)
+        except OSError as exc:
+            raise ReconcileError("transition journal append failed") from exc
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
 
 class APIAdapter:
@@ -865,6 +1091,7 @@ class Controller:
         self.now = now or (lambda: dt.datetime.now(UTC))
         self.rng = rng or random.SystemRandom()
         self.store = StateStore(state_dir, self.now)
+        self.journal = TransitionJournal(state_dir, self.now)
         self.max_seats = max_seats
         self.only_healthy = only_healthy
         self.force_probe = force_probe
@@ -872,6 +1099,18 @@ class Controller:
         self.seat_key = seat_key.strip().lower()
         self.recover_rollbacks = recover_rollbacks
         self.periodic = periodic
+
+    def _journal(
+        self,
+        seat_key: str,
+        action: str,
+        outcome: str,
+        prior: str,
+        result: str,
+        reason: str = "none",
+    ) -> None:
+        if self.apply:
+            self.journal.append(seat_key, action, outcome, prior, result, reason)
 
     def run(self) -> int:
         with file_lock(self.runtime_dir / "locks" / "global.lock") as global_acquired:
@@ -1200,6 +1439,14 @@ class Controller:
                     "failed",
                 )
             self._record(seat_key, "auth_required", "attempt_budget_exhausted", "skipped", attempts, "")
+            self._journal(
+                seat_key,
+                "terminal_auth_required",
+                "skipped",
+                state,
+                "auth_required",
+                "attempt_budget_exhausted",
+            )
             return True
         attempts += 1
         archive: Path | None = None
@@ -1229,6 +1476,14 @@ class Controller:
                 promoted = True
                 self._wait_for_generation(seat.auth_index, generation, False)
                 durable_disabled = False
+                self._journal(
+                    seat_key,
+                    "candidate_promotion",
+                    "succeeded",
+                    state,
+                    state,
+                    "candidate_promoted",
+                )
             except (PromotionError, APIError):
                 if promoted and self._restore_and_reload(seat, archive, promoted_raw_generation) is None:
                     return self._record_local_failure(
@@ -1267,6 +1522,15 @@ class Controller:
                 "candidate_promoted" if candidate_exists else "",
                 disabled=False,
             )
+            if candidate_exists:
+                self._journal(
+                    seat_key,
+                    "staged_reauth",
+                    "succeeded",
+                    state,
+                    "refreshing",
+                    "candidate_promoted",
+                )
             if promoted:
                 # The lifecycle CAS above intentionally rewrites the canonical
                 # JSON and therefore advances its raw generation. Rollback must
@@ -1279,6 +1543,14 @@ class Controller:
                     generation,
                 )
             refresh_attempted = True
+            self._journal(
+                seat_key,
+                "refresh",
+                "started",
+                state,
+                "refreshing",
+                "candidate_promoted" if candidate_exists else "none",
+            )
             refresh_outcome, refreshed_generation, refreshed_disabled = self.api.refresh(seat.auth_index)
             if refresh_outcome != "succeeded":
                 if promoted:
@@ -1302,6 +1574,9 @@ class Controller:
                     refresh_outcome,
                     generation,
                     durable_disabled,
+                    operation_action="refresh",
+                    operation_outcome=refresh_outcome,
+                    operation_prior="refreshing",
                 )
             generation = refreshed_generation
             durable_disabled = refreshed_disabled
@@ -1317,9 +1592,25 @@ class Controller:
                 disabled=False,
             )
             durable_disabled = False
+            self._journal(
+                seat_key,
+                "refresh",
+                "succeeded",
+                "refreshing",
+                "probing",
+                "refresh_succeeded",
+            )
             if promoted and candidate_exists and seat.canonical_path is not None:
                 with credential_file_lock(seat.canonical_path):
                     canonical_raw_generation = raw_file_generation(seat.canonical_path)
+            self._journal(
+                seat_key,
+                "probe_start",
+                "started",
+                "probing",
+                "probing",
+                "refresh_succeeded",
+            )
             probe_outcome = self.api.probe(seat, self.inventory.probe_payload)
             if probe_outcome == "succeeded":
                 generation = self._transition(
@@ -1330,6 +1621,22 @@ class Controller:
                     disabled=False,
                 )
                 self._record(seat_key, "ready", "none", "succeeded", attempts, "")
+                self._journal(
+                    seat_key,
+                    "probe_result",
+                    "succeeded",
+                    "probing",
+                    "ready",
+                    "none",
+                )
+                self._journal(
+                    seat_key,
+                    "readmission",
+                    "succeeded",
+                    "probing",
+                    "ready",
+                    "none",
+                )
                 if candidate_exists and seat.candidate_path:
                     with credential_file_lock(seat.candidate_path):
                         if seat.candidate_path.exists() and raw_file_generation(seat.candidate_path) == candidate_raw_generation:
@@ -1351,8 +1658,14 @@ class Controller:
                 # admission flag while applying the failure lifecycle.
                 durable_disabled = archived_disabled(archive)
             if probe_outcome == "auth_required":
-                return self._fail(seat, seat_key, attempts, "probe_auth_required", "auth_required", probe_outcome, generation, durable_disabled)
-            return self._fail(seat, seat_key, attempts, "probe_rejected" if probe_outcome == "rejected" else "probe_retryable", "cooling", probe_outcome, generation, durable_disabled)
+                return self._fail(
+                    seat, seat_key, attempts, "probe_auth_required", "auth_required", probe_outcome, generation, durable_disabled,
+                    operation_action="probe_result", operation_outcome=probe_outcome, operation_prior="probing",
+                )
+            return self._fail(
+                seat, seat_key, attempts, "probe_rejected" if probe_outcome == "rejected" else "probe_retryable", "cooling", probe_outcome, generation, durable_disabled,
+                operation_action="probe_result", operation_outcome=probe_outcome, operation_prior="probing",
+            )
         except (APIError, PromotionError):
             if promoted:
                 if refresh_succeeded and candidate_exists:
@@ -1659,6 +1972,9 @@ class Controller:
         outcome: str,
         generation: str = "",
         disabled: bool | None = None,
+        operation_action: str = "",
+        operation_outcome: str = "",
+        operation_prior: str = "unknown",
     ) -> bool:
         delay = backoff_seconds(attempts, self.inventory.base_backoff_seconds, self.inventory.max_backoff_seconds, self.rng)
         next_attempt = "" if state in {"auth_required", "misconfigured"} else (self.now() + dt.timedelta(seconds=delay)).replace(microsecond=0).isoformat()
@@ -1674,6 +1990,33 @@ class Controller:
         except (APIError, PromotionError):
             return self._record_local_failure(seat_key, attempts, reason, state, "failed", next_attempt)
         self._record(seat_key, state, reason, outcome if outcome in SAFE_OUTCOMES else "failed", attempts, next_attempt)
+        if operation_action:
+            self._journal(
+                seat_key,
+                operation_action,
+                operation_outcome if operation_outcome in JOURNAL_OUTCOMES else "failed",
+                operation_prior,
+                state,
+                reason,
+            )
+        if state == "cooling":
+            self._journal(
+                seat_key,
+                "quarantine",
+                outcome if outcome in SAFE_OUTCOMES else "failed",
+                "probing" if reason.startswith("probe_") else "refreshing",
+                "cooling",
+                reason,
+            )
+        elif state == "auth_required":
+            self._journal(
+                seat_key,
+                "terminal_auth_required",
+                outcome if outcome in SAFE_OUTCOMES else "failed",
+                "probing" if reason.startswith("probe_") else "refreshing",
+                "auth_required",
+                reason,
+            )
         return False
 
     def _record_local_failure(

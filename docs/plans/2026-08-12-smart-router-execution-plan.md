@@ -1,9 +1,18 @@
 # Smart Model Router and Predictive Account Balancer
 
-Status: live `.7` reconciler recovery is healthy; account-attempt/pressure hardening passes local and isolated ARM64 fault gates; committed `.8` rollout, active canaries, and 24-hour soak pending
+Status: live `.9` remains the rollback baseline; schema-v3 verification, authoritative
+controller journaling, and a separate auto-router front endpoint are implemented
+and pass the complete precommit gate; final `.10` two-service rollout and a fresh
+24-hour acceptance window remain pending
 Owner: primary agent
 Canonical runtime: `healify-hub` only
 Proxy path: nginx `:8317` -> CLIProxyAPI `127.0.0.1:8319`
+
+Auto-router path: nginx `:8321` -> stateless CLIProxyAPI front
+`127.0.0.1:8320` -> explicit-model base request on `127.0.0.1:8319`.
+The base endpoint uses `routing.auto.mode: reject`; the front uses
+`routing.auto.mode: exclusive`. This keeps named model choices on `:8317` and
+literal `model: auto` on the separate `:8321` endpoint.
 Source baseline: CLIProxyAPI v7.2.128 (`bd34ceca`)
 
 ## 1. Outcome

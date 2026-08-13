@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import datetime as dt
 import fcntl
 import hashlib
 import json
@@ -27,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 EXPECTED_DURATION_SECONDS = 24 * 60 * 60
 EXPECTED_INTERVAL_SECONDS = 60
 MAX_SAMPLE_GAP_SECONDS = 90
@@ -71,7 +72,8 @@ CHECK_NAMES = {
     "binary_hash",
     "config_hash",
     "verifier_hash",
-    "auto_active",
+    "base_auto_reject",
+    "front_auto_active",
     "least_pressure",
     "crsproxy_active",
     "nginx_active",
@@ -104,6 +106,42 @@ ROUTING_P95_LIMIT_MS = 25
 PRESSURE_SKEW_RATIO_MILLI = 1500
 PRESSURE_SKEW_MAX_SECONDS = 5 * 60
 MIN_FAIR_ROUTE_SELECTIONS = 100
+RECONCILER_SEAT_KEY = re.compile(r"^[0-9a-f]{32}$")
+JOURNAL_ACTIONS = {
+    "candidate_promotion", "staged_reauth", "refresh", "probe_start", "probe_result",
+    "quarantine", "readmission", "terminal_auth_required",
+}
+JOURNAL_STATES = {"ready", "cooling", "refreshing", "probing", "auth_required", "misconfigured", "unknown"}
+JOURNAL_OUTCOMES = {
+    "succeeded", "failed", "auth_required", "cooling", "retryable", "rejected",
+    "admission_rejected", "skipped", "started",
+}
+JOURNAL_REASONS = {
+    "none", "attempt_budget_exhausted", "candidate_invalid", "candidate_promoted",
+    "inventory_invalid", "locked", "not_due", "probe_auth_required", "probe_rejected",
+    "probe_retryable", "refresh_failed", "refresh_succeeded", "rollback_completed", "rollback_failed",
+}
+ARTIFACT_ARGUMENTS = {
+    "router_binary": "router_binary",
+    "router_config": "router_config",
+    "router_renderer": "router_renderer",
+    "router_runtime_config": "router_runtime_config",
+    "router_service_unit": "router_service_unit",
+    "base_proxy_service_unit": "base_proxy_service_unit",
+    "nginx_auto_router_config": "nginx_auto_router_config",
+    "reconciler_program": "reconciler_program",
+    "reconciler_inventory": "reconciler_inventory",
+    "reconciler_service_unit": "reconciler_service_unit",
+    "reconciler_timer_unit": "reconciler_timer_unit",
+    "soak_service_unit": "soak_service_unit",
+    "soak_timer_unit": "soak_timer_unit",
+}
+ARTIFACT_CHECKS = {name: name + "_hash" for name in ARTIFACT_ARGUMENTS}
+CHECK_NAMES.update(ARTIFACT_CHECKS.values())
+CHECK_NAMES.add("reconciler_journal_valid")
+CHECK_NAMES.add("route_pressure_streak")
+CHECK_NAMES.add("auto_router_active")
+FAILURE_NAMES = CHECK_NAMES | INCIDENT_NAMES
 
 
 def canonical_json(payload: Any) -> bytes:
@@ -124,6 +162,120 @@ def sha256(path: Path) -> str:
 
 def command(*args: str) -> str:
     return subprocess.run(args, check=True, text=True, capture_output=True).stdout.strip()
+
+
+def journal_record_hash(record: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        b"cliproxy-reconcile-journal-v1\0" + json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def validate_journal_record(record: Any, expected_seq: int, previous_hash: str) -> dict[str, Any]:
+    required = {
+        "version", "seq", "timestamp", "seat_bucket", "action", "outcome", "prior",
+        "result", "reason", "previous_hash", "hash",
+    }
+    if not isinstance(record, dict) or set(record) != required:
+        raise RuntimeError("invalid reconciler journal schema")
+    unsigned = {key: value for key, value in record.items() if key != "hash"}
+    if (
+        record["version"] != 1
+        or record["seq"] != expected_seq
+        or record["previous_hash"] != previous_hash
+        or not RECONCILER_SEAT_KEY.fullmatch(str(record["seat_bucket"]))
+        or record["action"] not in JOURNAL_ACTIONS
+        or record["outcome"] not in JOURNAL_OUTCOMES
+        or record["prior"] not in JOURNAL_STATES
+        or record["result"] not in JOURNAL_STATES
+        or record["reason"] not in JOURNAL_REASONS
+        or not valid_journal_timestamp(record["timestamp"])
+        or not HEX_64.fullmatch(str(record["hash"]))
+        or record["hash"] != journal_record_hash(unsigned)
+    ):
+        raise RuntimeError("invalid reconciler journal record")
+    return dict(record)
+
+
+def valid_journal_timestamp(value: Any) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return False
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def journal_anchor(path: Path) -> dict[str, Any]:
+    metadata, raw = read_journal_bytes(path)
+    if len(raw) > 64 * 1024 * 1024 or (raw and not raw.endswith(b"\n")):
+        raise RuntimeError("invalid reconciler journal")
+    seq = 0
+    previous = "0" * 64
+    for line in raw.splitlines():
+        if not line or len(line) > 4096:
+            raise RuntimeError("invalid reconciler journal")
+        record = validate_journal_record(json.loads(line), seq + 1, previous)
+        seq = int(record["seq"])
+        previous = str(record["hash"])
+    return {
+        "inode": int(metadata.st_ino), "uid": int(metadata.st_uid), "gid": int(metadata.st_gid),
+        "offset": len(raw), "seq": seq, "hash": previous,
+        "prefix_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def validate_journal_cursor(cursor: Any) -> None:
+    if not isinstance(cursor, dict) or set(cursor) != {"inode", "uid", "gid", "offset", "seq", "hash", "prefix_sha256"}:
+        raise RuntimeError("invalid reconciler journal cursor")
+    if any(not isinstance(cursor[name], int) or isinstance(cursor[name], bool) or cursor[name] < 0 for name in ("inode", "uid", "gid", "offset", "seq")):
+        raise RuntimeError("invalid reconciler journal cursor")
+    if not HEX_64.fullmatch(str(cursor["hash"])) or not HEX_64.fullmatch(str(cursor["prefix_sha256"])):
+        raise RuntimeError("invalid reconciler journal cursor")
+    if cursor["seq"] == 0 and cursor["hash"] != "0" * 64:
+        raise RuntimeError("invalid reconciler journal cursor")
+
+
+def read_reconciler_journal(path: Path, cursor: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    validate_journal_cursor(cursor)
+    metadata, full = read_journal_bytes(path)
+    if (
+        metadata.st_ino != cursor["inode"] or metadata.st_uid != cursor["uid"] or metadata.st_gid != cursor["gid"]
+        or metadata.st_size < cursor["offset"] or metadata.st_size > 64 * 1024 * 1024
+    ):
+        raise RuntimeError("reconciler journal discontinuity")
+    prefix = full[: int(cursor["offset"])]
+    raw = full[int(cursor["offset"]):]
+    if hashlib.sha256(prefix).hexdigest() != cursor["prefix_sha256"] or (raw and not raw.endswith(b"\n")):
+        raise RuntimeError("reconciler journal mutation")
+    seq = int(cursor["seq"])
+    previous = str(cursor["hash"])
+    events: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        if not line or len(line) > 4096:
+            raise RuntimeError("invalid reconciler journal")
+        record = validate_journal_record(json.loads(line), seq + 1, previous)
+        events.append(record)
+        seq = int(record["seq"])
+        previous = str(record["hash"])
+    next_cursor = {
+        "inode": int(metadata.st_ino), "uid": int(metadata.st_uid), "gid": int(metadata.st_gid),
+        "offset": int(metadata.st_size), "seq": seq, "hash": previous,
+        "prefix_sha256": hashlib.sha256(full).hexdigest(),
+    }
+    return events, next_cursor
+
+
+def read_journal_bytes(path: Path) -> tuple[os.stat_result, bytes]:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise RuntimeError("unsafe reconciler journal")
+        with os.fdopen(os.dup(descriptor), "rb") as handle:
+            return metadata, handle.read(64 * 1024 * 1024 + 1)
+    finally:
+        os.close(descriptor)
 
 
 def api_json(path: str, token: str) -> Any:
@@ -379,6 +531,8 @@ def new_baseline(
     verifier_hash: str,
     log_metadata: os.stat_result,
     pressure: dict[str, Any],
+    artifact_hashes: dict[str, str] | None = None,
+    reconciler_journal_cursor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     pressure_rows = pressure.get("seats", [])
     allowance: dict[str, int] = {}
@@ -388,6 +542,14 @@ def new_baseline(
         if not SEAT_BUCKET.fullmatch(seat) or leases < 0:
             raise RuntimeError("invalid pressure snapshot")
         allowance[seat] = leases
+    hashes = dict(artifact_hashes or {name: "0" * 64 for name in ARTIFACT_ARGUMENTS})
+    if set(hashes) != set(ARTIFACT_ARGUMENTS) or any(not HEX_64.fullmatch(str(value)) for value in hashes.values()):
+        raise RuntimeError("invalid artifact hashes")
+    journal = copy.deepcopy(reconciler_journal_cursor or {
+        "inode": 1, "uid": 0, "gid": 0, "offset": 0, "seq": 0, "hash": "0" * 64,
+        "prefix_sha256": hashlib.sha256(b"").hexdigest(),
+    })
+    validate_journal_cursor(journal)
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": uuid.uuid4().hex,
@@ -407,6 +569,9 @@ def new_baseline(
         "telemetry_instance": pressure.get("telemetry_instance"),
         "routing_events_dropped": pressure.get("routing_events_dropped"),
         "routing_events_rejected": pressure.get("routing_events_rejected"),
+        "artifact_hashes": hashes,
+        "reconciler_journal_cursor": journal,
+        "reconciler_journal_cursor_sha256": object_hash(journal),
     }
 
 
@@ -425,7 +590,8 @@ def validate_baseline(baseline: dict[str, Any], now: float) -> None:
         "run_id", "started_at_epoch", "soak_cutoff_epoch", "expected_binary_sha256",
         "expected_config_sha256", "expected_verifier_sha256", "initial_log_inode",
         "initial_log_offset", "startup_allowance", "telemetry_instance",
-        "routing_events_dropped", "routing_events_rejected",
+        "routing_events_dropped", "routing_events_rejected", "artifact_hashes",
+        "reconciler_journal_cursor", "reconciler_journal_cursor_sha256",
     }
     if set(baseline) != required:
         raise RuntimeError("invalid baseline fields")
@@ -443,6 +609,15 @@ def validate_baseline(baseline: dict[str, Any], now: float) -> None:
         raise RuntimeError("invalid baseline hash")
     if int(baseline["initial_log_inode"]) < 0 or int(baseline["initial_log_offset"]) < 0:
         raise RuntimeError("invalid baseline cursor")
+    artifact_hashes = baseline["artifact_hashes"]
+    if not isinstance(artifact_hashes, dict) or set(artifact_hashes) != set(ARTIFACT_ARGUMENTS) or any(
+        not HEX_64.fullmatch(str(value)) for value in artifact_hashes.values()
+    ):
+        raise RuntimeError("invalid baseline artifact hashes")
+    journal = baseline["reconciler_journal_cursor"]
+    validate_journal_cursor(journal)
+    if baseline["reconciler_journal_cursor_sha256"] != object_hash(journal):
+        raise RuntimeError("invalid baseline journal cursor")
     if not TELEMETRY_INSTANCE.fullmatch(str(baseline["telemetry_instance"])):
         raise RuntimeError("invalid baseline telemetry instance")
     for name in ("routing_events_dropped", "routing_events_rejected"):
@@ -471,12 +646,16 @@ def new_state(baseline: dict[str, Any]) -> dict[str, Any]:
             "request_seats": {}, "manual_toggles": 0, "reused_seat_attempts": 0,
             "cutoff": None,
         },
+        "recovery": {
+            "journal_cursor": baseline["reconciler_journal_cursor"],
+            "seats": {}, "completed": 0, "events_sha256": "0" * 64,
+        },
         "slo": {
             "terminal_requests": {}, "model_attempts": {}, "deterministic_latencies_ms": [],
             "selection_counts": {},
             "eligible_routes": {},
-            "pressure_skew_violation_seconds": 0.0, "pressure_skew_last_sample_epoch": None,
         },
+        "pressure": {"routes": {}, "maximum_skew_streak_seconds": 0.0},
         "samples": [],
         "terminal": None,
     }
@@ -523,14 +702,29 @@ def validate_sample(sample: dict[str, Any], state: dict[str, Any], index: int, p
     if not HEX_64.fullmatch(actual_hash) or object_hash(unsigned) != actual_hash:
         raise RuntimeError("invalid evidence hash")
     if not incidents:
-        if set(observations) != {"inventory", "pressure", "events", "reconciler", "manual_toggles", "telemetry"}:
+        if set(observations) != {"inventory", "pressure", "events", "reconciler", "manual_toggles", "telemetry", "artifacts"}:
             raise RuntimeError("invalid evidence observation fields")
         pressure = observations["pressure"]
-        if not isinstance(pressure, dict) or set(pressure) != {"active_leases", "active_seats"} or any(
+        if not isinstance(pressure, dict) or set(pressure) != {
+            "active_leases", "active_seats", "frozen_active_leases", "maximum_skew_streak_seconds",
+        } or any(
             not isinstance(pressure[name], int) or isinstance(pressure[name], bool) or pressure[name] < 0
-            for name in ("active_leases", "active_seats")
+            for name in ("active_leases", "active_seats", "frozen_active_leases")
         ):
             raise RuntimeError("invalid evidence pressure")
+        maximum = pressure["maximum_skew_streak_seconds"]
+        if not isinstance(maximum, (int, float)) or isinstance(maximum, bool) or not math.isfinite(float(maximum)) or maximum < 0:
+            raise RuntimeError("invalid evidence pressure")
+        if checks.get("route_pressure_streak") is not (float(maximum) <= PRESSURE_SKEW_MAX_SECONDS):
+            raise RuntimeError("invalid evidence pressure check")
+        artifacts = observations["artifacts"]
+        if not isinstance(artifacts, dict) or set(artifacts) != set(ARTIFACT_ARGUMENTS) or any(
+            not HEX_64.fullmatch(str(value)) for value in artifacts.values()
+        ):
+            raise RuntimeError("invalid evidence artifacts")
+        for name, value in artifacts.items():
+            if checks.get(ARTIFACT_CHECKS[name]) is not (value == state["baseline"]["artifact_hashes"][name]):
+                raise RuntimeError("invalid evidence artifact check")
         if not isinstance(observations["manual_toggles"], int) or isinstance(observations["manual_toggles"], bool) or observations["manual_toggles"] < 0:
             raise RuntimeError("invalid evidence manual toggles")
         telemetry = observations.get("telemetry")
@@ -543,7 +737,10 @@ def validate_sample(sample: dict[str, Any], state: dict[str, Any], index: int, p
 
 
 def validate_state(state: dict[str, Any], now: float) -> None:
-    required = {"schema_version", "run_id", "baseline", "baseline_sha256", "cursor", "lifecycle", "slo", "samples", "terminal"}
+    required = {
+        "schema_version", "run_id", "baseline", "baseline_sha256", "cursor", "lifecycle",
+        "recovery", "pressure", "slo", "samples", "terminal",
+    }
     if set(state) != required or state.get("schema_version") != SCHEMA_VERSION:
         raise RuntimeError("invalid authoritative state")
     baseline = state.get("baseline")
@@ -559,6 +756,8 @@ def validate_state(state: dict[str, Any], now: float) -> None:
     if not isinstance(lifecycle, dict) or not isinstance(state.get("samples"), list):
         raise RuntimeError("invalid state payload")
     validate_lifecycle(lifecycle, baseline)
+    validate_recovery(state["recovery"], baseline)
+    validate_pressure_state(state["pressure"])
     validate_slo_state(state["slo"])
     previous = "0" * 64
     last_time = None
@@ -577,6 +776,7 @@ def validate_state(state: dict[str, Any], now: float) -> None:
         required_terminal = {
             "schema_version", "run_id", "baseline_sha256", "state", "accepted",
             "finalized_at_epoch", "sample_count", "last_sample_sha256", "aggregate", "lifecycle", "slo",
+            "pressure", "recovery",
         }
         if not isinstance(terminal, dict) or set(terminal) != required_terminal:
             raise RuntimeError("invalid terminal schema")
@@ -593,6 +793,8 @@ def validate_state(state: dict[str, Any], now: float) -> None:
             terminal.get("aggregate") != evidence_aggregate(state)
             or terminal.get("lifecycle") != lifecycle_summary(lifecycle)
             or terminal.get("slo") != slo_summary(state["slo"])
+            or terminal.get("pressure") != pressure_summary(state["pressure"])
+            or terminal.get("recovery") != recovery_summary(state["recovery"])
         ):
             raise RuntimeError("invalid terminal summary")
         finalized = float(terminal.get("finalized_at_epoch", math.nan))
@@ -682,11 +884,130 @@ def validate_lifecycle(lifecycle: dict[str, Any], baseline: dict[str, Any]) -> N
         raise RuntimeError("invalid lifecycle frozen quiescence")
 
 
+def apply_recovery_events(recovery: dict[str, Any], events: list[dict[str, Any]]) -> None:
+    seats = copy.deepcopy(recovery["seats"])
+    completed = int(recovery["completed"])
+    for event in events:
+        seat = event["seat_bucket"]
+        phase = str(seats.get(seat, "idle"))
+        action = event["action"]
+        outcome = event["outcome"]
+        result = event["result"]
+        if action == "refresh" and outcome == "started" and result == "refreshing" and event["reason"] in {"none", "candidate_promoted"}:
+            phase = "refresh"
+        elif action == "refresh" and phase == "refresh" and outcome == "succeeded" and event["prior"] == "refreshing" and result == "probing" and event["reason"] == "refresh_succeeded":
+            phase = "probe"
+        elif action in {"staged_reauth", "candidate_promotion"} and outcome == "succeeded" and result == "refreshing" and event["reason"] == "candidate_promoted":
+            phase = "refresh"
+        elif action == "probe_start" and phase in {"refresh", "probe"} and outcome == "started" and event["prior"] == "probing" and result == "probing" and event["reason"] == "refresh_succeeded":
+            phase = "probe"
+        elif action == "probe_result" and phase in {"refresh", "probe"} and outcome == "succeeded" and event["prior"] == "probing" and result == "ready" and event["reason"] == "none":
+            phase = "probe_success"
+        elif action == "readmission" and phase == "probe_success" and outcome == "succeeded" and event["prior"] == "probing" and result == "ready" and event["reason"] == "none":
+            phase = "complete"
+            completed += 1
+        elif action in {"quarantine", "terminal_auth_required"} or outcome in {"failed", "rejected", "auth_required"}:
+            phase = "idle"
+        seats[seat] = phase
+    recovery["seats"] = seats
+    recovery["completed"] = completed
+    digest = str(recovery["events_sha256"])
+    for event in events:
+        digest = hashlib.sha256((digest + object_hash(event)).encode()).hexdigest()
+    recovery["events_sha256"] = digest
+
+
+def validate_recovery(recovery: Any, baseline: dict[str, Any]) -> None:
+    if not isinstance(recovery, dict) or set(recovery) != {"journal_cursor", "seats", "completed", "events_sha256"}:
+        raise RuntimeError("invalid recovery state")
+    validate_journal_cursor(recovery["journal_cursor"])
+    baseline_cursor = baseline["reconciler_journal_cursor"]
+    if any(recovery["journal_cursor"][name] != baseline_cursor[name] for name in ("inode", "uid", "gid")) or recovery["journal_cursor"]["seq"] < baseline_cursor["seq"]:
+        raise RuntimeError("invalid recovery cursor")
+    if not isinstance(recovery["completed"], int) or isinstance(recovery["completed"], bool) or recovery["completed"] < 0:
+        raise RuntimeError("invalid recovery count")
+    if not HEX_64.fullmatch(str(recovery["events_sha256"])):
+        raise RuntimeError("invalid recovery evidence hash")
+    seats = recovery["seats"]
+    if not isinstance(seats, dict) or any(
+        not RECONCILER_SEAT_KEY.fullmatch(str(seat)) or phase not in {"idle", "refresh", "probe", "probe_success", "complete"}
+        for seat, phase in seats.items()
+    ):
+        raise RuntimeError("invalid recovery seats")
+
+
+def apply_route_pressure(pressure_state: dict[str, Any], pressure: dict[str, Any], now: float) -> None:
+    routes = copy.deepcopy(pressure_state["routes"])
+    current = {
+        route["route_bucket"]: {seat["seat_bucket"] for seat in route["seats"]}
+        for route in pressure["eligible_routes"]
+    }
+    active = {row["seat_bucket"]: int(row["concurrency_pressure_milli"]) for row in pressure["seats"]}
+    maximum = float(pressure_state["maximum_skew_streak_seconds"])
+    for route, eligible in current.items():
+        record = routes.get(route, {"last_sample_epoch": now, "last_eligible": [], "streak_seconds": 0.0, "maximum_streak_seconds": 0.0})
+        gap = now - float(record["last_sample_epoch"])
+        continuous = 0 <= gap <= MAX_SAMPLE_GAP_SECONDS
+        same_route = eligible == set(record["last_eligible"]) and len(eligible) >= 2
+        values = sorted(active.get(seat, 0) for seat in eligible)
+        median = 0.0
+        if values:
+            middle = len(values) // 2
+            median = values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2
+        skewed = bool(values and (max(values) > 0 if median == 0 else max(values) * 1000 > median * PRESSURE_SKEW_RATIO_MILLI))
+        if continuous and same_route and skewed:
+            record["streak_seconds"] = float(record["streak_seconds"]) + gap
+        else:
+            record["streak_seconds"] = 0.0
+        record["maximum_streak_seconds"] = max(float(record["maximum_streak_seconds"]), float(record["streak_seconds"]))
+        maximum = max(maximum, float(record["maximum_streak_seconds"]))
+        record["last_sample_epoch"] = now
+        record["last_eligible"] = sorted(eligible)
+        routes[route] = record
+    for route, record in routes.items():
+        if route not in current:
+            record["streak_seconds"] = 0.0
+            record["last_sample_epoch"] = now
+            record["last_eligible"] = []
+    pressure_state["routes"] = routes
+    pressure_state["maximum_skew_streak_seconds"] = maximum
+
+
+def validate_pressure_state(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) != {"routes", "maximum_skew_streak_seconds"}:
+        raise RuntimeError("invalid pressure state")
+    maximum = value["maximum_skew_streak_seconds"]
+    if not isinstance(maximum, (int, float)) or isinstance(maximum, bool) or not math.isfinite(float(maximum)) or maximum < 0:
+        raise RuntimeError("invalid pressure maximum")
+    if not isinstance(value["routes"], dict):
+        raise RuntimeError("invalid pressure routes")
+    for route, record in value["routes"].items():
+        if not ROUTE_BUCKET.fullmatch(str(route)) or not isinstance(record, dict) or set(record) != {
+            "last_sample_epoch", "last_eligible", "streak_seconds", "maximum_streak_seconds",
+        }:
+            raise RuntimeError("invalid pressure route")
+        if not isinstance(record["last_eligible"], list) or record["last_eligible"] != sorted(set(record["last_eligible"])) or any(
+            not SEAT_BUCKET.fullmatch(str(seat)) for seat in record["last_eligible"]
+        ):
+            raise RuntimeError("invalid pressure eligibility")
+        for name in ("last_sample_epoch", "streak_seconds", "maximum_streak_seconds"):
+            number = record[name]
+            if not isinstance(number, (int, float)) or isinstance(number, bool) or not math.isfinite(float(number)) or number < 0:
+                raise RuntimeError("invalid pressure route value")
+        if float(record["maximum_streak_seconds"]) < float(record["streak_seconds"]):
+            raise RuntimeError("invalid pressure streak")
+    expected_maximum = max(
+        (float(record["maximum_streak_seconds"]) for record in value["routes"].values()),
+        default=0.0,
+    )
+    if abs(float(maximum) - expected_maximum) > 0.001:
+        raise RuntimeError("invalid pressure maximum")
+
+
 def validate_slo_state(slo: Any) -> None:
     if not isinstance(slo, dict) or set(slo) != {
         "terminal_requests", "model_attempts", "deterministic_latencies_ms",
-        "selection_counts", "pressure_skew_violation_seconds", "pressure_skew_last_sample_epoch",
-        "eligible_routes",
+        "selection_counts", "eligible_routes",
     }:
         raise RuntimeError("invalid slo state")
     terminal_requests = slo["terminal_requests"]
@@ -719,12 +1040,6 @@ def validate_slo_state(slo: Any) -> None:
     ):
         raise RuntimeError("invalid slo selection counts")
     validate_eligible_routes(slo["eligible_routes"])
-    violation = slo["pressure_skew_violation_seconds"]
-    last = slo["pressure_skew_last_sample_epoch"]
-    if not isinstance(violation, (int, float)) or isinstance(violation, bool) or not math.isfinite(float(violation)) or violation < 0:
-        raise RuntimeError("invalid slo pressure duration")
-    if last is not None and (not isinstance(last, (int, float)) or isinstance(last, bool) or not math.isfinite(float(last))):
-        raise RuntimeError("invalid slo pressure time")
 
 
 def validate_eligible_routes(routes: Any) -> None:
@@ -906,7 +1221,6 @@ def apply_slo_events(slo: dict[str, Any], events: list[dict[str, str]], pressure
             seats = selection_counts.setdefault(route, {})
             seat = item["routing_seat_bucket"]
             seats[seat] = int(seats.get(seat, 0)) + 1
-    rows = pressure.get("seats", [])
     current_routes = {
         str(route["route_bucket"]): {
             str(seat["seat_bucket"]): int(seat["capacity"])
@@ -959,18 +1273,6 @@ def apply_slo_events(slo: dict[str, Any], events: list[dict[str, str]], pressure
             exposure["streak_seconds"] = 0.0
         record["last_sample_epoch"] = now
         record["last_seats"] = {}
-    pressure_values = sorted(int(row.get("concurrency_pressure_milli", 0)) for row in rows)
-    skewed = False
-    if len(pressure_values) >= 2:
-        midpoint = len(pressure_values) // 2
-        median = pressure_values[midpoint] if len(pressure_values) % 2 else (
-            pressure_values[midpoint - 1] + pressure_values[midpoint]
-        ) / 2
-        skewed = median > 0 and max(pressure_values) * 1000 > median * PRESSURE_SKEW_RATIO_MILLI
-    last = slo["pressure_skew_last_sample_epoch"]
-    if skewed and last is not None:
-        slo["pressure_skew_violation_seconds"] += max(0.0, min(now - float(last), MAX_SAMPLE_GAP_SECONDS))
-    slo["pressure_skew_last_sample_epoch"] = now
     slo["terminal_requests"] = terminal_requests
     slo["model_attempts"] = attempts
     slo["deterministic_latencies_ms"] = latencies
@@ -1073,7 +1375,6 @@ def slo_summary(slo: dict[str, Any]) -> dict[str, Any]:
         "first_attempt_acceptance": first_attempt_eligible > 0 and first_attempt_successes * 100 >= first_attempt_eligible * FIRST_ATTEMPT_SUCCESS_PERCENT,
         "minimum_deterministic_decisions": len(latencies) >= MIN_DETERMINISTIC_DECISIONS,
         "routing_overhead_p95": p95 is not None and p95 <= ROUTING_P95_LIMIT_MS,
-        "pressure_skew_duration": float(slo["pressure_skew_violation_seconds"]) <= PRESSURE_SKEW_MAX_SECONDS,
         "comparable_seat_coverage": bool(comparable_groups),
         "selection_balance": bool(comparable_groups) and fairness_ok,
     }
@@ -1086,7 +1387,6 @@ def slo_summary(slo: dict[str, Any]) -> dict[str, Any]:
         "first_attempt_successes": first_attempt_successes,
         "deterministic_decisions": len(latencies),
         "routing_overhead_p95_ms": p95,
-        "pressure_skew_violation_seconds": round(float(slo["pressure_skew_violation_seconds"]), 3),
         "selection_balance_groups": comparable_groups,
         "thresholds": {
             "minimum_eligible_requests": MIN_ELIGIBLE_REQUESTS,
@@ -1097,6 +1397,26 @@ def slo_summary(slo: dict[str, Any]) -> dict[str, Any]:
             "pressure_skew_max_seconds": PRESSURE_SKEW_MAX_SECONDS,
             "minimum_fair_route_selections": MIN_FAIR_ROUTE_SELECTIONS,
         },
+    }
+
+
+def pressure_summary(pressure: dict[str, Any]) -> dict[str, Any]:
+    maximum = round(float(pressure["maximum_skew_streak_seconds"]), 3)
+    return {
+        "maximum_skew_streak_seconds": maximum,
+        "within_limit": maximum <= PRESSURE_SKEW_MAX_SECONDS,
+        "route_count": len(pressure["routes"]),
+        "limit_seconds": PRESSURE_SKEW_MAX_SECONDS,
+    }
+
+
+def recovery_summary(recovery: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "completed_chains": int(recovery["completed"]),
+        "tracked_seats": len(recovery["seats"]),
+        "journal_seq": int(recovery["journal_cursor"]["seq"]),
+        "journal_hash": recovery["journal_cursor"]["hash"],
+        "events_sha256": recovery["events_sha256"],
     }
 
 
@@ -1119,6 +1439,11 @@ def lifecycle_summary(lifecycle: dict[str, Any]) -> dict[str, Any]:
         "cutoff": copy.deepcopy(cutoff),
         "terminal_outcomes": dict(lifecycle["outcomes"]),
     }
+
+
+def frozen_active_leases(lifecycle: dict[str, Any]) -> int:
+    cutoff = lifecycle.get("cutoff") or {}
+    return sum(int(value) for value in cutoff.get("frozen", {}).values())
 
 
 def make_sample(
@@ -1186,13 +1511,13 @@ def terminal_decision(state: dict[str, Any], now: float) -> dict[str, Any] | Non
         sample for sample in state["samples"]
         if quiescence is not None and float(sample["sampled_at_epoch"]) >= float(quiescence)
     ]
-    pressure_quiet = bool(
+    frozen_quiet = bool(
         quiescence is not None
         and quiescence_samples
         and float(quiescence_samples[0]["sampled_at_epoch"]) <= float(quiescence) + MAX_SAMPLE_GAP_SECONDS
         and float(quiescence_samples[-1]["sampled_at_epoch"]) >= float(quiescence) + EXPECTED_INTERVAL_SECONDS
         and all(
-            sample["observations"].get("pressure") == {"active_leases": 0, "active_seats": 0}
+            sample["observations"].get("pressure", {}).get("frozen_active_leases") == 0
             for sample in quiescence_samples
         )
     )
@@ -1202,11 +1527,12 @@ def terminal_decision(state: dict[str, Any], now: float) -> dict[str, Any] | Non
         and float(quiescence) + EXPECTED_INTERVAL_SECONDS <= deadline
         and now >= float(quiescence) + EXPECTED_INTERVAL_SECONDS
         and now <= deadline
-        and pressure_quiet
+        and frozen_quiet
     )
     accepted = bool(
         closed_in_time and aggregate["window_healthy"] and aggregate["continuity_healthy"]
-        and slo["sufficient_evidence"]
+        and slo["sufficient_evidence"] and pressure_summary(state["pressure"])["within_limit"]
+        and recovery_summary(state["recovery"])["completed_chains"] > 0
     )
     if not accepted and now < deadline and aggregate["window_healthy"] and aggregate["continuity_healthy"]:
         return None
@@ -1222,6 +1548,8 @@ def terminal_decision(state: dict[str, Any], now: float) -> dict[str, Any] | Non
         "aggregate": aggregate,
         "lifecycle": summary,
         "slo": slo,
+        "pressure": pressure_summary(state["pressure"]),
+        "recovery": recovery_summary(state["recovery"]),
     }
 
 
@@ -1241,6 +1569,8 @@ def status_document(state: dict[str, Any]) -> dict[str, Any]:
         "aggregate": aggregate,
         "lifecycle": summary,
         "slo": slo_summary(state["slo"]),
+        "pressure": pressure_summary(state["pressure"]),
+        "recovery": recovery_summary(state["recovery"]),
         "latest_sample": state["samples"][-1] if state["samples"] else None,
     }
 
@@ -1310,6 +1640,10 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
     )
     summary = apply_events(state["lifecycle"], events, now, state["baseline"])
     apply_slo_events(state["slo"], events, pressure, now)
+    apply_route_pressure(state["pressure"], pressure, now)
+    journal_events, journal_cursor = read_reconciler_journal(args.reconciler_journal, state["recovery"]["journal_cursor"])
+    apply_recovery_events(state["recovery"], journal_events)
+    state["recovery"]["journal_cursor"] = journal_cursor
     state["lifecycle"]["manual_toggles"] += telemetry["manual_toggles"]
     state["cursor"] = next_cursor
     reconciler_result = command("systemctl", "show", "cliproxy-account-reconciler.service", "-p", "Result", "--value")
@@ -1317,20 +1651,31 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
         "systemctl", "show", "cliproxy-account-reconciler.service", "-p", "ExecMainStatus", "--value"
     ) or "0")
     reconciler_result_observation = reconciler_result if reconciler_result in RECONCILER_RESULTS else "unknown"
-    strategy, auto_mode = routing_modes(args.config.read_text(encoding="utf-8", errors="replace"))
+    strategy, base_auto_mode = routing_modes(args.config.read_text(encoding="utf-8", errors="replace"))
+    router_policy = json.loads(args.router_config.read_text(encoding="utf-8"))
+    _, front_auto_mode = routing_modes(args.router_runtime_config.read_text(encoding="utf-8", errors="replace"))
+    front_policy_valid = bool(
+        isinstance(router_policy, dict)
+        and router_policy.get("schema_version") == 1
+        and isinstance(router_policy.get("listen"), dict)
+        and router_policy["listen"] == {"host": "127.0.0.1", "port": 8320}
+        and isinstance(router_policy.get("routing"), dict)
+    )
     telemetry_health = telemetry_tuple(pressure)
+    current_artifact_hashes = {name: sha256(getattr(args, argument)) for name, argument in ARTIFACT_ARGUMENTS.items()}
     checks = {
         "binary_hash": binary_hash == state["baseline"]["expected_binary_sha256"],
         "config_hash": config_hash == state["baseline"]["expected_config_sha256"],
         "verifier_hash": verifier_hash == state["baseline"]["expected_verifier_sha256"],
-        "auto_active": auto_mode == "active",
+        "base_auto_reject": base_auto_mode == "reject",
+        "front_auto_active": front_policy_valid and front_auto_mode == "exclusive",
         "least_pressure": strategy == "least-pressure",
         "crsproxy_active": command("systemctl", "is-active", "crsproxy.service") == "active",
         "nginx_active": command("systemctl", "is-active", "nginx") == "active",
         "reconciler_timer_active": command("systemctl", "is-active", "cliproxy-account-reconciler.timer") == "active",
         "reconciler_timer_enabled": command("systemctl", "is-enabled", "cliproxy-account-reconciler.timer") == "enabled",
         "reconciler_controller_completed": (reconciler_result, reconciler_status) in {("success", 0), ("exit-code", 1)},
-        "inventory_complete": len(reconcile) == 19,
+        "inventory_complete": len(reconcile) == 20,
         "reconcile_schema": reconcile_schema,
         "routable_capacity": states.get("ready", 0) > 0,
         "generation_converged": generation_mismatches == 0,
@@ -1345,14 +1690,23 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
         "no_manual_toggles": state["lifecycle"]["manual_toggles"] == 0,
         "log_continuity": telemetry["discontinuity"] == 0,
         "telemetry_complete": valid_telemetry_tuple(telemetry_health) and telemetry_health == baseline_telemetry(state["baseline"]),
+        "reconciler_journal_valid": True,
+        "route_pressure_streak": state["pressure"]["maximum_skew_streak_seconds"] <= PRESSURE_SKEW_MAX_SECONDS,
+        "auto_router_active": command("systemctl", "is-active", "cliproxy-auto-router.service") == "active",
     }
+    checks.update({ARTIFACT_CHECKS[name]: value == state["baseline"]["artifact_hashes"][name] for name, value in current_artifact_hashes.items()})
     observations = {
         "inventory": {"total": len(reconcile), "states": dict(states), "generation_mismatches": generation_mismatches, "ready_mismatches": ready_mismatches},
-        "pressure": {"active_leases": pressure.get("active_leases"), "active_seats": pressure.get("active_seats")},
+        "pressure": {
+            "active_leases": pressure.get("active_leases"), "active_seats": pressure.get("active_seats"),
+            "frozen_active_leases": frozen_active_leases(state["lifecycle"]),
+            "maximum_skew_streak_seconds": state["pressure"]["maximum_skew_streak_seconds"],
+        },
         "events": summary,
         "reconciler": {"result": reconciler_result_observation, "exec_main_status": reconciler_status},
         "manual_toggles": state["lifecycle"]["manual_toggles"],
         "telemetry": telemetry_health,
+        "artifacts": current_artifact_hashes,
     }
     return state, checks, observations
 
@@ -1380,7 +1734,11 @@ def initialise_state(args: argparse.Namespace, now: float, verifier_hash: str, b
     pressure = api_json("/v0/management/routing-pressure", management)
     if not valid_pressure_snapshot(pressure):
         raise RuntimeError("invalid baseline pressure")
-    baseline = new_baseline(now, binary_hash, config_hash, verifier_hash, log_metadata, pressure)
+    artifact_hashes = {name: sha256(getattr(args, argument)) for name, argument in ARTIFACT_ARGUMENTS.items()}
+    baseline = new_baseline(
+        now, binary_hash, config_hash, verifier_hash, log_metadata, pressure,
+        artifact_hashes, journal_anchor(args.reconciler_journal),
+    )
     return new_state(baseline)
 
 
@@ -1438,6 +1796,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=Path("/opt/crsproxy/config.yaml"))
     parser.add_argument("--management-env", type=Path, default=Path("/etc/crsproxy/management-general.env"))
     parser.add_argument("--reconciler-env", type=Path, default=Path("/etc/crsproxy/account-reconciler.env"))
+    parser.add_argument("--reconciler-journal", type=Path, default=Path("/var/lib/cliproxy-account-reconciler/journal.jsonl"))
+    parser.add_argument("--router-binary", type=Path, default=Path("/opt/crsproxy/auto-router/cliproxy-auto-router"))
+    parser.add_argument("--router-config", type=Path, default=Path("/etc/crsproxy/auto-router.yaml"))
+    parser.add_argument("--router-renderer", type=Path, default=Path("/opt/crsproxy/auto-router/render-config"))
+    parser.add_argument("--router-runtime-config", type=Path, default=Path("/run/cliproxy-auto-router/config.yaml"))
+    parser.add_argument("--router-service-unit", type=Path, default=Path("/etc/systemd/system/cliproxy-auto-router.service"))
+    parser.add_argument("--base-proxy-service-unit", type=Path, default=Path("/etc/systemd/system/crsproxy.service"))
+    parser.add_argument("--nginx-auto-router-config", type=Path, default=Path("/etc/nginx/conf.d/cliproxy-auto-router.conf"))
+    parser.add_argument("--reconciler-program", type=Path, default=Path("/opt/crsproxy/bin/account-reconciler"))
+    parser.add_argument("--reconciler-inventory", type=Path, default=Path("/etc/crsproxy/account-inventory.json"))
+    parser.add_argument("--reconciler-service-unit", type=Path, default=Path("/etc/systemd/system/cliproxy-account-reconciler.service"))
+    parser.add_argument("--reconciler-timer-unit", type=Path, default=Path("/etc/systemd/system/cliproxy-account-reconciler.timer"))
+    parser.add_argument("--soak-service-unit", type=Path, default=Path("/etc/systemd/system/cliproxy-smart-router-soak.service"))
+    parser.add_argument("--soak-timer-unit", type=Path, default=Path("/etc/systemd/system/cliproxy-smart-router-soak.timer"))
     return parser.parse_args(argv)
 
 

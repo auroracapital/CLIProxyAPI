@@ -242,7 +242,9 @@ type RoutingObservabilityConfig struct {
 type AutoRoutingConfig struct {
 	// Enabled is the legacy active-mode switch. Mode takes precedence when set.
 	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
-	// Mode controls semantic routing: off, shadow, or active.
+	// Mode controls semantic routing: off, reject, shadow, active, or exclusive. Reject
+	// reserves model "auto" for a separate front router; exclusive makes that front
+	// router accept only model "auto" and reject explicit model requests.
 	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
 	// MaxFallbacks limits the ordered model slate, including the primary model.
 	// Values below one use the default of three; values above five are clamped to five.

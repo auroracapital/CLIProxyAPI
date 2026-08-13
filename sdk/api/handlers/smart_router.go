@@ -99,7 +99,7 @@ func autoRoutingMode(cfg internalconfig.AutoRoutingConfig) string {
 		return "active"
 	}
 	switch mode {
-	case "active", "shadow":
+	case "active", "exclusive", "reject", "shadow":
 		return mode
 	default:
 		return "off"
@@ -109,13 +109,26 @@ func autoRoutingMode(cfg internalconfig.AutoRoutingConfig) string {
 func (h *BaseAPIHandler) smartRoute(model string, rawJSON []byte) (smartRouteDecision, bool) {
 	started := time.Now()
 	decision := smartRouteDecision{ScoreVersion: smartRouteScoreVersion}
-	if h == nil || !isAutoModel(model) {
+	if h == nil {
 		return decision, false
 	}
 	autoCfg := h.autoRoutingConfig()
 	decision.Mode = autoRoutingMode(autoCfg)
+	if !isAutoModel(model) {
+		if decision.Mode == "exclusive" {
+			decision.Reason = "auto_model_required"
+			decision.Duration = time.Since(started)
+			return decision, true
+		}
+		return decision, false
+	}
 	if decision.Mode == "off" {
 		return decision, false
+	}
+	if decision.Mode == "reject" {
+		decision.Reason = "separate_endpoint_required"
+		decision.Duration = time.Since(started)
+		return decision, true
 	}
 	requirements := classifySmartRoute(rawJSON)
 	configured := autoCfg.TaskModels[requirements.TaskClass]

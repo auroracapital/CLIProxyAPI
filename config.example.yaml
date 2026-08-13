@@ -209,8 +209,10 @@ routing:
   # Semantic routing is opt-in and only applies when the request model is exactly "auto".
   # Explicit model requests are never remapped.
   auto:
-    # mode: off records nothing, shadow records the decision without changing dispatch,
-    # and active routes model:auto through the selected slate. Legacy enabled:true maps to active.
+    # mode: off preserves legacy auto resolution; reject reserves model:auto for a
+    # separate front-router endpoint; shadow records without changing dispatch;
+    # active routes model:auto; and exclusive additionally rejects explicit models
+    # on an auto-only front endpoint. Legacy enabled:true maps to active.
     mode: off
     max-fallbacks: 3
     # default-models: ["claude-sonnet-5", "gpt-5.6-terra", "gemini-3.5-flash-low"]

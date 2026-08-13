@@ -53,6 +53,8 @@ func TestNormalizeAutoRoutingMode(t *testing.T) {
 		enabled bool
 	}{
 		{name: "legacy enabled", auto: AutoRoutingConfig{Enabled: true}, mode: "active", enabled: true},
+		{name: "separate endpoint", auto: AutoRoutingConfig{Enabled: true, Mode: " REJECT "}, mode: "reject"},
+		{name: "auto only endpoint", auto: AutoRoutingConfig{Mode: " EXCLUSIVE "}, mode: "exclusive"},
 		{name: "shadow", auto: AutoRoutingConfig{Enabled: true, Mode: " SHADOW "}, mode: "shadow"},
 		{name: "invalid fails off", auto: AutoRoutingConfig{Enabled: true, Mode: "invalid"}, mode: "off"},
 	} {

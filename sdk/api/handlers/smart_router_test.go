@@ -78,6 +78,35 @@ func TestSmartRouterOnlyRoutesExactAutoModel(t *testing.T) {
 	}
 }
 
+func TestSmartRouterRejectModeReservesAutoForSeparateEndpoint(t *testing.T) {
+	handler := smartRouterHandler(internalconfig.AutoRoutingConfig{Mode: "reject"})
+	decision := handler.applyModelRouter(context.Background(), "openai", "auto", []byte(`{"messages":[]}`), false, modelExecutionOptions{})
+	if !decision.AutoRouted || decision.Model != "" || decision.Reason != "separate_endpoint_required" {
+		t.Fatalf("decision = %#v, want rejected auto route", decision)
+	}
+	_, _, errMsg := handler.providersForExecution("auto", "auto", false, decision, modelExecutionOptions{})
+	if errMsg == nil || errMsg.StatusCode != 400 || !strings.Contains(errMsg.Error.Error(), "auto_router_endpoint_required") {
+		t.Fatalf("error = %#v, want explicit separate endpoint boundary", errMsg)
+	}
+
+	explicit := handler.applyModelRouter(context.Background(), "openai", "named-model", []byte(`{"messages":[]}`), false, modelExecutionOptions{})
+	if explicit.AutoRouted || explicit.Model != "" {
+		t.Fatalf("explicit decision = %#v, want unchanged explicit routing", explicit)
+	}
+}
+
+func TestSmartRouterExclusiveModeRejectsExplicitModels(t *testing.T) {
+	handler := smartRouterHandler(internalconfig.AutoRoutingConfig{Mode: "exclusive"})
+	decision := handler.applyModelRouter(context.Background(), "openai", "named-model", []byte(`{"messages":[]}`), false, modelExecutionOptions{})
+	if !decision.AutoRouted || decision.Model != "" || decision.Reason != "auto_model_required" {
+		t.Fatalf("decision = %#v, want auto-only endpoint rejection", decision)
+	}
+	_, _, errMsg := handler.providersForExecution("named-model", "named-model", false, decision, modelExecutionOptions{})
+	if errMsg == nil || errMsg.StatusCode != 400 || !strings.Contains(errMsg.Error.Error(), "auto_router_model_required") {
+		t.Fatalf("error = %#v, want explicit auto-only endpoint boundary", errMsg)
+	}
+}
+
 func TestSmartRouterClassifiesCodeAndReturnsOrderedLiveSlate(t *testing.T) {
 	registerSmartRouterModel(t, "smart-code-a-client", "codex", "smart-code-a", &registry.ModelInfo{SupportedParameters: []string{"tools", "response_format"}})
 	registerSmartRouterModel(t, "smart-code-b-client", "claude", "smart-code-b", &registry.ModelInfo{SupportedParameters: []string{"tools", "response_format"}})

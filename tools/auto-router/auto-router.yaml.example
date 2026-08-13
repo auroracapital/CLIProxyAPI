@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "listen": {
+    "host": "127.0.0.1",
+    "port": 8320
+  },
+  "base": {
+    "url": "http://127.0.0.1:8319/v1",
+    "provider": "cliproxy-base",
+    "models": [
+      "gpt-5.4",
+      "gpt-5.3-codex",
+      "claude-opus-4-6",
+      "claude-sonnet-4-6",
+      "gemini-3-pro-preview",
+      "gemini-3-flash-preview"
+    ]
+  },
+  "routing": {
+    "default_models": ["claude-sonnet-4-6", "gpt-5.4", "gemini-3-flash-preview"],
+    "task_models": {
+      "code": ["gpt-5.3-codex", "claude-sonnet-4-6", "gpt-5.4"],
+      "reasoning": ["claude-opus-4-6", "gpt-5.4", "gemini-3-pro-preview"],
+      "research": ["gemini-3-pro-preview", "claude-opus-4-6"],
+      "agent": ["claude-sonnet-4-6", "gpt-5.3-codex"],
+      "writing": ["claude-sonnet-4-6", "gpt-5.4"],
+      "general": ["claude-sonnet-4-6", "gpt-5.4", "gemini-3-flash-preview"]
+    },
+    "objective": "balanced",
+    "provider_strategy": "health"
+  }
+}

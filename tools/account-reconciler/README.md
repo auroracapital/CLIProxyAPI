@@ -8,6 +8,17 @@ Candidate files must be regular JSON files with mode `0600`, on the same filesys
 
 The inventory must exactly match the runtime `auth_index` and provider set. Missing, duplicate, extra, provider-mismatched, or path-ambiguous entries fail closed before mutation. Attempts are capped per seat per UTC day; failures use exponential backoff with jitter. Global, provider, and seat locks live below `RuntimeDirectory`.
 
+Applied lifecycle work is also recorded in `journal.jsonl` below
+`StateDirectory` (normally `/var/lib/cliproxy-account-reconciler`). The service
+creates this append-only JSONL file as mode `0600`. Each bounded record has a
+monotonic sequence, ISO timestamp, 32-character opaque HMAC seat bucket,
+categorical action/outcome/prior/result/reason, and a SHA-256 chain to the prior
+record. It never contains auth indexes, providers, models, identities, paths, or
+credential material. A malformed, truncated, symlinked, oversized, wrongly owned,
+or unwritable journal fails applied reconciliation closed. Verifiers can call
+`TransitionJournal.validated_cursor()` to establish the chain-validated baseline
+`{inode, offset, seq, hash}` and reject rotation, truncation, or chain drift.
+
 Use `--seat-key` for a single-seat canary. The value is the controller's 32-character opaque HMAC seat key from its categorical logs or state filename, never an auth index, identity, or path. The controller validates the complete inventory first and then applies the seat, provider, health, and maximum-seat filters together; an invalid, unknown, or contradictory selection fails before mutation.
 
 If an interrupted controller version records `rollback_failed`, use
