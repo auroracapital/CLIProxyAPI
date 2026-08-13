@@ -175,6 +175,14 @@ def command(*args: str) -> str:
     return subprocess.run(args, check=True, text=True, capture_output=True).stdout.strip()
 
 
+def command_equals(expected: str, *args: str) -> bool:
+    """Compare command output while treating an ordinary nonzero result as false."""
+    try:
+        return command(*args) == expected
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
 def legacy_reauth_is_fenced() -> bool:
     """Require both unsupported legacy reauth units to be condition-fenced and inactive."""
     try:
@@ -1849,8 +1857,8 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
         ),
         "single_reauth_owner": legacy_reauth_is_fenced(),
         "no_competing_reauth_processes": competing_reauth_processes_absent(args.proc_root),
-        "canary_timer_active": command("systemctl", "is-active", "cliproxy-smart-router-canary.timer") == "active",
-        "canary_timer_enabled": command("systemctl", "is-enabled", "cliproxy-smart-router-canary.timer") == "enabled",
+        "canary_timer_active": command_equals("active", "systemctl", "is-active", "cliproxy-smart-router-canary.timer"),
+        "canary_timer_enabled": command_equals("enabled", "systemctl", "is-enabled", "cliproxy-smart-router-canary.timer"),
         "canary_last_run_success": canary_result == "success" and canary_status == 0,
         "reconciler_journal_valid": True,
         "route_pressure_streak": state["pressure"]["maximum_skew_streak_seconds"] <= PRESSURE_SKEW_MAX_SECONDS,
