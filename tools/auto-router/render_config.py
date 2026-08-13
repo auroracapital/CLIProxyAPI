@@ -96,19 +96,24 @@ def load_policy(path: Path) -> dict[str, Any]:
     return policy
 
 
-def rendered_config(policy: dict[str, Any], client_key: str, base_key: str, state_dir: Path) -> dict[str, Any]:
+def rendered_config(
+    policy: dict[str, Any], client_key: str, base_key: str, management_key: str, state_dir: Path,
+) -> dict[str, Any]:
     base = policy["base"]
     routing = policy["routing"]
     return {
         "host": "127.0.0.1",
         "port": 8320,
         "tls": {"enable": False, "cert": "", "key": ""},
-        "remote-management": {"allow-remote": False, "secret-key": "", "disable-control-panel": True},
+        "remote-management": {
+            "allow-remote": False, "secret-key": management_key,
+            "disable-control-panel": True, "disable-auto-update-panel": True,
+        },
         "auth-dir": str(state_dir / "auths"),
         "api-keys": [client_key],
         "debug": False,
         "commercial-mode": True,
-        "logging-to-file": False,
+        "logging-to-file": True,
         "usage-statistics-enabled": False,
         "proxy-url": "",
         "request-retry": 2,
@@ -174,6 +179,7 @@ def main() -> int:
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--client-key-file", type=Path, required=True)
     parser.add_argument("--base-api-key-file", type=Path, required=True)
+    parser.add_argument("--management-key-file", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--state-directory", type=Path, default=Path("/var/lib/cliproxy-auto-router"))
     args = parser.parse_args()
@@ -182,6 +188,7 @@ def main() -> int:
         policy,
         regular_secret(args.client_key_file),
         regular_secret(args.base_api_key_file),
+        regular_secret(args.management_key_file),
         args.state_directory,
     )
     atomic_write(args.output, config)

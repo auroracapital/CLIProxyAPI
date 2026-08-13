@@ -66,7 +66,10 @@ class PureStateMachineTests(unittest.TestCase):
                 "maximum_skew_streak_seconds": 0.0,
             },
             "events": {}, "reconciler": {}, "manual_toggles": 0,
-            "telemetry": telemetry or {"instance": "p1_" + "a" * 32, "dropped": 0, "rejected": 0},
+            "telemetry": {
+                "base": telemetry or {"instance": "p1_" + "a" * 32, "dropped": 0, "rejected": 0},
+                "front": {"instance": "p1_" + "a" * 32, "dropped": 0, "rejected": 0},
+            },
             "artifacts": {name: "0" * 64 for name in soak.ARTIFACT_ARGUMENTS},
         }
 
@@ -649,13 +652,17 @@ class MainTransactionTests(unittest.TestCase):
         self.config = root / "config.yaml"
         self.management = root / "management.env"
         self.reconciler = root / "reconciler.env"
+        self.front_management = root / "front-management.env"
+        self.front_log = root / "front-main.log"
         self.journal = root / "journal.jsonl"
         self.artifacts = [root / f"artifact-{index}" for index in range(len(soak.ARTIFACT_ARGUMENTS))]
         self.log.write_text("", encoding="utf-8")
+        self.front_log.write_text("", encoding="utf-8")
         self.binary.write_bytes(b"binary")
         self.config.write_text("routing:\n  strategy: least-pressure\n  auto:\n    mode: reject\n", encoding="utf-8")
         self.management.write_text("MANAGEMENT_PASSWORD=x\n", encoding="utf-8")
         self.reconciler.write_text("CLIPROXY_RECONCILER_API_KEY=y\n", encoding="utf-8")
+        self.front_management.write_text("AUTO_ROUTER_MANAGEMENT_PASSWORD=z\n", encoding="utf-8")
         self.journal.write_bytes(b"")
         os.chmod(self.journal, 0o600)
         for artifact in self.artifacts:
@@ -676,6 +683,7 @@ class MainTransactionTests(unittest.TestCase):
             "--state-directory", str(self.state), "--log", str(self.log),
             "--binary", str(self.binary), "--config", str(self.config),
             "--management-env", str(self.management), "--reconciler-env", str(self.reconciler),
+            "--front-log", str(self.front_log), "--front-management-env", str(self.front_management),
             "--reconciler-journal", str(self.journal), *artifact_args,
         ]
 
@@ -698,7 +706,7 @@ class MainTransactionTests(unittest.TestCase):
         } for _ in range(20)]
         return {"credentials": rows}
 
-    def api(self, path: str, _token: str) -> object:
+    def api(self, path: str, _token: str, _base_url: str = "") -> object:
         return self.pressure() if path.endswith("routing-pressure") else self.reconcile()
 
     def command(self, *args: str) -> str:
@@ -738,6 +746,33 @@ class MainTransactionTests(unittest.TestCase):
         router.write_bytes(original)
         self.assertEqual(self.invoke(1120), 0)
         self.assertFalse(soak.evidence_aggregate(self.read_state())["window_healthy"])
+
+    def test_front_and_base_telemetry_are_independently_consumed(self) -> None:
+        self.assertEqual(self.invoke(1000), 0)
+        self.front_log.write_text(
+            "routing decision routing_schema_version=1 routing_stage=model_decision routing_mode=active "
+            "routing_task=code routing_score_version=v2 routing_model=gpt-5.6-sol routing_provider= "
+            "routing_reason=keyword_code routing_outcome=selected routing_attempt=0 "
+            "routing_candidate_count=1 routing_duration_ms=1 routing_selector= "
+            "routing_shadow_match=false routing_seat_bucket= routing_predicted_seat_bucket= "
+            "routing_request_bucket=r1_1111111111111111\n",
+            encoding="utf-8",
+        )
+        self.log.write_text(
+            "routing decision routing_schema_version=1 routing_stage=account_selection routing_mode=active "
+            "routing_task= routing_score_version= routing_model=gpt-5.6-sol routing_provider=codex "
+            "routing_reason= routing_outcome=selected routing_attempt=1 routing_candidate_count=0 "
+            "routing_duration_ms=0 routing_selector=least_pressure routing_shadow_match=false "
+            "routing_seat_bucket=h1_0123456789abcdef routing_predicted_seat_bucket= "
+            "routing_request_bucket=r1_2222222222222222\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.invoke(1060), 0)
+        state = self.read_state()
+        self.assertEqual(len(state["slo"]["deterministic_latencies_ms"]), 1)
+        self.assertEqual(sum(state["lifecycle"]["selected"].values()), 1)
+        self.assertGreater(state["front_cursor"]["offset"], 0)
+        self.assertGreater(state["cursor"]["offset"], 0)
 
     def test_snapshot_failure_records_incident_without_advancing_cursor(self) -> None:
         self.assertEqual(self.invoke(1000), 0)
@@ -808,7 +843,7 @@ class MainTransactionTests(unittest.TestCase):
         self.assertEqual(len(self.read_state()["samples"]), 1)
 
     def test_empty_reconcile_rows_cannot_green(self) -> None:
-        def bad_api(path: str, _token: str) -> object:
+        def bad_api(path: str, _token: str, _base_url: str = "") -> object:
             return self.pressure() if path.endswith("routing-pressure") else {"credentials": [{} for _ in range(20)]}
 
         with mock.patch.object(soak, "api_json", side_effect=bad_api), mock.patch.object(soak, "unauthenticated_status", return_value=401), mock.patch.object(soak, "command", side_effect=self.command):

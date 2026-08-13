@@ -278,9 +278,9 @@ def read_journal_bytes(path: Path) -> tuple[os.stat_result, bytes]:
         os.close(descriptor)
 
 
-def api_json(path: str, token: str) -> Any:
+def api_json(path: str, token: str, base_url: str = "http://127.0.0.1:8319") -> Any:
     request = urllib.request.Request(
-        "http://127.0.0.1:8319" + path,
+        base_url + path,
         headers={"Authorization": "Bearer " + token},
     )
     with urllib.request.urlopen(request, timeout=5) as response:
@@ -533,6 +533,8 @@ def new_baseline(
     pressure: dict[str, Any],
     artifact_hashes: dict[str, str] | None = None,
     reconciler_journal_cursor: dict[str, Any] | None = None,
+    front_log_metadata: os.stat_result | None = None,
+    front_pressure: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     pressure_rows = pressure.get("seats", [])
     allowance: dict[str, int] = {}
@@ -550,6 +552,10 @@ def new_baseline(
         "prefix_sha256": hashlib.sha256(b"").hexdigest(),
     })
     validate_journal_cursor(journal)
+    front_metadata = front_log_metadata or log_metadata
+    front_health = telemetry_tuple(front_pressure or pressure)
+    if not valid_telemetry_tuple(front_health):
+        raise RuntimeError("invalid front telemetry baseline")
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": uuid.uuid4().hex,
@@ -565,10 +571,15 @@ def new_baseline(
         "terminal_grace_seconds": TERMINAL_GRACE_SECONDS,
         "initial_log_inode": int(log_metadata.st_ino),
         "initial_log_offset": int(log_metadata.st_size),
+        "initial_front_log_inode": int(front_metadata.st_ino),
+        "initial_front_log_offset": int(front_metadata.st_size),
         "startup_allowance": allowance,
         "telemetry_instance": pressure.get("telemetry_instance"),
         "routing_events_dropped": pressure.get("routing_events_dropped"),
         "routing_events_rejected": pressure.get("routing_events_rejected"),
+        "front_telemetry_instance": front_health["instance"],
+        "front_routing_events_dropped": front_health["dropped"],
+        "front_routing_events_rejected": front_health["rejected"],
         "artifact_hashes": hashes,
         "reconciler_journal_cursor": journal,
         "reconciler_journal_cursor_sha256": object_hash(journal),
@@ -589,9 +600,11 @@ def validate_baseline(baseline: dict[str, Any], now: float) -> None:
     required = set(exact) | {
         "run_id", "started_at_epoch", "soak_cutoff_epoch", "expected_binary_sha256",
         "expected_config_sha256", "expected_verifier_sha256", "initial_log_inode",
-        "initial_log_offset", "startup_allowance", "telemetry_instance",
+        "initial_log_offset", "initial_front_log_inode", "initial_front_log_offset",
+        "startup_allowance", "telemetry_instance",
         "routing_events_dropped", "routing_events_rejected", "artifact_hashes",
         "reconciler_journal_cursor", "reconciler_journal_cursor_sha256",
+        "front_telemetry_instance", "front_routing_events_dropped", "front_routing_events_rejected",
     }
     if set(baseline) != required:
         raise RuntimeError("invalid baseline fields")
@@ -607,7 +620,9 @@ def validate_baseline(baseline: dict[str, Any], now: float) -> None:
         "expected_binary_sha256", "expected_config_sha256", "expected_verifier_sha256"
     )):
         raise RuntimeError("invalid baseline hash")
-    if int(baseline["initial_log_inode"]) < 0 or int(baseline["initial_log_offset"]) < 0:
+    if any(int(baseline[name]) < 0 for name in (
+        "initial_log_inode", "initial_log_offset", "initial_front_log_inode", "initial_front_log_offset",
+    )):
         raise RuntimeError("invalid baseline cursor")
     artifact_hashes = baseline["artifact_hashes"]
     if not isinstance(artifact_hashes, dict) or set(artifact_hashes) != set(ARTIFACT_ARGUMENTS) or any(
@@ -624,6 +639,8 @@ def validate_baseline(baseline: dict[str, Any], now: float) -> None:
         value = baseline[name]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise RuntimeError("invalid baseline telemetry counter")
+    if not valid_telemetry_tuple(front_baseline_telemetry(baseline)):
+        raise RuntimeError("invalid front baseline telemetry")
     allowance = baseline["startup_allowance"]
     if not isinstance(allowance, dict) or any(
         not SEAT_BUCKET.fullmatch(str(key)) or not isinstance(value, int) or value < 0
@@ -640,6 +657,9 @@ def new_state(baseline: dict[str, Any]) -> dict[str, Any]:
         "baseline": baseline,
         "baseline_sha256": baseline_sha,
         "cursor": {"inode": baseline["initial_log_inode"], "offset": baseline["initial_log_offset"]},
+        "front_cursor": {
+            "inode": baseline["initial_front_log_inode"], "offset": baseline["initial_front_log_offset"],
+        },
         "lifecycle": {
             "selected": {}, "terminal": {}, "startup_terminal": {}, "outcomes": {},
             "startup_allowance": dict(baseline["startup_allowance"]),
@@ -728,9 +748,14 @@ def validate_sample(sample: dict[str, Any], state: dict[str, Any], index: int, p
         if not isinstance(observations["manual_toggles"], int) or isinstance(observations["manual_toggles"], bool) or observations["manual_toggles"] < 0:
             raise RuntimeError("invalid evidence manual toggles")
         telemetry = observations.get("telemetry")
-        if not valid_telemetry_tuple(telemetry):
+        if not isinstance(telemetry, dict) or set(telemetry) != {"base", "front"} or not all(
+            valid_telemetry_tuple(telemetry[name]) for name in ("base", "front")
+        ):
             raise RuntimeError("invalid evidence telemetry")
-        expected_complete = telemetry == baseline_telemetry(state["baseline"])
+        expected_complete = (
+            telemetry["base"] == baseline_telemetry(state["baseline"])
+            and telemetry["front"] == front_baseline_telemetry(state["baseline"])
+        )
         if checks.get("telemetry_complete") is not expected_complete:
             raise RuntimeError("invalid evidence telemetry check")
     return actual_hash
@@ -738,7 +763,7 @@ def validate_sample(sample: dict[str, Any], state: dict[str, Any], index: int, p
 
 def validate_state(state: dict[str, Any], now: float) -> None:
     required = {
-        "schema_version", "run_id", "baseline", "baseline_sha256", "cursor", "lifecycle",
+        "schema_version", "run_id", "baseline", "baseline_sha256", "cursor", "front_cursor", "lifecycle",
         "recovery", "pressure", "slo", "samples", "terminal",
     }
     if set(state) != required or state.get("schema_version") != SCHEMA_VERSION:
@@ -752,6 +777,9 @@ def validate_state(state: dict[str, Any], now: float) -> None:
     cursor = state.get("cursor")
     if not isinstance(cursor, dict) or set(cursor) != {"inode", "offset"} or int(cursor["inode"]) < 0 or int(cursor["offset"]) < 0:
         raise RuntimeError("invalid cursor")
+    front_cursor = state.get("front_cursor")
+    if not isinstance(front_cursor, dict) or set(front_cursor) != {"inode", "offset"} or int(front_cursor["inode"]) < 0 or int(front_cursor["offset"]) < 0:
+        raise RuntimeError("invalid front cursor")
     lifecycle = state.get("lifecycle")
     if not isinstance(lifecycle, dict) or not isinstance(state.get("samples"), list):
         raise RuntimeError("invalid state payload")
@@ -1309,6 +1337,14 @@ def baseline_telemetry(baseline: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def front_baseline_telemetry(baseline: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "instance": baseline["front_telemetry_instance"],
+        "dropped": baseline["front_routing_events_dropped"],
+        "rejected": baseline["front_routing_events_rejected"],
+    }
+
+
 def valid_telemetry_tuple(value: Any) -> bool:
     return bool(
         isinstance(value, dict)
@@ -1620,10 +1656,26 @@ def preflight_terminal(directory: Path, terminal: dict[str, Any]) -> None:
 
 
 def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifier_hash: str, binary_hash: str, config_hash: str) -> tuple[dict[str, Any], dict[str, bool], dict[str, Any]]:
-    events, next_cursor, telemetry = read_events(args.log, state["cursor"])
+    base_events, next_cursor, telemetry = read_events(args.log, state["cursor"])
+    front_events, next_front_cursor, front_log_telemetry = read_events(args.front_log, state["front_cursor"])
+    # The front owns end-to-end semantic model attempts; the base owns real
+    # provider-account attempts. Request IDs intentionally change across the
+    # loopback hop, so never merge the front's synthetic compatibility seat
+    # attempts with the base's authenticated-seat lifecycle.
+    events = [
+        event for event in front_events
+        if event["routing_stage"] in {"model_decision", "model_attempt", "stream_attempt", "count_attempt"}
+    ] + [
+        event for event in base_events
+        if event["routing_stage"] in {"account_selection", "account_attempt"}
+    ]
     management = load_env(args.management_env)["MANAGEMENT_PASSWORD"]
     reconciler = load_env(args.reconciler_env)["CLIPROXY_RECONCILER_API_KEY"]
+    front_management = load_env(args.front_management_env)["AUTO_ROUTER_MANAGEMENT_PASSWORD"]
     pressure = api_json("/v0/management/routing-pressure", management)
+    front_pressure = api_json(
+        "/v0/management/routing-pressure", front_management, "http://127.0.0.1:8320",
+    )
     reconcile = api_json("/v0/management/auth-files/reconcile-status", reconciler)["credentials"]
     pressure_rows = pressure.get("seats", [])
     eligible_routes = pressure.get("eligible_routes", [])
@@ -1646,6 +1698,7 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
     state["recovery"]["journal_cursor"] = journal_cursor
     state["lifecycle"]["manual_toggles"] += telemetry["manual_toggles"]
     state["cursor"] = next_cursor
+    state["front_cursor"] = next_front_cursor
     reconciler_result = command("systemctl", "show", "cliproxy-account-reconciler.service", "-p", "Result", "--value")
     reconciler_status = int(command(
         "systemctl", "show", "cliproxy-account-reconciler.service", "-p", "ExecMainStatus", "--value"
@@ -1662,6 +1715,7 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
         and isinstance(router_policy.get("routing"), dict)
     )
     telemetry_health = telemetry_tuple(pressure)
+    front_telemetry_health = telemetry_tuple(front_pressure)
     current_artifact_hashes = {name: sha256(getattr(args, argument)) for name, argument in ARTIFACT_ARGUMENTS.items()}
     checks = {
         "binary_hash": binary_hash == state["baseline"]["expected_binary_sha256"],
@@ -1683,13 +1737,20 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
         "pressure_consistent": pressure_consistent,
         "pressure_protected": unauthenticated_status("/v0/management/routing-pressure") == 401,
         "telemetry_schema": telemetry["invalid"] == 0,
-        "telemetry_privacy": telemetry["sensitive"] == 0,
+        "telemetry_privacy": telemetry["sensitive"] == 0 and front_log_telemetry["sensitive"] == 0,
         "no_duplicate_events": summary["duplicate_selected"] == 0 and summary["duplicate_terminal"] == 0,
         "no_reused_seat_attempts": summary["reused_seat_attempts"] == 0,
         "no_orphan_terminal_events": summary["unmatched_terminal"] == 0,
         "no_manual_toggles": state["lifecycle"]["manual_toggles"] == 0,
         "log_continuity": telemetry["discontinuity"] == 0,
-        "telemetry_complete": valid_telemetry_tuple(telemetry_health) and telemetry_health == baseline_telemetry(state["baseline"]),
+        "telemetry_complete": (
+            valid_telemetry_tuple(telemetry_health)
+            and telemetry_health == baseline_telemetry(state["baseline"])
+            and front_log_telemetry["invalid"] == 0
+            and front_log_telemetry["discontinuity"] == 0
+            and valid_telemetry_tuple(front_telemetry_health)
+            and front_telemetry_health == front_baseline_telemetry(state["baseline"])
+        ),
         "reconciler_journal_valid": True,
         "route_pressure_streak": state["pressure"]["maximum_skew_streak_seconds"] <= PRESSURE_SKEW_MAX_SECONDS,
         "auto_router_active": command("systemctl", "is-active", "cliproxy-auto-router.service") == "active",
@@ -1705,7 +1766,7 @@ def snapshot(args: argparse.Namespace, state: dict[str, Any], now: float, verifi
         "events": summary,
         "reconciler": {"result": reconciler_result_observation, "exec_main_status": reconciler_status},
         "manual_toggles": state["lifecycle"]["manual_toggles"],
-        "telemetry": telemetry_health,
+        "telemetry": {"base": telemetry_health, "front": front_telemetry_health},
         "artifacts": current_artifact_hashes,
     }
     return state, checks, observations
@@ -1730,14 +1791,19 @@ def valid_reconcile_row(row: Any) -> bool:
 
 def initialise_state(args: argparse.Namespace, now: float, verifier_hash: str, binary_hash: str, config_hash: str) -> dict[str, Any]:
     log_metadata = args.log.stat()
+    front_log_metadata = args.front_log.stat()
     management = load_env(args.management_env)["MANAGEMENT_PASSWORD"]
     pressure = api_json("/v0/management/routing-pressure", management)
+    front_management = load_env(args.front_management_env)["AUTO_ROUTER_MANAGEMENT_PASSWORD"]
+    front_pressure = api_json(
+        "/v0/management/routing-pressure", front_management, "http://127.0.0.1:8320",
+    )
     if not valid_pressure_snapshot(pressure):
         raise RuntimeError("invalid baseline pressure")
     artifact_hashes = {name: sha256(getattr(args, argument)) for name, argument in ARTIFACT_ARGUMENTS.items()}
     baseline = new_baseline(
         now, binary_hash, config_hash, verifier_hash, log_metadata, pressure,
-        artifact_hashes, journal_anchor(args.reconciler_journal),
+        artifact_hashes, journal_anchor(args.reconciler_journal), front_log_metadata, front_pressure,
     )
     return new_state(baseline)
 
@@ -1792,10 +1858,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-directory", type=Path, default=Path("/var/lib/cliproxy-smart-router-soak"))
     parser.add_argument("--log", type=Path, default=Path("/opt/crsproxy/logs/main.log"))
+    parser.add_argument("--front-log", type=Path, default=Path("/var/lib/cliproxy-auto-router/auths/logs/main.log"))
     parser.add_argument("--binary", type=Path, default=Path("/opt/crsproxy/cli-proxy-api"))
     parser.add_argument("--config", type=Path, default=Path("/opt/crsproxy/config.yaml"))
     parser.add_argument("--management-env", type=Path, default=Path("/etc/crsproxy/management-general.env"))
     parser.add_argument("--reconciler-env", type=Path, default=Path("/etc/crsproxy/account-reconciler.env"))
+    parser.add_argument("--front-management-env", type=Path, default=Path("/etc/crsproxy/auto-router-management.env"))
     parser.add_argument("--reconciler-journal", type=Path, default=Path("/var/lib/cliproxy-account-reconciler/journal.jsonl"))
     parser.add_argument("--router-binary", type=Path, default=Path("/opt/crsproxy/auto-router/cliproxy-auto-router"))
     parser.add_argument("--router-config", type=Path, default=Path("/etc/crsproxy/auto-router.yaml"))

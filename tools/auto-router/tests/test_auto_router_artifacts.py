@@ -36,10 +36,13 @@ class AutoRouterArtifactTests(unittest.TestCase):
 
     def test_rendered_config_is_loopback_only_and_forwards_explicit_models(self) -> None:
         policy = self.policy()
-        config = renderer.rendered_config(policy, "front-secret", "base-secret", Path("/var/lib/cliproxy-auto-router"))
+        config = renderer.rendered_config(
+            policy, "front-secret", "base-secret", "management-secret", Path("/var/lib/cliproxy-auto-router")
+        )
         self.assertEqual((config["host"], config["port"]), ("127.0.0.1", 8320))
         self.assertTrue(config["commercial-mode"])
-        self.assertFalse(config["logging-to-file"])
+        self.assertTrue(config["logging-to-file"])
+        self.assertEqual(config["remote-management"]["secret-key"], "management-secret")
         self.assertEqual(config["routing"]["auto"]["mode"], "exclusive")
         provider = config["openai-compatibility"][0]
         self.assertEqual(provider["base-url"], "http://127.0.0.1:8319/v1")
@@ -57,8 +60,10 @@ class AutoRouterArtifactTests(unittest.TestCase):
             policy_path.write_text(json.dumps(self.policy()), encoding="utf-8")
             client_key = root / "client-key"
             base_key = root / "base-key"
+            management_key = root / "management-key"
             client_key.write_text("front-secret\n", encoding="utf-8")
             base_key.write_text("base-secret\n", encoding="utf-8")
+            management_key.write_text("management-secret\n", encoding="utf-8")
             policy = renderer.load_policy(policy_path)
             output = root / "run" / "config.yaml"
             renderer.atomic_write(
@@ -67,6 +72,7 @@ class AutoRouterArtifactTests(unittest.TestCase):
                     policy,
                     renderer.regular_secret(client_key),
                     renderer.regular_secret(base_key),
+                    renderer.regular_secret(management_key),
                     root / "state",
                 ),
             )
@@ -76,6 +82,7 @@ class AutoRouterArtifactTests(unittest.TestCase):
             rendered = output.read_text(encoding="utf-8")
             self.assertIn("front-secret", rendered)
             self.assertIn("base-secret", rendered)
+            self.assertIn("management-secret", rendered)
 
     def test_renderer_rejects_symlinked_output_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -107,6 +114,7 @@ class AutoRouterArtifactTests(unittest.TestCase):
         self.assertIn("SupplementaryGroups=crsproxy", unit)
         self.assertIn("LoadCredential=client-key:/etc/crsproxy/auto-router-client-key", unit)
         self.assertIn("LoadCredential=base-api-key:/etc/crsproxy/auto-router-base-api-key", unit)
+        self.assertIn("LoadCredential=management-key:/etc/crsproxy/auto-router-management-key", unit)
         self.assertIn("IPAddressAllow=localhost", unit)
         self.assertIn("-config /run/cliproxy-auto-router/config.yaml --local-model", unit)
         self.assertNotIn("Environment=", unit)

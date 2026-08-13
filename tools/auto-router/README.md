@@ -30,10 +30,12 @@ Install the secret-free policy as `/etc/crsproxy/auto-router.yaml` from
 the renderer intentionally accepts only this constrained schema. List every model
 the base service may receive and ensure all routing slates reference that list.
 
-Place the two runtime secrets in root-owned mode-`0600` files:
+Place the three runtime secrets in root-owned mode-`0600` files:
 
 - `/etc/crsproxy/auto-router-client-key`: key accepted by the `:8321` front.
 - `/etc/crsproxy/auto-router-base-api-key`: existing key accepted by base `:8319`.
+- `/etc/crsproxy/auto-router-management-key`: independent loopback-only key used
+  by the acceptance verifier to read front telemetry counters.
 
 The systemd credentials mechanism exposes them only to the service. `render-config`
 combines them with the policy into `/run/cliproxy-auto-router/config.yaml`, mode
@@ -46,6 +48,7 @@ persistent policy. The generated runtime file disappears with the runtime direct
 /etc/crsproxy/auto-router.yaml
 /etc/crsproxy/auto-router-client-key
 /etc/crsproxy/auto-router-base-api-key
+/etc/crsproxy/auto-router-management-key
 /etc/systemd/system/cliproxy-auto-router.service
 /etc/nginx/conf.d/cliproxy-auto-router.conf
 /opt/crsproxy/auto-router/cliproxy-auto-router
