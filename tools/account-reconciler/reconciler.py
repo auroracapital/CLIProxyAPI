@@ -707,6 +707,9 @@ class Controller:
         logger: logging.Logger | None = None,
         now: Any = None,
         rng: random.Random | None = None,
+        max_seats: int = 0,
+        only_healthy: bool = False,
+        force_probe: bool = False,
     ):
         self.inventory = inventory
         self.api = api
@@ -718,6 +721,9 @@ class Controller:
         self.now = now or (lambda: dt.datetime.now(UTC))
         self.rng = rng or random.SystemRandom()
         self.store = StateStore(state_dir, self.now)
+        self.max_seats = max_seats
+        self.only_healthy = only_healthy
+        self.force_probe = force_probe
 
     def run(self) -> int:
         with file_lock(self.runtime_dir / "locks" / "global.lock") as global_acquired:
@@ -727,8 +733,15 @@ class Controller:
             remote = self.api.status()
             validate_complete_inventory(self.inventory, remote)
             by_index = {row["auth_index"]: row for row in remote}
+            seats = list(self.inventory.seats)
+            if self.only_healthy:
+                seats = [seat for seat in seats if self._remote_credential_is_healthy(by_index[seat.auth_index])]
+            if self.max_seats > 0:
+                seats = seats[: self.max_seats]
+            if not seats:
+                raise InventoryError("canary selection is empty")
             failures = 0
-            for seat in self.inventory.seats:
+            for seat in seats:
                 if not self._reconcile_locked(seat, by_index[seat.auth_index]):
                     failures += 1
             return 1 if failures else 0
@@ -776,6 +789,7 @@ class Controller:
                     or info.st_gid != os.getegid()
                     or state != "ready"
                     or not self._remote_credential_is_healthy(remote)
+                    or self.force_probe
                 )
             except (OSError, PromotionError):
                 return self._fail(seat, seat_key, int(persisted.get("attempts", 0)), "candidate_invalid", "misconfigured", "failed")
@@ -960,6 +974,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--runtime-directory", type=Path, default=Path(os.environ.get("RUNTIME_DIRECTORY", "/run/cliproxy-account-reconciler")))
     parser.add_argument("--base-url", default="http://127.0.0.1:8319")
     parser.add_argument("--apply", action="store_true", help="perform mutations; the default is dry-run")
+    parser.add_argument("--max-seats", type=int, default=0, help="after full validation, reconcile at most this many seats")
+    parser.add_argument("--only-healthy", action="store_true", help="select canary seats from currently healthy runtime credentials")
+    parser.add_argument("--force-probe", action="store_true", help="atomically normalize and exact-probe selected seats even when healthy")
     return parser.parse_args(argv)
 
 
@@ -968,6 +985,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parse_args(argv)
         inventory = load_inventory(args.inventory)
+        if args.max_seats < 0 or args.max_seats > len(inventory.seats):
+            raise InventoryError("max seats is invalid")
         api = APIAdapter(args.base_url, os.environ.get("CLIPROXY_RECONCILER_API_KEY", ""))
         controller = Controller(
             inventory,
@@ -976,6 +995,9 @@ def main(argv: list[str] | None = None) -> int:
             args.runtime_directory,
             load_hmac_key(),
             apply=args.apply,
+            max_seats=args.max_seats,
+            only_healthy=args.only_healthy,
+            force_probe=args.force_probe,
             logger=logger,
         )
         return controller.run()

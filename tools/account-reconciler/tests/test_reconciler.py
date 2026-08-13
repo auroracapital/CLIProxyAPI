@@ -439,7 +439,7 @@ class PromotionTests(unittest.TestCase):
             write_json(seat.candidate_path, {"provider": "claude", "refresh_token": "new"})
             inventory = reconciler.Inventory((seat,), 3, 10, 80)
             api = FakeAPI(probe="retryable")
-            controller = reconciler.Controller(
+            controller = ImmediateReloadController(
                 inventory,
                 api,
                 root / "state",
@@ -505,6 +505,30 @@ class PromotionTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
+    def test_apply_canary_validates_full_inventory_but_reconciles_one_healthy_seat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical = root / "auths" / "healthy.json"
+            candidate = root / "auths" / "healthy-candidate.json"
+            write_json(canonical, {"provider": "claude", "refresh_token": "token", "account_id": "healthy"})
+            seats = (
+                reconciler.Seat("healthy", "claude", "probe-model", canonical, candidate, ("refresh_token",), (("account_id", "healthy"),)),
+                reconciler.Seat("unhealthy", "claude", "probe-model"),
+            )
+            api = FakeAPI(rows=[
+                remote_row(auth_index="healthy"),
+                remote_row(auth_index="unhealthy", credential_status="error", unavailable=True),
+            ])
+            controller = ImmediateReloadController(
+                reconciler.Inventory(seats), api, root / "state", root / "run", HMAC_KEY,
+                apply=True, max_seats=1, only_healthy=True, force_probe=True,
+                logger=reconciler.configure_logging(io.StringIO()), now=lambda: NOW,
+            )
+            self.assertEqual(controller.run(), 0)
+            self.assertFalse(any("unhealthy" in call for call in api.calls))
+            self.assertTrue(any(call[0] == "refresh" for call in api.calls))
+            self.assertTrue(any(call[0] == "probe" for call in api.calls))
+
     def test_probe_preserves_categorical_outcome_from_non_2xx(self):
         adapter = HTTPErrorAdapter("http://127.0.0.1:8319")
         seat = reconciler.Seat("index-alpha", "claude", "probe-model")
