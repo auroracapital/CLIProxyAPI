@@ -2,8 +2,12 @@ package management
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -90,16 +94,30 @@ func (h *Handler) GetAuthReconcileStatus(c *gin.Context) {
 		if !isReconcileManagedAuth(auth) {
 			continue
 		}
+		generation, durableDisabled, errGeneration := h.authManager.ReconcileCredentialGeneration(c.Request.Context(), auth.ID)
+		if errGeneration != nil {
+			// The controller's transaction contract is meaningful only when the
+			// backing store can prove the durable generation. Returning partial
+			// inventory would make an unsupported or unhealthy store look like an
+			// ordinary credential problem, so fail the whole snapshot closed.
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "durable credential generations unavailable"})
+			return
+		}
+		generation = opaqueReconcileGeneration(h.reconcilerPassword, generation)
+		runtimeGeneration := opaqueReconcileGeneration(h.reconcilerPassword, strings.TrimSpace(auth.Attributes[coreauth.AttributeSourceGeneration]))
 		items = append(items, gin.H{
-			"auth_index":        lockedAuthIndex(auth),
-			"provider":          strings.ToLower(strings.TrimSpace(auth.Provider)),
-			"credential_status": reconcileCredentialStatus(auth.Status),
-			"disabled":          auth.Disabled,
-			"unavailable":       auth.Unavailable,
-			"state":             auth.ReconcileState,
-			"reason":            auth.ReconcileReason,
-			"next_attempt":      auth.ReconcileNextAttempt,
-			"updated_at":        auth.UpdatedAt,
+			"auth_index":         lockedAuthIndex(auth),
+			"provider":           strings.ToLower(strings.TrimSpace(auth.Provider)),
+			"credential_status":  reconcileCredentialStatus(auth.Status),
+			"disabled":           auth.Disabled,
+			"unavailable":        auth.Unavailable,
+			"state":              auth.ReconcileState,
+			"reason":             auth.ReconcileReason,
+			"next_attempt":       auth.ReconcileNextAttempt,
+			"updated_at":         auth.UpdatedAt,
+			"generation":         generation,
+			"runtime_generation": runtimeGeneration,
+			"durable_disabled":   durableDisabled,
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"credentials": items})
@@ -173,6 +191,8 @@ func (h *Handler) SetAuthReconcileState(c *gin.Context) {
 		State       coreauth.ReconcileState `json:"state"`
 		Reason      string                  `json:"reason"`
 		NextAttempt time.Time               `json:"next_attempt"`
+		Generation  string                  `json:"generation"`
+		Disabled    *bool                   `json:"disabled"`
 	}
 	if errBind := c.ShouldBindJSON(&req); errBind != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -183,12 +203,35 @@ func (h *Handler) SetAuthReconcileState(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "credential not found"})
 		return
 	}
-	updated, errSet := h.authManager.SetReconcileState(c.Request.Context(), auth.ID, req.State, req.Reason, req.NextAttempt)
-	if errSet != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "reconcile state update failed"})
+	if len(strings.TrimSpace(req.Generation)) != 64 {
+		c.JSON(http.StatusPreconditionRequired, gin.H{"error": "credential generation required"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"auth_index": lockedAuthIndex(updated), "state": updated.ReconcileState})
+	rawGeneration, _, errGeneration := h.authManager.ReconcileCredentialGeneration(c.Request.Context(), auth.ID)
+	if errGeneration != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "reconcile state update failed"})
+		return
+	}
+	if opaqueReconcileGeneration(h.reconcilerPassword, rawGeneration) != strings.ToLower(strings.TrimSpace(req.Generation)) {
+		c.JSON(http.StatusPreconditionFailed, gin.H{"error": "reconcile state update failed"})
+		return
+	}
+	updated, generation, errSet := h.authManager.SetReconcileStateCAS(c.Request.Context(), auth.ID, rawGeneration, req.State, req.Reason, req.NextAttempt, req.Disabled)
+	if errSet != nil {
+		status := http.StatusBadRequest
+		if errors.Is(errSet, coreauth.ErrReconcileGenerationMismatch) {
+			status = http.StatusPreconditionFailed
+		} else {
+			var committed *coreauth.ReconcileCommittedError
+			if errors.As(errSet, &committed) {
+				c.JSON(http.StatusConflict, gin.H{"error": "reconcile state committed but runtime publication failed", "outcome": "committed", "generation": opaqueReconcileGeneration(h.reconcilerPassword, committed.Generation)})
+				return
+			}
+		}
+		c.JSON(status, gin.H{"error": "reconcile state update failed"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"auth_index": lockedAuthIndex(updated), "state": updated.ReconcileState, "generation": opaqueReconcileGeneration(h.reconcilerPassword, generation), "disabled": updated.Disabled})
 }
 
 func (h *Handler) RefreshAuthCredential(c *gin.Context) {
@@ -212,7 +255,23 @@ func (h *Handler) RefreshAuthCredential(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"outcome": reconcileFailureOutcome(status)})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"outcome": "succeeded"})
+	generation, disabled, errGeneration := h.authManager.ReconcileCredentialGeneration(c.Request.Context(), auth.ID)
+	if errGeneration != nil {
+		c.JSON(http.StatusConflict, gin.H{"outcome": "retryable"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"outcome": "succeeded", "generation": opaqueReconcileGeneration(h.reconcilerPassword, generation), "disabled": disabled})
+}
+
+func opaqueReconcileGeneration(secret, generation string) string {
+	secret = strings.TrimSpace(secret)
+	generation = strings.ToLower(strings.TrimSpace(generation))
+	if secret == "" || len(generation) != 64 {
+		return ""
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte("reconcile-generation\x00" + generation))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func reconcileFailureOutcome(status int) string {
@@ -237,7 +296,6 @@ func (h *Handler) ProbeAuthCredential(c *gin.Context) {
 		AuthIndex string          `json:"auth_index"`
 		Model     string          `json:"model"`
 		Payload   json.RawMessage `json:"payload"`
-		Admit     bool            `json:"admit"`
 	}
 	if errBind := c.ShouldBindJSON(&req); errBind != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -253,12 +311,6 @@ func (h *Handler) ProbeAuthCredential(c *gin.Context) {
 	if errProbe != nil {
 		c.JSON(http.StatusBadGateway, outcome)
 		return
-	}
-	if req.Admit {
-		if _, errAdmit := h.authManager.AdmitCredential(c.Request.Context(), auth.ID, outcome); errAdmit != nil {
-			c.JSON(http.StatusConflict, gin.H{"outcome": "admission_rejected"})
-			return
-		}
 	}
 	c.JSON(http.StatusOK, outcome)
 }

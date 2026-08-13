@@ -6,12 +6,14 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	sdkauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -25,11 +27,34 @@ type managementProbeExecutor struct {
 
 type managementReconcileStore struct{}
 
+type managementUnsupportedStore struct{}
+
+type managementCommittedStore struct {
+	managementReconcileStore
+	manager *coreauth.Manager
+}
+
+func (s *managementCommittedStore) SaveReconcileCAS(_ context.Context, auth *coreauth.Auth, _ string) (string, string, error) {
+	if s.manager != nil {
+		s.manager.Remove(context.Background(), auth.ID)
+	}
+	return "saved", strings.Repeat("b", 64), nil
+}
+
 func (*managementReconcileStore) List(context.Context) ([]*coreauth.Auth, error) { return nil, nil }
 func (*managementReconcileStore) Save(context.Context, *coreauth.Auth) (string, error) {
 	return "saved", nil
 }
 func (*managementReconcileStore) Delete(context.Context, string) error { return nil }
+func (*managementReconcileStore) LoadReconcile(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, string, error) {
+	return auth.Clone(), strings.Repeat("a", 64), nil
+}
+
+func (*managementUnsupportedStore) List(context.Context) ([]*coreauth.Auth, error) { return nil, nil }
+func (*managementUnsupportedStore) Save(context.Context, *coreauth.Auth) (string, error) {
+	return "saved", nil
+}
+func (*managementUnsupportedStore) Delete(context.Context, string) error { return nil }
 
 func (*managementProbeExecutor) Identifier() string { return "gemini" }
 func (e *managementProbeExecutor) Execute(_ context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
@@ -67,7 +92,9 @@ func newManagementReconcileHandler(t *testing.T) (*Handler, *managementProbeExec
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatal(errRegister)
 	}
-	return NewHandlerWithoutConfigFilePath(&config.Config{}, manager), executor, index
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+	h.reconcilerPassword = "reconciler-test-key"
+	return h, executor, index
 }
 
 func TestAuthReconcileEndpointsRequireLoopback(t *testing.T) {
@@ -231,6 +258,119 @@ func TestReconcileCredentialStatusIsClosed(t *testing.T) {
 	}
 }
 
+func TestSetAuthReconcileStateRequiresAndAdvancesDurableGeneration(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/seat.json"
+	if errWrite := os.WriteFile(path, []byte(`{"type":"claude","refresh_token":"restored","disabled":true,"reconcile_state":"probing"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	store := sdkauth.NewFileTokenStore()
+	store.SetBaseDir(dir)
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetStore(store)
+	auth := &coreauth.Auth{ID: "seat.json", FileName: "seat.json", Provider: "claude", Status: coreauth.StatusActive, ReconcileState: coreauth.ReconcileStateProbing, Attributes: map[string]string{coreauth.AttributePath: path, coreauth.AttributeSourceBackend: coreauth.AuthSourceFile}, Metadata: map[string]any{"type": "claude", "refresh_token": "stale", "disabled": false}}
+	index := auth.EnsureIndex()
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	generation, durableDisabled, errGeneration := manager.ReconcileCredentialGeneration(context.Background(), auth.ID)
+	if errGeneration != nil || !durableDisabled {
+		t.Fatalf("generation=%q disabled=%t err=%v", generation, durableDisabled, errGeneration)
+	}
+	auth.Attributes[coreauth.AttributeSourceGeneration] = generation
+	if _, errUpdate := manager.Update(coreauth.WithSkipPersist(context.Background()), auth); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+	h.reconcilerPassword = "reconciler-test-key"
+
+	request := func(payload map[string]any) *httptest.ResponseRecorder {
+		body, errJSON := json.Marshal(payload)
+		if errJSON != nil {
+			t.Fatal(errJSON)
+		}
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/reconcile-state", strings.NewReader(string(body)))
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Header.Set("Content-Type", "application/json")
+		c.Request = req
+		h.SetAuthReconcileState(c)
+		return recorder
+	}
+	missing := request(map[string]any{"auth_index": index, "state": "cooling"})
+	if missing.Code != http.StatusPreconditionRequired {
+		t.Fatalf("missing generation status=%d body=%s", missing.Code, missing.Body.String())
+	}
+	opaqueGeneration := opaqueReconcileGeneration(h.reconcilerPassword, generation)
+	accepted := request(map[string]any{"auth_index": index, "state": "cooling", "reason": "probe_rejected", "generation": opaqueGeneration, "disabled": true})
+	if accepted.Code != http.StatusOK || !strings.Contains(accepted.Body.String(), `"disabled":true`) || strings.Contains(accepted.Body.String(), generation) {
+		t.Fatalf("accepted status=%d body=%s", accepted.Code, accepted.Body.String())
+	}
+	stale := request(map[string]any{"auth_index": index, "state": "ready", "generation": opaqueGeneration})
+	if stale.Code != http.StatusPreconditionFailed {
+		t.Fatalf("stale generation status=%d body=%s", stale.Code, stale.Body.String())
+	}
+	var persisted map[string]any
+	if errJSON := json.Unmarshal(mustReadManagementFile(t, path), &persisted); errJSON != nil {
+		t.Fatal(errJSON)
+	}
+	if persisted["refresh_token"] != "restored" || persisted["disabled"] != true || persisted["reconcile_state"] != "cooling" {
+		t.Fatalf("durable projection changed unexpectedly")
+	}
+}
+
+func TestSetAuthReconcileStateReturnsCategoricalCommittedGeneration(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	store := &managementCommittedStore{manager: manager}
+	manager.SetStore(store)
+	auth := &coreauth.Auth{
+		ID:             "seat.json",
+		FileName:       "seat.json",
+		Provider:       "claude",
+		Status:         coreauth.StatusActive,
+		ReconcileState: coreauth.ReconcileStateProbing,
+		Attributes: map[string]string{
+			coreauth.AttributePath:          "/private/auth/seat.json",
+			coreauth.AttributeSourceBackend: coreauth.AuthSourceFile,
+		},
+		Metadata: map[string]any{"type": "claude", "disabled": false},
+	}
+	index := auth.EnsureIndex()
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+	h.reconcilerPassword = "reconciler-test-key"
+	body, _ := json.Marshal(map[string]any{
+		"auth_index": index,
+		"state":      "cooling",
+		"generation": opaqueReconcileGeneration(h.reconcilerPassword, strings.Repeat("a", 64)),
+	})
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/reconcile-state", strings.NewReader(string(body)))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("Content-Type", "application/json")
+	c.Request = req
+	h.SetAuthReconcileState(c)
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), `"outcome":"committed"`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), opaqueReconcileGeneration(h.reconcilerPassword, strings.Repeat("b", 64))) {
+		t.Fatalf("committed opaque generation missing: %s", recorder.Body.String())
+	}
+}
+
+func mustReadManagementFile(t *testing.T, path string) []byte {
+	t.Helper()
+	raw, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	return raw
+}
+
 func TestGetAuthReconcileStatusIncludesOnlyFileBackedDesiredSeats(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.SetStore(&managementReconcileStore{})
@@ -310,6 +450,39 @@ func TestGetAuthReconcileStatusIncludesOnlyFileBackedDesiredSeats(t *testing.T) 
 	}
 }
 
+func TestGetAuthReconcileStatusFailsClosedWithoutGenerationStore(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetStore(&managementUnsupportedStore{})
+	auth := &coreauth.Auth{
+		ID:       "file-seat",
+		FileName: "seat.json",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			coreauth.AttributePath:          "/opt/crsproxy/auths/seat.json",
+			coreauth.AttributeSourceBackend: coreauth.AuthSourceFile,
+		},
+		Metadata: map[string]any{"type": "claude"},
+	}
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+	h.reconcilerPassword = "reconciler-test-key"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/reconcile-status", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	c.Request = req
+	h.GetAuthReconcileStatus(c)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), auth.ID) || strings.Contains(recorder.Body.String(), auth.FileName) {
+		t.Fatalf("failed-closed response exposed credential identity: %s", recorder.Body.String())
+	}
+}
+
 func TestAuthReconcileMutationsRejectNonPersistableCredentials(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.SetStore(&managementReconcileStore{})
@@ -360,7 +533,7 @@ func TestAuthReconcileMutationsRejectNonPersistableCredentials(t *testing.T) {
 	}
 }
 
-func TestProbeAuthCredentialUsesExactSeatAndAdmits(t *testing.T) {
+func TestProbeAuthCredentialUsesExactSeatWithoutAdmitting(t *testing.T) {
 	h, executor, index := newManagementReconcileHandler(t)
 	body, _ := json.Marshal(map[string]any{"auth_index": index, "model": "gemini-probe", "payload": json.RawMessage(`{"messages":[{"role":"user","content":"ping"}]}`), "admit": true})
 	recorder := httptest.NewRecorder()
@@ -377,7 +550,7 @@ func TestProbeAuthCredentialUsesExactSeatAndAdmits(t *testing.T) {
 		t.Fatalf("request=%s original=%s", executor.requestPayload, executor.originalRequest)
 	}
 	auth := h.authByIndex(index)
-	if auth == nil || auth.ReconcileState != coreauth.ReconcileStateReady {
+	if auth == nil || auth.ReconcileState != coreauth.ReconcileStateProbing {
 		t.Fatalf("auth = %#v", auth)
 	}
 }

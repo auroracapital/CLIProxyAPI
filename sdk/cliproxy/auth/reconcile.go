@@ -29,11 +29,164 @@ func (m *Manager) SetReconcileState(ctx context.Context, authID string, state Re
 	if !ok || auth == nil {
 		return nil, errors.New("auth not found")
 	}
+	m.mu.RLock()
+	_, hasCAS := m.store.(ReconcileStore)
+	m.mu.RUnlock()
+	if hasCAS && auth.AuthSourceKind() == AuthSourceFile {
+		generation, _, errGeneration := m.ReconcileCredentialGeneration(ctx, auth.ID)
+		if errGeneration != nil {
+			return nil, errGeneration
+		}
+		updated, _, errCAS := m.SetReconcileStateCAS(ctx, auth.ID, generation, state, reason, nextAttempt, nil)
+		return updated, errCAS
+	}
 	auth.ReconcileState = normalizeReconcileState(state)
 	auth.ReconcileReason = sanitizeReconcileReason(reason)
 	auth.ReconcileNextAttempt = nextAttempt
+	if auth.ReconcileState == ReconcileStateReady {
+		auth.Unavailable = false
+		auth.NextRetryAfter = time.Time{}
+		auth.LastError = nil
+		auth.StatusMessage = ""
+		if auth.Status == StatusError || auth.Status == StatusRefreshing || auth.Status == StatusPending || (auth.Status == StatusDisabled && !auth.Disabled) {
+			auth.Status = StatusActive
+		}
+	}
 	auth.UpdatedAt = time.Now()
 	return m.commitReconcileUpdate(ctx, auth)
+}
+
+// SetReconcileStateCAS rebases a lifecycle transition onto an exact durable
+// credential generation. This prevents a stale watcher or refresh snapshot from
+// overwriting a controller rollback with different tokens or admission state.
+func (m *Manager) SetReconcileStateCAS(ctx context.Context, authID, expectedGeneration string, state ReconcileState, reason string, nextAttempt time.Time, disabled *bool) (*Auth, string, error) {
+	if m == nil {
+		return nil, "", errors.New("auth manager is nil")
+	}
+	authID = strings.TrimSpace(authID)
+	expectedGeneration = strings.ToLower(strings.TrimSpace(expectedGeneration))
+	if authID == "" || len(expectedGeneration) != 64 {
+		return nil, "", errors.New("reconcile update is incomplete")
+	}
+	var updated *Auth
+	var generation string
+	errMutation := m.WithCredentialMutation(authID, func() error {
+		var errCAS error
+		updated, generation, errCAS = m.setReconcileStateCASLocked(ctx, authID, expectedGeneration, state, reason, nextAttempt, disabled)
+		return errCAS
+	})
+	return updated, generation, errMutation
+}
+
+func (m *Manager) setReconcileStateCASLocked(ctx context.Context, authID, expectedGeneration string, state ReconcileState, reason string, nextAttempt time.Time, disabled *bool) (*Auth, string, error) {
+	m.mu.RLock()
+	current := m.auths[authID]
+	store := m.store
+	m.mu.RUnlock()
+	if current == nil || store == nil {
+		return nil, "", errors.New("auth not found")
+	}
+	reconcileStore, ok := store.(ReconcileStore)
+	if !ok {
+		return nil, "", errors.New("credential store does not support reconcile generations")
+	}
+	auth, generation, errLoad := reconcileStore.LoadReconcile(ctx, current.Clone())
+	if errLoad != nil {
+		return nil, "", errLoad
+	}
+	if !strings.EqualFold(generation, expectedGeneration) {
+		return nil, "", ErrReconcileGenerationMismatch
+	}
+	auth.Runtime = current.Runtime
+	auth.LastRefreshedAt = current.LastRefreshedAt
+	auth.NextRefreshAfter = current.NextRefreshAfter
+	auth.ModelStates = current.ModelStates
+	if disabled != nil {
+		auth.Disabled = *disabled
+		auth.Metadata["disabled"] = *disabled
+		if *disabled {
+			auth.Status = StatusDisabled
+		} else if auth.Status == StatusDisabled {
+			auth.Status = StatusActive
+		}
+	}
+	auth.ReconcileState = normalizeReconcileState(state)
+	auth.ReconcileReason = sanitizeReconcileReason(reason)
+	auth.ReconcileNextAttempt = nextAttempt
+	if auth.ReconcileState == ReconcileStateReady {
+		auth.Unavailable = false
+		auth.NextRetryAfter = time.Time{}
+		auth.LastError = nil
+		auth.StatusMessage = ""
+		if auth.Status == StatusError || auth.Status == StatusRefreshing || auth.Status == StatusPending || (auth.Status == StatusDisabled && !auth.Disabled) {
+			auth.Status = StatusActive
+		}
+	} else {
+		auth.NextRetryAfter = current.NextRetryAfter
+	}
+	auth.UpdatedAt = time.Now()
+	SyncReconcileMetadata(auth)
+	_, newGeneration, errSave := reconcileStore.SaveReconcileCAS(ctx, auth, generation)
+	if errSave != nil {
+		return nil, "", errSave
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	auth.Attributes[AttributeSourceGeneration] = newGeneration
+	updated, errUpdate := m.Update(WithSkipPersist(ctx), auth)
+	if errUpdate != nil {
+		return nil, newGeneration, &ReconcileCommittedError{Generation: newGeneration, Cause: errUpdate}
+	}
+	if updated == nil {
+		return nil, newGeneration, &ReconcileCommittedError{Generation: newGeneration}
+	}
+	return updated, newGeneration, nil
+}
+
+// ReconcileCredentialGeneration returns the authoritative durable generation
+// and categorical admission state for a file-backed credential.
+func (m *Manager) ReconcileCredentialGeneration(ctx context.Context, authID string) (string, bool, error) {
+	if m == nil {
+		return "", false, errors.New("auth manager is nil")
+	}
+	auth, ok := m.GetByID(strings.TrimSpace(authID))
+	if !ok || auth == nil {
+		return "", false, errors.New("auth not found")
+	}
+	m.mu.RLock()
+	store := m.store
+	m.mu.RUnlock()
+	reconcileStore, ok := store.(ReconcileGenerationStore)
+	if !ok {
+		return "", false, errors.New("credential store does not support reconcile generations")
+	}
+	loaded, generation, errLoad := reconcileStore.LoadReconcile(ctx, auth)
+	if errLoad != nil {
+		return "", false, errLoad
+	}
+	return generation, loaded.Disabled, nil
+}
+
+// ReconcileSourceGenerationCurrent rejects delayed watcher snapshots after a
+// newer durable generation has already won.
+func (m *Manager) ReconcileSourceGenerationCurrent(ctx context.Context, auth *Auth) bool {
+	if auth == nil || auth.AuthSourceKind() != AuthSourceFile {
+		return true
+	}
+	expected := strings.TrimSpace(auth.Attributes[AttributeSourceGeneration])
+	if expected == "" {
+		return true
+	}
+	m.mu.RLock()
+	store := m.store
+	m.mu.RUnlock()
+	reconcileStore, ok := store.(ReconcileGenerationStore)
+	if !ok {
+		return false
+	}
+	_, generation, errGeneration := reconcileStore.LoadReconcile(ctx, auth)
+	return errGeneration == nil && strings.EqualFold(generation, expected)
 }
 
 // RefreshCredential runs the manager's serialized refresh path for one exact

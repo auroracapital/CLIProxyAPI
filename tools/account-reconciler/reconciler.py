@@ -79,10 +79,18 @@ class InventoryError(ReconcileError):
 
 
 class APIError(ReconcileError):
-    def __init__(self, status: int = 0, outcome: str = ""):
+    def __init__(self, status: int = 0, outcome: str = "", generation: str = ""):
         super().__init__("API request failed")
         self.status = status
         self.outcome = outcome if outcome in SAFE_OUTCOMES else ""
+        self.generation = generation if re.fullmatch(r"[0-9a-f]{64}", generation) else ""
+
+
+class CommittedTransition(APIError):
+    """Durable lifecycle state committed but runtime publication is pending."""
+
+    def __init__(self, status: int, generation: str):
+        super().__init__(status, generation=generation)
 
 
 class PromotionError(ReconcileError):
@@ -270,6 +278,11 @@ def validate_complete_inventory(inventory: Inventory, remote: list[dict[str, Any
             raise InventoryError("remote credential status is invalid")
         if not isinstance(item.get("disabled"), bool) or not isinstance(item.get("unavailable"), bool):
             raise InventoryError("remote availability flags are invalid")
+        for field in ("generation", "runtime_generation"):
+            if not isinstance(item.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", item[field]):
+                raise InventoryError("remote credential generation is invalid")
+        if not isinstance(item.get("durable_disabled"), bool):
+            raise InventoryError("remote durable admission flag is invalid")
         if index in indexed:
             raise InventoryError("remote inventory is ambiguous")
         indexed[index] = provider.strip().lower()
@@ -407,12 +420,19 @@ class APIAdapter:
             # Extract only the documented categorical outcome. Never retain or
             # expose the response body itself.
             outcome = ""
+            generation = ""
             try:
                 value = json.load(exc)
                 if isinstance(value, dict) and value.get("outcome") in SAFE_OUTCOMES:
                     outcome = value["outcome"]
+                if isinstance(value, dict) and value.get("outcome") == "committed":
+                    candidate_generation = value.get("generation")
+                    if isinstance(candidate_generation, str) and re.fullmatch(r"[0-9a-f]{64}", candidate_generation):
+                        generation = candidate_generation
             except (OSError, UnicodeError, json.JSONDecodeError):
                 pass
+            if generation:
+                raise CommittedTransition(exc.code, generation) from None
             raise APIError(exc.code, outcome) from None
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
             raise APIError() from None
@@ -427,27 +447,49 @@ class APIAdapter:
             raise APIError()
         return rows
 
-    def set_state(self, auth_index: str, state: str, reason: str = "", next_attempt: str = "") -> None:
-        payload = {"auth_index": auth_index, "state": state, "reason": reason}
+    def set_state(
+        self,
+        auth_index: str,
+        state: str,
+        reason: str = "",
+        next_attempt: str = "",
+        generation: str = "",
+        disabled: bool | None = None,
+    ) -> dict[str, Any]:
+        if not re.fullmatch(r"[0-9a-f]{64}", generation):
+            raise APIError()
+        payload: dict[str, Any] = {
+            "auth_index": auth_index,
+            "state": state,
+            "reason": reason,
+            "generation": generation,
+        }
         if next_attempt:
             payload["next_attempt"] = next_attempt
-        self._request("POST", "/v0/management/auth-files/reconcile-state", payload)
+        if disabled is not None:
+            payload["disabled"] = disabled
+        return self._request("POST", "/v0/management/auth-files/reconcile-state", payload)
 
-    def refresh(self, auth_index: str) -> str:
+    def refresh(self, auth_index: str) -> tuple[str, str, bool]:
         try:
             value = self._request("POST", "/v0/management/auth-files/refresh", {"auth_index": auth_index})
         except APIError as exc:
             if exc.outcome:
-                return exc.outcome
+                return exc.outcome, "", False
             raise
-        return value.get("outcome") if value.get("outcome") in SAFE_OUTCOMES else "failed"
+        outcome = value.get("outcome") if value.get("outcome") in SAFE_OUTCOMES else "failed"
+        generation = value.get("generation") if isinstance(value.get("generation"), str) else ""
+        disabled = value.get("disabled") if isinstance(value.get("disabled"), bool) else False
+        if outcome == "succeeded" and not re.fullmatch(r"[0-9a-f]{64}", generation):
+            raise APIError()
+        return outcome, generation, disabled
 
     def probe(self, seat: Seat, payload: dict[str, Any]) -> str:
         try:
             value = self._request(
                 "POST",
                 "/v0/management/auth-files/probe",
-                {"auth_index": seat.auth_index, "model": seat.model, "payload": payload, "admit": True},
+                {"auth_index": seat.auth_index, "model": seat.model, "payload": payload, "admit": False},
             )
         except APIError as exc:
             if exc.outcome:
@@ -456,21 +498,32 @@ class APIAdapter:
         return value.get("outcome") if value.get("outcome") in SAFE_OUTCOMES else "failed"
 
 
-def validate_candidate(seat: Seat) -> dict[str, Any]:
+def read_candidate_snapshot(seat: Seat) -> tuple[dict[str, Any], str]:
     if seat.candidate_path is None or seat.canonical_path is None:
         raise PromotionError("candidate is not configured")
     try:
-        info = seat.candidate_path.lstat()
         parent_info = seat.canonical_path.parent.stat()
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(seat.candidate_path, flags)
     except OSError as exc:
         raise PromotionError("candidate is unavailable") from exc
-    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-        raise PromotionError("candidate must be a regular file")
-    if stat.S_IMODE(info.st_mode) != 0o600 or info.st_dev != parent_info.st_dev:
-        raise PromotionError("candidate permissions or filesystem are invalid")
     try:
-        value = json.loads(seat.candidate_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise PromotionError("candidate must be a regular file")
+        if stat.S_IMODE(info.st_mode) != 0o600 or info.st_dev != parent_info.st_dev:
+            raise PromotionError("candidate permissions or filesystem are invalid")
+        with os.fdopen(fd, "rb", closefd=False) as incoming:
+            raw = incoming.read()
+    except OSError as exc:
+        raise PromotionError("candidate cannot be read") from exc
+    finally:
+        os.close(fd)
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise PromotionError("candidate JSON is invalid") from exc
     if not isinstance(value, dict) or value.get("disabled") is True:
         raise PromotionError("candidate content is invalid")
@@ -481,6 +534,11 @@ def validate_candidate(seat: Seat) -> dict[str, Any]:
         raise PromotionError("candidate is missing required fields")
     if any(str(value.get(key, "")) != expected for key, expected in seat.expected_fields):
         raise PromotionError("candidate identity does not match")
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+def validate_candidate(seat: Seat) -> dict[str, Any]:
+    value, _ = read_candidate_snapshot(seat)
     return value
 
 
@@ -525,8 +583,88 @@ def _copy_fsync(source: Path, destination: Path, exclusive: bool = False) -> Non
         os.close(fd)
 
 
-def promote_candidate(seat: Seat, archive_dir: Path, seat_key: str, now: dt.datetime) -> Path | None:
-    candidate = validate_candidate(seat)
+def raw_file_generation(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise PromotionError("credential generation is unavailable") from exc
+
+
+def file_generation(path: Path, hmac_key: bytes) -> str:
+    digest = raw_file_generation(path)
+    return hmac.new(
+        hmac_key,
+        b"reconcile-generation\0" + digest.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+@contextlib.contextmanager
+def credential_file_lock(path: Path) -> Iterator[None]:
+    lock_path = Path(str(path) + ".reconcile.lock")
+    parent = lock_path.parent
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent_info = parent.lstat()
+    if not stat.S_ISDIR(parent_info.st_mode) or stat.S_ISLNK(parent_info.st_mode) or stat.S_IMODE(parent_info.st_mode) & 0o022:
+        raise PromotionError("credential lock directory is unsafe")
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+            raise PromotionError("credential lock is unsafe")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def archived_disabled(archive: Path | None) -> bool:
+    if archive is None:
+        return False
+    try:
+        value = json.loads(archive.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PromotionError("rollback archive is invalid") from exc
+    if not isinstance(value, dict):
+        raise PromotionError("rollback archive is invalid")
+    disabled = value.get("disabled", False)
+    if not isinstance(disabled, bool):
+        raise PromotionError("rollback admission state is invalid")
+    return disabled
+
+
+def copy_atomic(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".reconcile-copy-", dir=destination.parent)
+    os.close(fd)
+    temp = Path(temp_name)
+    try:
+        _copy_fsync(source, temp)
+        os.replace(temp, destination)
+        directory_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temp.unlink()
+
+
+def promote_candidate(
+    seat: Seat,
+    archive_dir: Path,
+    seat_key: str,
+    now: dt.datetime,
+    candidate: dict[str, Any] | None = None,
+) -> Path | None:
+    if candidate is None:
+        candidate = validate_candidate(seat)
     assert seat.candidate_path is not None and seat.canonical_path is not None
     seat.canonical_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     parent_info = seat.canonical_path.parent.stat()
@@ -822,8 +960,14 @@ class Controller:
         attempts = int(persisted.get("attempts", 0))
         if attempts >= self.inventory.max_attempts_per_day:
             try:
-                self.api.set_state(seat.auth_index, "auth_required", "attempt_budget_exhausted")
-            except APIError:
+                self._transition(
+                    seat.auth_index,
+                    remote["generation"],
+                    "auth_required",
+                    "attempt_budget_exhausted",
+                    disabled=remote["durable_disabled"],
+                )
+            except (APIError, PromotionError):
                 return self._record_local_failure(
                     seat_key,
                     attempts,
@@ -836,14 +980,32 @@ class Controller:
         attempts += 1
         archive: Path | None = None
         promoted = False
-        promoted_updated_at: Any = remote.get("updated_at")
+        promoted_raw_generation = ""
+        candidate_raw_generation = ""
+        canonical_raw_generation = ""
+        refresh_succeeded = False
+        generation = remote["generation"]
+        durable_disabled = remote["durable_disabled"]
         if candidate_exists:
             try:
-                archive = promote_candidate(seat, self.state_dir / "rollback", seat_key, self.now())
+                assert seat.canonical_path is not None
+                assert seat.candidate_path is not None
+                with credential_file_lock(seat.canonical_path), credential_file_lock(seat.candidate_path):
+                    candidate, candidate_raw_generation = read_candidate_snapshot(seat)
+                    archive = promote_candidate(
+                        seat,
+                        self.state_dir / "rollback",
+                        seat_key,
+                        self.now(),
+                        candidate,
+                    )
+                    promoted_raw_generation = raw_file_generation(seat.canonical_path)
+                    generation = file_generation(seat.canonical_path, self.api.api_key.encode())
                 promoted = True
-                promoted_updated_at = self._wait_for_reload(seat.auth_index, remote.get("updated_at"))
+                self._wait_for_generation(seat.auth_index, generation, False)
+                durable_disabled = False
             except (PromotionError, APIError):
-                if promoted and not self._rollback_and_reload(seat, archive, remote.get("updated_at")):
+                if promoted and self._restore_and_reload(seat, archive, promoted_raw_generation) is None:
                     return self._record_local_failure(
                         seat_key,
                         attempts,
@@ -854,11 +1016,16 @@ class Controller:
                 return self._fail(seat, seat_key, attempts, "candidate_invalid", "misconfigured", "failed")
         elif canonical_needs_normalization:
             try:
-                archive = normalize_canonical(seat, self.state_dir / "rollback", seat_key, self.now())
+                assert seat.canonical_path is not None
+                with credential_file_lock(seat.canonical_path):
+                    archive = normalize_canonical(seat, self.state_dir / "rollback", seat_key, self.now())
+                    promoted_raw_generation = raw_file_generation(seat.canonical_path)
+                    generation = file_generation(seat.canonical_path, self.api.api_key.encode())
                 promoted = True
-                promoted_updated_at = self._wait_for_reload(seat.auth_index, remote.get("updated_at"))
+                self._wait_for_generation(seat.auth_index, generation, False)
+                durable_disabled = False
             except (PromotionError, APIError):
-                if promoted and not self._rollback_and_reload(seat, archive, remote.get("updated_at")):
+                if promoted and self._restore_and_reload(seat, archive, promoted_raw_generation) is None:
                     return self._record_local_failure(
                         seat_key,
                         attempts,
@@ -868,11 +1035,20 @@ class Controller:
                     )
                 return self._fail(seat, seat_key, attempts, "candidate_invalid", "misconfigured", "failed")
         try:
-            self.api.set_state(seat.auth_index, "refreshing", "candidate_promoted" if candidate_exists else "")
-            refresh_outcome = self.api.refresh(seat.auth_index)
+            generation = self._transition(
+                seat.auth_index,
+                generation,
+                "refreshing",
+                "candidate_promoted" if candidate_exists else "",
+                disabled=False,
+            )
+            refresh_outcome, refreshed_generation, refreshed_disabled = self.api.refresh(seat.auth_index)
             if refresh_outcome != "succeeded":
-                if promoted and not self._rollback_and_reload(seat, archive, promoted_updated_at):
-                    return self._fail(seat, seat_key, attempts, "rollback_failed", "misconfigured", "failed")
+                if promoted:
+                    restored = self._restore_and_reload(seat, archive, promoted_raw_generation)
+                    if restored is None:
+                        return self._record_local_failure(seat_key, attempts, "rollback_failed", "misconfigured", "failed")
+                    generation, durable_disabled = restored
                 terminal = refresh_outcome == "auth_required" or attempts >= self.inventory.max_attempts_per_day
                 return self._fail(
                     seat,
@@ -881,23 +1057,105 @@ class Controller:
                     "probe_auth_required" if terminal else "refresh_failed",
                     "auth_required" if terminal else "cooling",
                     refresh_outcome,
+                    generation,
+                    durable_disabled,
                 )
-            self.api.set_state(seat.auth_index, "probing", "refresh_succeeded")
+            generation = refreshed_generation
+            durable_disabled = refreshed_disabled
+            refresh_succeeded = True
+            if promoted and candidate_exists and seat.canonical_path is not None:
+                with credential_file_lock(seat.canonical_path):
+                    canonical_raw_generation = raw_file_generation(seat.canonical_path)
+            generation = self._transition(
+                seat.auth_index,
+                generation,
+                "probing",
+                "refresh_succeeded",
+                disabled=False,
+            )
+            durable_disabled = False
+            if promoted and candidate_exists and seat.canonical_path is not None:
+                with credential_file_lock(seat.canonical_path):
+                    canonical_raw_generation = raw_file_generation(seat.canonical_path)
             probe_outcome = self.api.probe(seat, self.inventory.probe_payload)
             if probe_outcome == "succeeded":
+                generation = self._transition(
+                    seat.auth_index,
+                    generation,
+                    "ready",
+                    "",
+                    disabled=False,
+                )
                 self._record(seat_key, "ready", "none", "succeeded", attempts, "")
                 if candidate_exists and seat.candidate_path:
-                    seat.candidate_path.unlink(missing_ok=True)
+                    with credential_file_lock(seat.candidate_path):
+                        if seat.candidate_path.exists() and raw_file_generation(seat.candidate_path) == candidate_raw_generation:
+                            seat.candidate_path.unlink()
                 return True
-            if promoted and not self._rollback_and_reload(seat, archive, promoted_updated_at):
-                return self._fail(seat, seat_key, attempts, "rollback_failed", "misconfigured", "failed")
+            if promoted and candidate_exists:
+                restored = self._restage_candidate_and_restore(
+                    seat,
+                    archive,
+                    candidate_raw_generation,
+                    canonical_raw_generation,
+                )
+                if restored is None:
+                    return self._record_local_failure(seat_key, attempts, "rollback_failed", "misconfigured", "failed")
+                generation, durable_disabled = restored
+            elif promoted:
+                # A successful refresh may rotate the refresh token. Keep that
+                # newest credential generation, but restore the archived
+                # admission flag while applying the failure lifecycle.
+                durable_disabled = archived_disabled(archive)
             if probe_outcome == "auth_required":
-                return self._fail(seat, seat_key, attempts, "probe_auth_required", "auth_required", probe_outcome)
-            return self._fail(seat, seat_key, attempts, "probe_rejected" if probe_outcome == "rejected" else "probe_retryable", "cooling", probe_outcome)
+                return self._fail(seat, seat_key, attempts, "probe_auth_required", "auth_required", probe_outcome, generation, durable_disabled)
+            return self._fail(seat, seat_key, attempts, "probe_rejected" if probe_outcome == "rejected" else "probe_retryable", "cooling", probe_outcome, generation, durable_disabled)
         except (APIError, PromotionError):
-            if promoted and not self._rollback_and_reload(seat, archive, promoted_updated_at):
-                return self._fail(seat, seat_key, attempts, "rollback_failed", "misconfigured", "failed")
-            return self._fail(seat, seat_key, attempts, "probe_retryable", "cooling", "retryable")
+            if promoted:
+                if refresh_succeeded and candidate_exists:
+                    restored = self._restage_candidate_and_restore(
+                        seat,
+                        archive,
+                        candidate_raw_generation,
+                        canonical_raw_generation,
+                    )
+                    if restored is None:
+                        return self._record_local_failure(seat_key, attempts, "rollback_failed", "misconfigured", "failed")
+                    generation, durable_disabled = restored
+                elif refresh_succeeded:
+                    durable_disabled = archived_disabled(archive)
+                else:
+                    restored = self._restore_and_reload(seat, archive, promoted_raw_generation)
+                    if restored is None:
+                        return self._record_local_failure(seat_key, attempts, "rollback_failed", "misconfigured", "failed")
+                    generation, durable_disabled = restored
+            return self._fail(seat, seat_key, attempts, "probe_retryable", "cooling", "retryable", generation, durable_disabled)
+
+    def _restage_candidate_and_restore(
+        self,
+        seat: Seat,
+        archive: Path | None,
+        expected_candidate_generation: str,
+        expected_canonical_generation: str,
+    ) -> tuple[str, bool] | None:
+        """Preserve a rotated candidate before restoring the prior canonical seat."""
+        try:
+            if seat.canonical_path is None or seat.candidate_path is None:
+                return None
+            with credential_file_lock(seat.canonical_path), credential_file_lock(seat.candidate_path):
+                if not seat.canonical_path.exists():
+                    return None
+                if not seat.candidate_path.exists():
+                    raise PromotionError("staged candidate disappeared")
+                if raw_file_generation(seat.candidate_path) != expected_candidate_generation:
+                    raise PromotionError("staged candidate generation changed")
+                if raw_file_generation(seat.canonical_path) != expected_canonical_generation:
+                    raise PromotionError("canonical generation changed before candidate restage")
+                copy_atomic(seat.canonical_path, seat.candidate_path)
+                expected_raw_generation = raw_file_generation(seat.canonical_path)
+            return self._restore_and_reload(seat, archive, expected_raw_generation)
+        except (OSError, PromotionError, APIError):
+            return None
 
     @staticmethod
     def _remote_credential_is_healthy(remote: dict[str, Any]) -> bool:
@@ -909,33 +1167,173 @@ class Controller:
             and remote.get("unavailable") is False
         )
 
-    def _wait_for_reload(self, auth_index: str, previous_updated_at: Any) -> Any:
-        """Wait briefly for the file watcher to observe an atomic promotion."""
+    def _wait_for_generation(self, auth_index: str, generation: str, disabled: bool) -> None:
+        """Wait for both runtime and disk to converge on an exact generation."""
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
             rows = self.api.status()
             matches = [row for row in rows if row.get("auth_index") == auth_index]
             if len(matches) != 1:
                 raise PromotionError("promoted credential identity changed")
-            if not isinstance(previous_updated_at, str) or not previous_updated_at or matches[0].get("updated_at") != previous_updated_at:
-                return matches[0].get("updated_at")
+            row = matches[0]
+            if (
+                row.get("generation") == generation
+                and row.get("runtime_generation") == generation
+                and row.get("durable_disabled") is disabled
+                and row.get("disabled") is disabled
+            ):
+                return
             time.sleep(0.2)
         raise PromotionError("promoted credential was not reloaded")
 
-    def _rollback_and_reload(self, seat: Seat, archive: Path | None, promoted_updated_at: Any) -> bool:
+    def _restore_and_reload(
+        self,
+        seat: Seat,
+        archive: Path | None,
+        expected_raw_generation: str,
+    ) -> tuple[str, bool] | None:
         try:
-            revert_promotion(seat, archive)
-            self._wait_for_reload(seat.auth_index, promoted_updated_at)
-            return True
+            if seat.canonical_path is None:
+                return None
+            if archive is None:
+                # A declared first-install seat must remain present so the next
+                # complete-inventory validation can recover it. Keep the staged
+                # credential durably disabled instead of deleting the runtime row.
+                if not seat.canonical_path.exists():
+                    return None
+                generation = file_generation(seat.canonical_path, self.api.api_key.encode())
+                generation = self._transition(
+                    seat.auth_index,
+                    generation,
+                    "cooling",
+                    "probe_retryable",
+                    disabled=True,
+                )
+                return generation, True
+            with credential_file_lock(seat.canonical_path):
+                if seat.canonical_path.exists():
+                    if not expected_raw_generation or raw_file_generation(seat.canonical_path) != expected_raw_generation:
+                        raise PromotionError("rollback generation changed")
+                elif expected_raw_generation:
+                    raise PromotionError("rollback generation disappeared")
+                revert_promotion(seat, archive)
+            if seat.canonical_path is None or not seat.canonical_path.exists():
+                return None
+            generation = file_generation(seat.canonical_path, self.api.api_key.encode())
+            disabled = archived_disabled(archive)
+            self._wait_for_generation(seat.auth_index, generation, disabled)
+            return generation, disabled
         except (OSError, PromotionError, APIError):
-            return False
+            return None
 
-    def _fail(self, seat: Seat, seat_key: str, attempts: int, reason: str, state: str, outcome: str) -> bool:
+    def _transition(
+        self,
+        auth_index: str,
+        generation: str,
+        state: str,
+        reason: str,
+        next_attempt: str = "",
+        disabled: bool | None = None,
+    ) -> str:
+        value: dict[str, Any] | None = None
+        try:
+            value = self.api.set_state(auth_index, state, reason, next_attempt, generation, disabled)
+            new_generation = value.get("generation") if isinstance(value, dict) else ""
+        except CommittedTransition as committed:
+            new_generation = committed.generation
+        except APIError as exc:
+            # A transport failure may hide a successful durable commit. Recover
+            # only from an exact authoritative lifecycle/admission convergence;
+            # otherwise preserve the ambiguity and let generation fences stop
+            # stale rollback or replay.
+            if exc.status != 0:
+                raise
+            new_generation = self._discover_committed_transition(
+                auth_index,
+                generation,
+                state,
+                reason,
+                next_attempt,
+                disabled,
+            )
+            if not new_generation:
+                raise
+        if not re.fullmatch(r"[0-9a-f]{64}", new_generation):
+            raise APIError()
+        expected_disabled = disabled
+        if expected_disabled is None:
+            if value is None:
+                raise APIError()
+            actual = value.get("disabled")
+            if not isinstance(actual, bool):
+                raise APIError()
+            expected_disabled = actual
+        self._wait_for_generation(auth_index, new_generation, expected_disabled)
+        return new_generation
+
+    def _discover_committed_transition(
+        self,
+        auth_index: str,
+        expected_generation: str,
+        state: str,
+        reason: str,
+        next_attempt: str,
+        disabled: bool | None,
+    ) -> str:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                rows = self.api.status()
+            except APIError:
+                time.sleep(0.2)
+                continue
+            matches = [row for row in rows if row.get("auth_index") == auth_index]
+            if len(matches) != 1:
+                return ""
+            row = matches[0]
+            generation = row.get("generation")
+            if (
+                isinstance(generation, str)
+                and re.fullmatch(r"[0-9a-f]{64}", generation)
+                and generation != expected_generation
+                and row.get("runtime_generation") == generation
+                and row.get("state") == state
+                and row.get("reason", "") == reason
+                and reconcile_times_equal(row.get("next_attempt", ""), next_attempt)
+                and (
+                    disabled is None
+                    or (
+                        row.get("durable_disabled") is disabled
+                        and row.get("disabled") is disabled
+                    )
+                )
+            ):
+                return generation
+            time.sleep(0.2)
+        return ""
+    def _fail(
+        self,
+        seat: Seat,
+        seat_key: str,
+        attempts: int,
+        reason: str,
+        state: str,
+        outcome: str,
+        generation: str = "",
+        disabled: bool | None = None,
+    ) -> bool:
         delay = backoff_seconds(attempts, self.inventory.base_backoff_seconds, self.inventory.max_backoff_seconds, self.rng)
         next_attempt = "" if state in {"auth_required", "misconfigured"} else (self.now() + dt.timedelta(seconds=delay)).replace(microsecond=0).isoformat()
         try:
-            self.api.set_state(seat.auth_index, state, reason, next_attempt)
-        except APIError:
+            if not generation:
+                rows = self.api.status()
+                matches = [row for row in rows if row.get("auth_index") == seat.auth_index]
+                if len(matches) != 1:
+                    raise APIError()
+                generation = matches[0].get("generation", "")
+                disabled = matches[0].get("durable_disabled") if disabled is None else disabled
+            self._transition(seat.auth_index, generation, state, reason, next_attempt, disabled)
+        except (APIError, PromotionError):
             return self._record_local_failure(seat_key, attempts, reason, state, "failed", next_attempt)
         self._record(seat_key, state, reason, outcome if outcome in SAFE_OUTCOMES else "failed", attempts, next_attempt)
         return False
@@ -978,6 +1376,14 @@ def _parse_time(value: Any) -> dt.datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def reconcile_times_equal(observed: Any, expected: str) -> bool:
+    observed_time = _parse_time(observed if isinstance(observed, str) else "")
+    expected_time = _parse_time(expected)
+    if expected_time is None:
+        return observed_time is None or observed_time.year == 1
+    return observed_time == expected_time
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "reconciler.py"
@@ -25,6 +26,7 @@ SPEC.loader.exec_module(reconciler)
 
 NOW = dt.datetime(2026, 8, 13, 12, 0, tzinfo=dt.timezone.utc)
 HMAC_KEY = b"unit-test-key-that-is-at-least-32-bytes-long"
+GENERATION = "a" * 64
 
 
 def write_json(path: Path, value: object, mode: int = 0o600) -> None:
@@ -61,22 +63,41 @@ class FakeAPI:
                 "credential_status": "error",
                 "disabled": False,
                 "unavailable": True,
+                "generation": GENERATION,
+                "runtime_generation": GENERATION,
+                "durable_disabled": False,
             }
         ]
         self.refresh_outcome = refresh
         self.probe_outcome = probe
         self.calls = []
+        self.generation_counter = 0
+        self.api_key = HMAC_KEY.decode()
 
     def status(self):
         self.calls.append(("status",))
         return self.rows
 
-    def set_state(self, auth_index, state, reason="", next_attempt=""):
-        self.calls.append(("set_state", auth_index, state, reason, next_attempt))
+    def set_state(self, auth_index, state, reason="", next_attempt="", generation="", disabled=None):
+        self.calls.append(("set_state", auth_index, state, reason, next_attempt, generation, disabled))
+        self.generation_counter += 1
+        new_generation = f"{self.generation_counter:064x}"
+        for row in self.rows:
+            if row["auth_index"] != auth_index:
+                continue
+            row["state"] = state
+            row["generation"] = new_generation
+            row["runtime_generation"] = new_generation
+            if disabled is not None:
+                row["disabled"] = disabled
+                row["durable_disabled"] = disabled
+            return {"generation": new_generation, "disabled": row["durable_disabled"]}
+        raise reconciler.APIError(404)
 
     def refresh(self, auth_index):
         self.calls.append(("refresh", auth_index))
-        return self.refresh_outcome
+        row = next(row for row in self.rows if row["auth_index"] == auth_index)
+        return self.refresh_outcome, row["generation"], row["durable_disabled"]
 
     def probe(self, seat, payload):
         self.calls.append(("probe", seat.auth_index, seat.model))
@@ -92,14 +113,19 @@ def remote_row(**overrides):
         "disabled": False,
         "unavailable": False,
         "updated_at": "before",
+        "generation": GENERATION,
+        "runtime_generation": GENERATION,
+        "durable_disabled": False,
     }
     row.update(overrides)
+    if "disabled" in overrides and "durable_disabled" not in overrides:
+        row["durable_disabled"] = overrides["disabled"]
     return row
 
 
 class FailingSetStateAPI(FakeAPI):
-    def set_state(self, auth_index, state, reason="", next_attempt=""):
-        self.calls.append(("set_state", auth_index, state, reason, next_attempt))
+    def set_state(self, auth_index, state, reason="", next_attempt="", generation="", disabled=None):
+        self.calls.append(("set_state", auth_index, state, reason, next_attempt, generation, disabled))
         raise reconciler.APIError(503, "retryable")
 
 
@@ -108,11 +134,10 @@ class PromotionReloadFailureController(reconciler.Controller):
         super().__init__(*args, **kwargs)
         self.reload_calls = 0
 
-    def _wait_for_reload(self, auth_index, previous_updated_at):
+    def _wait_for_generation(self, auth_index, generation, disabled):
         self.reload_calls += 1
-        if self.reload_calls == 1:
+        if self.reload_calls == 1 and not disabled:
             raise reconciler.PromotionError("reload failed")
-        return "rollback-reloaded"
 
 
 class ImmediateReloadController(reconciler.Controller):
@@ -120,9 +145,8 @@ class ImmediateReloadController(reconciler.Controller):
         super().__init__(*args, **kwargs)
         self.reload_calls = []
 
-    def _wait_for_reload(self, auth_index, previous_updated_at):
-        self.reload_calls.append((auth_index, previous_updated_at))
-        return f"reloaded-{len(self.reload_calls)}"
+    def _wait_for_generation(self, auth_index, generation, disabled):
+        self.reload_calls.append((auth_index, generation, disabled))
 
 
 class InspectingAPI(FakeAPI):
@@ -134,6 +158,200 @@ class InspectingAPI(FakeAPI):
     def probe(self, seat, payload):
         self.probed_canonical = json.loads(self.canonical_path.read_text(encoding="utf-8"))
         return super().probe(seat, payload)
+
+    def set_state(self, auth_index, state, reason="", next_attempt="", generation="", disabled=None):
+        value = super().set_state(auth_index, state, reason, next_attempt, generation, disabled)
+        canonical = json.loads(self.canonical_path.read_text(encoding="utf-8"))
+        if disabled is not None:
+            canonical["disabled"] = disabled
+        canonical["reconcile_state"] = state
+        if reason:
+            canonical["reconcile_reason"] = reason
+        else:
+            canonical.pop("reconcile_reason", None)
+        write_json(self.canonical_path, canonical)
+        new_generation = reconciler.file_generation(self.canonical_path, self.api_key.encode())
+        value["generation"] = new_generation
+        for row in self.rows:
+            if row["auth_index"] == auth_index:
+                row["generation"] = new_generation
+                row["runtime_generation"] = new_generation
+        return value
+
+
+class RotatingInspectingAPI(InspectingAPI):
+    def refresh(self, auth_index):
+        self.calls.append(("refresh", auth_index))
+        canonical = json.loads(self.canonical_path.read_text(encoding="utf-8"))
+        canonical["access_token"] = "rotated-access"
+        canonical["refresh_token"] = "rotated-refresh"
+        write_json(self.canonical_path, canonical)
+        generation = reconciler.file_generation(self.canonical_path, self.api_key.encode())
+        for row in self.rows:
+            if row["auth_index"] == auth_index:
+                row["generation"] = generation
+                row["runtime_generation"] = generation
+                row["durable_disabled"] = canonical.get("disabled", False)
+        return "succeeded", generation, canonical.get("disabled", False)
+
+
+class StatefulGenerationAPI:
+    """Model durable file state and delayed watcher publication separately."""
+
+    def __init__(
+        self,
+        canonical_path,
+        *,
+        row=None,
+        probe_outcomes=("succeeded",),
+        publish_delay=2,
+        rotate_on_refresh=False,
+        fail_transition_state="",
+    ):
+        self.canonical_path = canonical_path
+        self.api_key = HMAC_KEY.decode()
+        self.calls = []
+        self.publish_delay = publish_delay
+        self.rotate_on_refresh = rotate_on_refresh
+        self.fail_transition_state = fail_transition_state
+        self.probe_outcomes = list(probe_outcomes)
+        self.pending_publication = None
+        self.divergent_statuses = 0
+        self.probe_snapshots = []
+        self.refresh_count = 0
+        self.row = remote_row(**(row or {}))
+        if self.canonical_path.exists():
+            canonical = self._canonical()
+            generation = self._generation()
+            disabled = canonical.get("disabled", False)
+            self.row.update(
+                {
+                    "generation": generation,
+                    "runtime_generation": generation,
+                    "durable_disabled": disabled,
+                    "disabled": disabled,
+                    "state": canonical.get("reconcile_state", self.row["state"]),
+                    "credential_status": "disabled" if disabled else "active",
+                }
+            )
+
+    def _canonical(self):
+        return json.loads(self.canonical_path.read_text(encoding="utf-8"))
+
+    def _generation(self):
+        return reconciler.file_generation(self.canonical_path, self.api_key.encode())
+
+    def _queue_current_file(self):
+        if not self.canonical_path.exists():
+            return
+        canonical = self._canonical()
+        generation = self._generation()
+        snapshot = {
+            "generation": generation,
+            "disabled": canonical.get("disabled", False),
+            "state": canonical.get("reconcile_state", "ready"),
+        }
+        if self.pending_publication and self.pending_publication[1]["generation"] == generation:
+            return
+        if self.row["runtime_generation"] == generation:
+            return
+        self.pending_publication = [self.publish_delay, snapshot]
+
+    def _advance_watcher(self):
+        self._queue_current_file()
+        if not self.pending_publication:
+            return
+        remaining, snapshot = self.pending_publication
+        if remaining > 0:
+            self.pending_publication[0] -= 1
+            self.divergent_statuses += 1
+            return
+        self.row.update(
+            {
+                "runtime_generation": snapshot["generation"],
+                "disabled": snapshot["disabled"],
+                "state": snapshot["state"],
+                "credential_status": "disabled" if snapshot["disabled"] else "active",
+                "unavailable": False,
+            }
+        )
+        self.pending_publication = None
+
+    def status(self):
+        self.calls.append(("status",))
+        if self.canonical_path.exists():
+            canonical = self._canonical()
+            self.row["generation"] = self._generation()
+            self.row["durable_disabled"] = canonical.get("disabled", False)
+            self._advance_watcher()
+        return [dict(self.row)]
+
+    def set_state(self, auth_index, state, reason="", next_attempt="", generation="", disabled=None):
+        self.calls.append(("set_state", auth_index, state, reason, next_attempt, generation, disabled))
+        if state == self.fail_transition_state:
+            self.fail_transition_state = ""
+            raise reconciler.APIError(412, "retryable")
+        if not self.canonical_path.exists() or generation != self._generation():
+            raise reconciler.APIError(412)
+        canonical = self._canonical()
+        if disabled is not None:
+            canonical["disabled"] = disabled
+        canonical["reconcile_state"] = state
+        if reason:
+            canonical["reconcile_reason"] = reason
+        else:
+            canonical.pop("reconcile_reason", None)
+        if next_attempt:
+            canonical["reconcile_next_attempt"] = next_attempt
+        else:
+            canonical.pop("reconcile_next_attempt", None)
+        write_json(self.canonical_path, canonical)
+        new_generation = self._generation()
+        self.row["generation"] = new_generation
+        self.row["durable_disabled"] = canonical.get("disabled", False)
+        self._queue_current_file()
+        return {"generation": new_generation, "disabled": canonical.get("disabled", False)}
+
+    def refresh(self, auth_index):
+        self.calls.append(("refresh", auth_index))
+        self.refresh_count += 1
+        if self.rotate_on_refresh:
+            canonical = self._canonical()
+            canonical["access_token"] = f"rotated-access-{self.refresh_count}"
+            canonical["refresh_token"] = f"rotated-refresh-{self.refresh_count}"
+            write_json(self.canonical_path, canonical)
+            self.row["generation"] = self._generation()
+            self.row["durable_disabled"] = canonical.get("disabled", False)
+            self._queue_current_file()
+        return "succeeded", self._generation(), self._canonical().get("disabled", False)
+
+    def probe(self, seat, payload):
+        self.calls.append(("probe", seat.auth_index, seat.model))
+        durable_generation = self._generation()
+        snapshot = {
+            "durable_generation": durable_generation,
+            "runtime_generation": self.row["runtime_generation"],
+            "state": self.row["state"],
+            "disabled": self.row["disabled"],
+        }
+        self.probe_snapshots.append(snapshot)
+        if snapshot != {
+            "durable_generation": durable_generation,
+            "runtime_generation": durable_generation,
+            "state": "probing",
+            "disabled": False,
+        }:
+            raise AssertionError(f"probe dispatched before runtime convergence: {snapshot}")
+        return self.probe_outcomes.pop(0)
+
+
+class AdvancingClock:
+    def __init__(self):
+        self.value = 0.0
+
+    def __call__(self):
+        self.value += 0.1
+        return self.value
 
 
 class HTTPErrorAdapter(reconciler.APIAdapter):
@@ -262,6 +480,13 @@ class PromotionTests(unittest.TestCase):
             ("refresh_token",),
         )
 
+    def run_with_stateful_watcher(self, controller):
+        clock = AdvancingClock()
+        with mock.patch.object(reconciler.time, "monotonic", side_effect=clock), mock.patch.object(
+            reconciler.time, "sleep", return_value=None
+        ):
+            return controller.run()
+
     def test_rejects_bad_mode_invalid_json_disabled_and_missing_key(self):
         invalid = [
             ({"provider": "claude", "refresh_token": "x"}, 0o644),
@@ -372,14 +597,16 @@ class PromotionTests(unittest.TestCase):
             self.assertEqual(controller.run(), 0)
             canonical = json.loads(seat.canonical_path.read_text())
             self.assertFalse(canonical["disabled"])
-            self.assertEqual(canonical["reconcile_state"], "probing")
+            self.assertEqual(canonical["reconcile_state"], "ready")
             self.assertEqual(stat.S_IMODE(seat.canonical_path.stat().st_mode), 0o600)
-            self.assertEqual(api.probed_canonical, canonical)
+            self.assertEqual(api.probed_canonical["reconcile_state"], "probing")
+            self.assertEqual(api.probed_canonical["refresh_token"], canonical["refresh_token"])
+            self.assertEqual(api.probed_canonical["disabled"], canonical["disabled"])
             self.assertEqual(
                 [call[2] for call in api.calls if call[0] == "set_state"],
-                ["refreshing", "probing"],
+                ["refreshing", "probing", "ready"],
             )
-            self.assertEqual(len(controller.reload_calls), 1)
+            self.assertEqual(len(controller.reload_calls), 4)
             seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
             self.assertEqual(controller.store.read(seat_key)["state"], "ready")
 
@@ -403,7 +630,7 @@ class PromotionTests(unittest.TestCase):
             self.assertEqual(controller.run(), 1)
             self.assertEqual(json.loads(seat.canonical_path.read_text()), original)
             self.assertEqual(stat.S_IMODE(seat.canonical_path.stat().st_mode), 0o600)
-            self.assertEqual(controller.reload_calls, 2)
+            self.assertEqual(controller.reload_calls, 3)
 
     def test_controller_rolls_back_normalization_when_probe_fails(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -413,7 +640,8 @@ class PromotionTests(unittest.TestCase):
             write_json(seat.canonical_path, original, 0o664)
             controller = ImmediateReloadController(
                 reconciler.Inventory((seat,), 3, 10, 80),
-                FakeAPI(
+                InspectingAPI(
+                    seat.canonical_path,
                     rows=[remote_row(credential_status="disabled", disabled=True)],
                     probe="retryable",
                 ),
@@ -426,9 +654,339 @@ class PromotionTests(unittest.TestCase):
                 rng=random.Random(1),
             )
             self.assertEqual(controller.run(), 1)
-            self.assertEqual(json.loads(seat.canonical_path.read_text()), original)
+            canonical = json.loads(seat.canonical_path.read_text())
+            self.assertTrue(canonical["disabled"])
+            self.assertEqual(canonical["refresh_token"], original["refresh_token"])
+            self.assertEqual(canonical["reconcile_state"], "cooling")
+            self.assertEqual(canonical["reconcile_reason"], "probe_retryable")
             self.assertEqual(stat.S_IMODE(seat.canonical_path.stat().st_mode), 0o600)
-            self.assertEqual(len(controller.reload_calls), 2)
+            self.assertGreaterEqual(len(controller.reload_calls), 2)
+
+    def test_rejected_probe_preserves_rotated_tokens_but_restores_archived_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            original = {
+                "provider": "claude",
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+                "disabled": True,
+            }
+            write_json(seat.canonical_path, original, 0o600)
+            api = RotatingInspectingAPI(
+                seat.canonical_path,
+                rows=[remote_row(credential_status="disabled", disabled=True)],
+                probe="rejected",
+            )
+            controller = ImmediateReloadController(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+            self.assertEqual(controller.run(), 1)
+            canonical = json.loads(seat.canonical_path.read_text())
+            self.assertEqual(canonical["access_token"], "rotated-access")
+            self.assertEqual(canonical["refresh_token"], "rotated-refresh")
+            self.assertTrue(canonical["disabled"])
+            self.assertEqual(canonical["reconcile_state"], "cooling")
+            self.assertEqual(canonical["reconcile_reason"], "probe_rejected")
+            archives = list((root / "state" / "rollback").glob("*.rollback"))
+            self.assertEqual(len(archives), 1)
+            self.assertEqual(json.loads(archives[0].read_text()), original)
+
+    def test_probe_waits_for_delayed_runtime_generation_and_probing_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            write_json(
+                seat.canonical_path,
+                {"provider": "claude", "refresh_token": "old", "disabled": True},
+            )
+            api = StatefulGenerationAPI(
+                seat.canonical_path,
+                row={"credential_status": "disabled", "disabled": True},
+                publish_delay=3,
+            )
+            controller = reconciler.Controller(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+            self.assertEqual(self.run_with_stateful_watcher(controller), 0)
+            self.assertGreaterEqual(api.divergent_statuses, 3)
+            self.assertEqual(len(api.probe_snapshots), 1)
+            snapshot = api.probe_snapshots[0]
+            self.assertEqual(snapshot["runtime_generation"], snapshot["durable_generation"])
+            self.assertEqual(snapshot["state"], "probing")
+            self.assertFalse(snapshot["disabled"])
+
+    def test_rejected_probe_cooling_preserves_archived_admission_and_newest_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            write_json(
+                seat.canonical_path,
+                {
+                    "provider": "claude",
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                    "disabled": True,
+                },
+            )
+            api = StatefulGenerationAPI(
+                seat.canonical_path,
+                row={"credential_status": "disabled", "disabled": True},
+                probe_outcomes=("rejected",),
+                publish_delay=2,
+                rotate_on_refresh=True,
+            )
+            controller = reconciler.Controller(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+            self.assertEqual(self.run_with_stateful_watcher(controller), 1)
+            canonical = json.loads(seat.canonical_path.read_text())
+            self.assertEqual(canonical["access_token"], "rotated-access-1")
+            self.assertEqual(canonical["refresh_token"], "rotated-refresh-1")
+            self.assertTrue(canonical["disabled"])
+            self.assertEqual(canonical["reconcile_state"], "cooling")
+            self.assertEqual(canonical["reconcile_reason"], "probe_rejected")
+            self.assertEqual(api.row["runtime_generation"], api.row["generation"])
+            self.assertTrue(api.row["disabled"])
+
+    def test_candidate_probing_transition_error_restages_refresh_and_restores_canonical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            original = {
+                "provider": "claude",
+                "access_token": "canonical-access",
+                "refresh_token": "canonical-refresh",
+                "disabled": True,
+            }
+            candidate = {
+                "provider": "claude",
+                "access_token": "candidate-access",
+                "refresh_token": "candidate-refresh",
+                "disabled": False,
+            }
+            write_json(seat.canonical_path, original)
+            write_json(seat.candidate_path, candidate)
+            api = StatefulGenerationAPI(
+                seat.canonical_path,
+                row={"credential_status": "disabled", "disabled": True},
+                publish_delay=1,
+                rotate_on_refresh=True,
+                fail_transition_state="probing",
+            )
+            controller = reconciler.Controller(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+            self.assertEqual(self.run_with_stateful_watcher(controller), 1)
+            canonical = json.loads(seat.canonical_path.read_text())
+            staged = json.loads(seat.candidate_path.read_text())
+            self.assertEqual(canonical["access_token"], original["access_token"])
+            self.assertEqual(canonical["refresh_token"], original["refresh_token"])
+            self.assertTrue(canonical["disabled"])
+            self.assertEqual(canonical["reconcile_state"], "cooling")
+            self.assertEqual(staged["access_token"], "rotated-access-1")
+            self.assertEqual(staged["refresh_token"], "rotated-refresh-1")
+
+    def test_first_install_probe_failure_recovers_on_second_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            write_json(
+                seat.candidate_path,
+                {
+                    "provider": "claude",
+                    "access_token": "candidate-access",
+                    "refresh_token": "candidate-refresh",
+                },
+            )
+            api = StatefulGenerationAPI(
+                seat.canonical_path,
+                row={"credential_status": "error", "unavailable": True},
+                probe_outcomes=("retryable", "succeeded"),
+                publish_delay=1,
+            )
+
+            def make_controller():
+                return reconciler.Controller(
+                    reconciler.Inventory((seat,), 3, 10, 80),
+                    api,
+                    root / "state",
+                    root / "run",
+                    HMAC_KEY,
+                    apply=True,
+                    logger=reconciler.configure_logging(io.StringIO()),
+                    now=lambda: NOW,
+                    rng=random.Random(1),
+                )
+
+            self.assertEqual(self.run_with_stateful_watcher(make_controller()), 1)
+            failed = json.loads(seat.canonical_path.read_text())
+            self.assertTrue(failed["disabled"])
+            self.assertEqual(failed["reconcile_state"], "cooling")
+            self.assertTrue(seat.candidate_path.exists())
+
+            seat_key = reconciler.opaque_key(HMAC_KEY, "seat", seat.auth_index)
+            state_path = root / "state" / "seats" / f"{seat_key}.json"
+            persisted = json.loads(state_path.read_text())
+            persisted["next_attempt"] = ""
+            write_json(state_path, persisted)
+
+            self.assertEqual(self.run_with_stateful_watcher(make_controller()), 0)
+            admitted = json.loads(seat.canonical_path.read_text())
+            self.assertFalse(admitted["disabled"])
+            self.assertEqual(admitted["reconcile_state"], "ready")
+            self.assertFalse(seat.candidate_path.exists())
+            self.assertEqual(len(api.probe_snapshots), 2)
+
+    def test_rejected_candidate_probe_restages_rotated_candidate_before_rollback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            original = {
+                "provider": "claude",
+                "access_token": "canonical-access",
+                "refresh_token": "canonical-refresh",
+                "disabled": True,
+            }
+            candidate = {
+                "provider": "claude",
+                "access_token": "candidate-access",
+                "refresh_token": "candidate-refresh",
+                "disabled": False,
+            }
+            write_json(seat.canonical_path, original)
+            write_json(seat.candidate_path, candidate)
+            api = RotatingInspectingAPI(
+                seat.canonical_path,
+                rows=[remote_row(credential_status="disabled", disabled=True)],
+                probe="rejected",
+            )
+            controller = ImmediateReloadController(
+                reconciler.Inventory((seat,), 3, 10, 80),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+                rng=random.Random(1),
+            )
+            self.assertEqual(controller.run(), 1)
+            canonical = json.loads(seat.canonical_path.read_text())
+            staged = json.loads(seat.candidate_path.read_text())
+            self.assertEqual(canonical["refresh_token"], "canonical-refresh")
+            self.assertTrue(canonical["disabled"])
+            self.assertEqual(canonical["reconcile_state"], "cooling")
+            self.assertEqual(staged["refresh_token"], "rotated-refresh")
+            self.assertEqual(staged["access_token"], "rotated-access")
+
+    def test_rollback_refuses_to_overwrite_newer_canonical_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seat = self.make_seat(root)
+            original = {"provider": "claude", "refresh_token": "old", "disabled": True}
+            write_json(seat.canonical_path, original)
+            archive = reconciler.normalize_canonical(
+                seat,
+                root / "state" / "rollback",
+                "opaque-seat",
+                NOW,
+            )
+            promoted_generation = reconciler.raw_file_generation(seat.canonical_path)
+            newer = {"provider": "claude", "refresh_token": "newer", "disabled": False}
+            write_json(seat.canonical_path, newer)
+            controller = ImmediateReloadController(
+                reconciler.Inventory((seat,)),
+                FakeAPI(),
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                apply=True,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+            )
+            self.assertIsNone(
+                controller._restore_and_reload(seat, archive, promoted_generation)
+            )
+            self.assertEqual(json.loads(seat.canonical_path.read_text()), newer)
+
+    def test_candidate_restage_refuses_changed_or_missing_staged_generation(self):
+        for replacement in ({"provider": "claude", "refresh_token": "newer"}, None):
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                seat = self.make_seat(root)
+                original = {"provider": "claude", "refresh_token": "old", "disabled": True}
+                staged = {"provider": "claude", "refresh_token": "candidate", "disabled": False}
+                write_json(seat.canonical_path, original)
+                write_json(seat.candidate_path, staged)
+                archive = reconciler.promote_candidate(
+                    seat,
+                    root / "state" / "rollback",
+                    "opaque-seat",
+                    NOW,
+                )
+                expected_canonical = reconciler.raw_file_generation(seat.canonical_path)
+                expected_candidate = reconciler.raw_file_generation(seat.candidate_path)
+                if replacement is None:
+                    seat.candidate_path.unlink()
+                else:
+                    write_json(seat.candidate_path, replacement)
+                controller = ImmediateReloadController(
+                    reconciler.Inventory((seat,)),
+                    FakeAPI(),
+                    root / "state",
+                    root / "run",
+                    HMAC_KEY,
+                    apply=True,
+                    logger=reconciler.configure_logging(io.StringIO()),
+                    now=lambda: NOW,
+                )
+                self.assertIsNone(
+                    controller._restage_candidate_and_restore(
+                        seat,
+                        archive,
+                        expected_candidate,
+                        expected_canonical,
+                    )
+                )
+                self.assertNotEqual(json.loads(seat.canonical_path.read_text()), original)
+                if replacement is None:
+                    self.assertFalse(seat.candidate_path.exists())
+                else:
+                    self.assertEqual(json.loads(seat.candidate_path.read_text()), replacement)
 
     def test_controller_rolls_back_when_pinned_probe_fails(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -454,13 +1012,13 @@ class PromotionTests(unittest.TestCase):
             self.assertEqual(json.loads(seat.canonical_path.read_text()), original)
             self.assertTrue(seat.candidate_path.exists())
 
-    def test_controller_removes_new_canonical_when_first_candidate_probe_fails(self):
+    def test_controller_retains_disabled_canonical_when_first_candidate_probe_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             seat = self.make_seat(root)
             write_json(seat.candidate_path, {"provider": "claude", "refresh_token": "new"})
-            api = FakeAPI(probe="retryable")
-            controller = reconciler.Controller(
+            api = InspectingAPI(seat.canonical_path, probe="retryable")
+            controller = ImmediateReloadController(
                 reconciler.Inventory((seat,), 3, 10, 80),
                 api,
                 root / "state",
@@ -472,7 +1030,10 @@ class PromotionTests(unittest.TestCase):
                 rng=random.Random(1),
             )
             self.assertEqual(controller.run(), 1)
-            self.assertFalse(seat.canonical_path.exists())
+            self.assertTrue(seat.canonical_path.exists())
+            canonical = json.loads(seat.canonical_path.read_text())
+            self.assertTrue(canonical["disabled"])
+            self.assertEqual(canonical["reconcile_state"], "cooling")
             self.assertTrue(seat.candidate_path.exists())
 
     def test_controller_rolls_back_when_promotion_reload_is_not_acknowledged(self):
@@ -486,7 +1047,7 @@ class PromotionTests(unittest.TestCase):
                 write_json(seat.candidate_path, {"provider": "claude", "refresh_token": "new"})
                 controller = PromotionReloadFailureController(
                     reconciler.Inventory((seat,), 3, 10, 80),
-                    FakeAPI(),
+                    InspectingAPI(seat.canonical_path) if not existing else FakeAPI(),
                     root / "state",
                     root / "run",
                     HMAC_KEY,
@@ -499,9 +1060,10 @@ class PromotionTests(unittest.TestCase):
                 if existing:
                     self.assertEqual(json.loads(seat.canonical_path.read_text()), original)
                 else:
-                    self.assertFalse(seat.canonical_path.exists())
+                    self.assertTrue(seat.canonical_path.exists())
+                    self.assertTrue(json.loads(seat.canonical_path.read_text())["disabled"])
                 self.assertTrue(seat.candidate_path.exists())
-                self.assertEqual(controller.reload_calls, 2)
+                self.assertGreaterEqual(controller.reload_calls, 1)
 
 
 class ControllerTests(unittest.TestCase):
@@ -593,7 +1155,251 @@ class ControllerTests(unittest.TestCase):
         adapter = HTTPErrorAdapter("http://127.0.0.1:8319")
         seat = reconciler.Seat("index-alpha", "claude", "probe-model")
         self.assertEqual(adapter.probe(seat, {"messages": []}), "auth_required")
-        self.assertEqual(adapter.refresh(seat.auth_index), "auth_required")
+        self.assertEqual(adapter.refresh(seat.auth_index), ("auth_required", "", False))
+
+    def test_adapter_preserves_committed_generation_from_conflict(self):
+        adapter = reconciler.APIAdapter("http://127.0.0.1:8319")
+        body = io.BytesIO(
+            json.dumps(
+                {
+                    "error": "reconcile state committed but runtime publication failed",
+                    "outcome": "committed",
+                    "generation": GENERATION,
+                }
+            ).encode()
+        )
+        conflict = reconciler.urllib.error.HTTPError(
+            "http://127.0.0.1:8319/reconcile-state",
+            409,
+            "Conflict",
+            {},
+            body,
+        )
+        with mock.patch.object(reconciler.urllib.request, "urlopen", side_effect=conflict):
+            with self.assertRaises(reconciler.CommittedTransition) as raised:
+                adapter.set_state("index-alpha", "probing", generation=GENERATION, disabled=False)
+        conflict.close()
+        self.assertEqual(raised.exception.status, 409)
+        self.assertEqual(raised.exception.generation, GENERATION)
+
+    def test_transition_waits_for_committed_generation_without_replaying(self):
+        class CommittedAPI(FakeAPI):
+            def __init__(self):
+                super().__init__(rows=[remote_row(state="refreshing")])
+                self.set_calls = 0
+
+            def set_state(self, auth_index, state, reason="", next_attempt="", generation="", disabled=None):
+                self.set_calls += 1
+                row = self.rows[0]
+                row.update(
+                    {
+                        "state": state,
+                        "reason": reason,
+                        "next_attempt": next_attempt,
+                        "generation": "b" * 64,
+                        "runtime_generation": "b" * 64,
+                        "disabled": disabled,
+                        "durable_disabled": disabled,
+                    }
+                )
+                raise reconciler.CommittedTransition(409, "b" * 64)
+
+        api = CommittedAPI()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = reconciler.Controller(
+                reconciler.Inventory((reconciler.Seat("index-alpha", "claude", "probe-model"),)),
+                api,
+                root / "state",
+                root / "run",
+                HMAC_KEY,
+                logger=reconciler.configure_logging(io.StringIO()),
+                now=lambda: NOW,
+            )
+            generation = controller._transition(
+                "index-alpha",
+                GENERATION,
+                "probing",
+                "refresh_succeeded",
+                disabled=False,
+            )
+        self.assertEqual(generation, "b" * 64)
+        self.assertEqual(api.set_calls, 1)
+
+    def test_transition_discovers_commit_after_response_loss(self):
+        class LostResponseAPI(FakeAPI):
+            def __init__(self):
+                super().__init__(rows=[remote_row(state="refreshing")])
+                self.set_calls = 0
+
+            def set_state(self, auth_index, state, reason="", next_attempt="", generation="", disabled=None):
+                self.set_calls += 1
+                row = self.rows[0]
+                row.update(
+                    {
+                        "state": state,
+                        "reason": reason,
+                        "next_attempt": next_attempt,
+                        "generation": "c" * 64,
+                        "runtime_generation": "c" * 64,
+                        "disabled": disabled,
+                        "durable_disabled": disabled,
+                    }
+                )
+                raise reconciler.APIError()
+
+        for state in ("probing", "ready"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                api = LostResponseAPI()
+                controller = reconciler.Controller(
+                    reconciler.Inventory((reconciler.Seat("index-alpha", "claude", "probe-model"),)),
+                    api,
+                    root / "state",
+                    root / "run",
+                    HMAC_KEY,
+                    logger=reconciler.configure_logging(io.StringIO()),
+                    now=lambda: NOW,
+                )
+                generation = controller._transition(
+                    "index-alpha",
+                    GENERATION,
+                    state,
+                    "refresh_succeeded" if state == "probing" else "",
+                    disabled=False,
+                )
+                self.assertEqual(generation, "c" * 64)
+                self.assertEqual(api.set_calls, 1)
+
+    def test_transition_waits_for_delayed_commit_publication_after_response_loss(self):
+        class DelayedLostResponseAPI(FakeAPI):
+            def __init__(self):
+                super().__init__(rows=[remote_row(state="refreshing")])
+                self.status_calls = 0
+
+            def set_state(self, auth_index, state, reason="", next_attempt="", generation="", disabled=None):
+                self.target_state = state
+                self.target_reason = reason
+                self.target_next_attempt = next_attempt
+                self.target_disabled = disabled
+                self.rows[0]["generation"] = "d" * 64
+                raise reconciler.APIError()
+
+            def status(self):
+                self.status_calls += 1
+                if self.status_calls >= 3:
+                    self.rows[0].update(
+                        {
+                            "state": self.target_state,
+                            "reason": self.target_reason,
+                            "next_attempt": self.target_next_attempt,
+                            "runtime_generation": "d" * 64,
+                            "disabled": self.target_disabled,
+                            "durable_disabled": self.target_disabled,
+                        }
+                    )
+                return super().status()
+
+        for state in ("probing", "ready"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                api = DelayedLostResponseAPI()
+                controller = reconciler.Controller(
+                    reconciler.Inventory((reconciler.Seat("index-alpha", "claude", "probe-model"),)),
+                    api,
+                    root / "state",
+                    root / "run",
+                    HMAC_KEY,
+                    logger=reconciler.configure_logging(io.StringIO()),
+                    now=lambda: NOW,
+                )
+                clock = AdvancingClock()
+                with mock.patch.object(reconciler.time, "monotonic", side_effect=clock), mock.patch.object(
+                    reconciler.time, "sleep", return_value=None
+                ):
+                    generation = controller._transition(
+                        "index-alpha",
+                        GENERATION,
+                        state,
+                        "refresh_succeeded" if state == "probing" else "",
+                        disabled=False,
+                    )
+                self.assertEqual(generation, "d" * 64)
+                self.assertGreaterEqual(api.status_calls, 3)
+
+    def test_transition_does_not_infer_unconverged_or_wrong_state_commit(self):
+        for override in (
+            {"generation": "c" * 64, "runtime_generation": GENERATION},
+            {"state": "cooling"},
+            {"disabled": True, "durable_disabled": True},
+        ):
+            with self.subTest(override=override), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                row = remote_row(state="probing")
+                row.update(override)
+                api = FakeAPI(rows=[row])
+                api.set_state = mock.Mock(side_effect=reconciler.APIError())
+                controller = reconciler.Controller(
+                    reconciler.Inventory((reconciler.Seat("index-alpha", "claude", "probe-model"),)),
+                    api,
+                    root / "state",
+                    root / "run",
+                    HMAC_KEY,
+                    logger=reconciler.configure_logging(io.StringIO()),
+                    now=lambda: NOW,
+                )
+                clock = AdvancingClock()
+                with mock.patch.object(reconciler.time, "monotonic", side_effect=clock), mock.patch.object(
+                    reconciler.time, "sleep", return_value=None
+                ):
+                    with self.assertRaises(reconciler.APIError):
+                        controller._transition(
+                            "index-alpha",
+                            GENERATION,
+                            "probing",
+                            "refresh_succeeded",
+                        disabled=False,
+                    )
+
+    def test_transition_does_not_infer_unchanged_target_state_after_predispatch_loss(self):
+        for state, reason, next_attempt in (
+            ("probing", "refresh_succeeded", ""),
+            ("ready", "", ""),
+            ("cooling", "probe_retryable", (NOW + dt.timedelta(minutes=5)).isoformat()),
+        ):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                row = remote_row(
+                    state=state,
+                    reason=reason,
+                    next_attempt=next_attempt,
+                    disabled=False,
+                    durable_disabled=False,
+                )
+                api = FakeAPI(rows=[row])
+                api.set_state = mock.Mock(side_effect=reconciler.APIError())
+                controller = reconciler.Controller(
+                    reconciler.Inventory((reconciler.Seat("index-alpha", "claude", "probe-model"),)),
+                    api,
+                    root / "state",
+                    root / "run",
+                    HMAC_KEY,
+                    logger=reconciler.configure_logging(io.StringIO()),
+                    now=lambda: NOW,
+                )
+                clock = AdvancingClock()
+                with mock.patch.object(reconciler.time, "monotonic", side_effect=clock), mock.patch.object(
+                    reconciler.time, "sleep", return_value=None
+                ):
+                    with self.assertRaises(reconciler.APIError):
+                        controller._transition(
+                            "index-alpha",
+                            GENERATION,
+                            state,
+                            reason,
+                            next_attempt,
+                            disabled=False,
+                        )
 
     def test_dry_run_is_default_and_performs_no_mutating_api_or_state_writes(self):
         with tempfile.TemporaryDirectory() as directory:

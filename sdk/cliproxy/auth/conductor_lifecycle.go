@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -144,6 +145,19 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
+	if auth.Attributes != nil {
+		if generation := auth.Attributes[AttributeSourceGeneration]; generation != "" {
+			m.mu.Lock()
+			if current := m.auths[auth.ID]; current != nil {
+				current.Attributes[AttributeSourceGeneration] = generation
+				m.auths[auth.ID] = current
+				if m.scheduler != nil {
+					m.scheduler.upsertAuth(current.Clone())
+				}
+			}
+			m.mu.Unlock()
+		}
+	}
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	if cooldownStateChanged {
 		m.persistCooldownStates(ctx)
@@ -202,6 +216,51 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 		}
 	}
 	m.persistCooldownStates(ctx)
+}
+
+// DeleteCredential serializes an explicit durable deletion against every
+// credential-material writer for the same auth ID. A refresh or request-auth
+// preparation that already started finishes before deleteFn runs; later writers
+// observe the runtime tombstone and cannot recreate the deleted credential.
+func (m *Manager) DeleteCredential(ctx context.Context, id string, deleteFn func() error) error {
+	if m == nil {
+		return errors.New("auth manager is nil")
+	}
+	id = strings.TrimSpace(id)
+	if id == "" || deleteFn == nil {
+		return errors.New("credential deletion is incomplete")
+	}
+	return m.WithCredentialMutation(id, func() error {
+		if errDelete := deleteFn(); errDelete != nil {
+			return errDelete
+		}
+		m.Remove(ctx, id)
+		return nil
+	})
+}
+
+// WithCredentialMutation serializes validate-and-publish operations with
+// refresh, request-auth preparation, and explicit deletion for one auth ID.
+func (m *Manager) WithCredentialMutation(id string, mutate func() error) error {
+	if m == nil || mutate == nil {
+		return errors.New("credential mutation is incomplete")
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return errors.New("credential mutation id is empty")
+	}
+	refreshValue, _ := m.refreshLocks.LoadOrStore(id, &authRefreshLock{})
+	refreshLock, _ := refreshValue.(*authRefreshLock)
+	prepareValue, _ := m.requestPrepareLocks.LoadOrStore(id, &requestAuthPrepareLock{})
+	prepareLock, _ := prepareValue.(*requestAuthPrepareLock)
+	if refreshLock == nil || prepareLock == nil {
+		return errors.New("credential mutation lock unavailable")
+	}
+	refreshLock.mu.Lock()
+	defer refreshLock.mu.Unlock()
+	prepareLock.mu.Lock()
+	defer prepareLock.mu.Unlock()
+	return mutate()
 }
 
 func (m *Manager) invalidateSessionAffinity(authID string) {

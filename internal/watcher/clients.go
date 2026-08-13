@@ -322,7 +322,14 @@ func (w *Watcher) computePerPathUpdatesLocked(oldByID, newByID map[string]*corea
 			continue
 		}
 		delete(w.currentAuths, id)
-		updates = append(updates, AuthUpdate{Action: AuthUpdateActionDelete, ID: id})
+		oldAuth := oldByID[id]
+		generation := ""
+		path := ""
+		if oldAuth != nil {
+			generation = oldAuth.Attributes[coreauth.AttributeSourceGeneration]
+			path = oldAuth.Attributes[coreauth.AttributePath]
+		}
+		updates = append(updates, AuthUpdate{Action: AuthUpdateActionDelete, ID: id, Generation: generation, Path: path})
 	}
 	return updates
 }

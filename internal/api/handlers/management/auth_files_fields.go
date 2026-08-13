@@ -678,6 +678,36 @@ func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
 	return store.Delete(ctx, path)
 }
 
+func (h *Handler) deleteAuthFileRecord(ctx context.Context, path, targetID string) error {
+	store := h.tokenStoreWithBaseDir()
+	if store == nil {
+		return fmt.Errorf("token store unavailable")
+	}
+	deleteRecord := func() error {
+		if _, ok := store.(interface {
+			LoadReconcile(context.Context, *coreauth.Auth) (*coreauth.Auth, string, error)
+		}); ok {
+			return store.Delete(ctx, path)
+		}
+		if errRemove := os.Remove(path); errRemove != nil {
+			return errRemove
+		}
+		return store.Delete(ctx, path)
+	}
+	if strings.TrimSpace(targetID) == "" && h != nil && h.authManager != nil {
+		for _, auth := range h.authManager.List() {
+			if auth != nil && sameAuthFilePath(path, authAttribute(auth, coreauth.AttributePath)) {
+				targetID = auth.ID
+				break
+			}
+		}
+	}
+	if h != nil && h.authManager != nil && strings.TrimSpace(targetID) != "" {
+		return h.authManager.DeleteCredential(ctx, targetID, deleteRecord)
+	}
+	return deleteRecord()
+}
+
 func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
 	if h == nil {
 		return nil

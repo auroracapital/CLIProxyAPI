@@ -4,12 +4,190 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
+
+type blockingReconcilePreparer struct {
+	reconcileExecutor
+	once    sync.Once
+	started chan struct{}
+	release chan struct{}
+}
+
+func (*blockingReconcilePreparer) ShouldPrepareRequestAuth(*Auth) bool { return true }
+
+func (e *blockingReconcilePreparer) PrepareRequestAuth(ctx context.Context, auth *Auth) (*Auth, error) {
+	e.once.Do(func() { close(e.started) })
+	select {
+	case <-e.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	updated := auth.Clone()
+	updated.Metadata["project_id"] = "prepared"
+	return updated, nil
+}
+
+type reconcileGenerationStore struct {
+	auth         *Auth
+	generation   string
+	removeOnSave func()
+	saveChanges  bool
+}
+
+func (s *reconcileGenerationStore) List(context.Context) ([]*Auth, error) { return nil, nil }
+func (s *reconcileGenerationStore) Save(_ context.Context, auth *Auth) (string, error) {
+	if s.saveChanges {
+		s.auth = auth.Clone()
+		s.generation = strings.Repeat("c", 64)
+	}
+	return "", nil
+}
+func (s *reconcileGenerationStore) Delete(context.Context, string) error { return nil }
+func (s *reconcileGenerationStore) LoadReconcile(context.Context, *Auth) (*Auth, string, error) {
+	return s.auth.Clone(), s.generation, nil
+}
+func (s *reconcileGenerationStore) SaveReconcileCAS(_ context.Context, auth *Auth, expected string) (string, string, error) {
+	if expected != s.generation {
+		return "", "", ErrReconcileGenerationMismatch
+	}
+	s.auth = auth.Clone()
+	s.generation = strings.Repeat("b", 64)
+	if s.removeOnSave != nil {
+		s.removeOnSave()
+	}
+	return "saved", s.generation, nil
+}
+
+func TestSetReconcileStateCASUsesDurableAdmissionAndRejectsStaleGeneration(t *testing.T) {
+	manager := newReconcileManager(t, &reconcileExecutor{}, ReconcileStateProbing)
+	durable := &Auth{ID: "seat-a", Provider: "gemini", Status: StatusDisabled, Disabled: true, ReconcileState: ReconcileStateProbing, Metadata: map[string]any{"type": "gemini", "disabled": true, "refresh_token": "restored"}}
+	generation := strings.Repeat("a", 64)
+	store := &reconcileGenerationStore{auth: durable, generation: generation}
+	manager.SetStore(store)
+	disabled := true
+	updated, nextGeneration, errSet := manager.SetReconcileStateCAS(context.Background(), "seat-a", generation, ReconcileStateCooling, "probe_rejected", time.Now().Add(time.Minute), &disabled)
+	if errSet != nil {
+		t.Fatal(errSet)
+	}
+	if nextGeneration == generation || updated == nil || !updated.Disabled || updated.Metadata["refresh_token"] != "restored" || updated.ReconcileState != ReconcileStateCooling {
+		t.Fatalf("updated=%#v generation=%q", updated, nextGeneration)
+	}
+	if _, _, errStale := manager.SetReconcileStateCAS(context.Background(), "seat-a", generation, ReconcileStateReady, "", time.Time{}, nil); !errors.Is(errStale, ErrReconcileGenerationMismatch) {
+		t.Fatalf("stale generation error=%v", errStale)
+	}
+	delayed := updated.Clone()
+	delayed.Attributes = map[string]string{AttributeSourceBackend: AuthSourceFile, AttributeSourceGeneration: generation}
+	if manager.ReconcileSourceGenerationCurrent(context.Background(), delayed) {
+		t.Fatal("delayed watcher generation was accepted")
+	}
+}
+
+func TestSetReconcileStateCASReadyPerformsAdmissionCleanup(t *testing.T) {
+	generation := strings.Repeat("a", 64)
+	durable := &Auth{
+		ID:             "seat-a",
+		Provider:       "gemini",
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: time.Now().Add(time.Hour),
+		LastError:      &Error{Code: "rate_limited"},
+		StatusMessage:  "cooling",
+		ReconcileState: ReconcileStateProbing,
+		Metadata:       map[string]any{"type": "gemini", "disabled": false},
+	}
+	store := &reconcileGenerationStore{auth: durable, generation: generation}
+	manager := newReconcileManager(t, &reconcileExecutor{}, ReconcileStateProbing)
+	manager.SetStore(store)
+	updated, _, errSet := manager.SetReconcileStateCAS(context.Background(), "seat-a", generation, ReconcileStateReady, "", time.Time{}, nil)
+	if errSet != nil {
+		t.Fatal(errSet)
+	}
+	if updated.Status != StatusActive || updated.Unavailable || !updated.NextRetryAfter.IsZero() || updated.LastError != nil || updated.StatusMessage != "" || updated.ReconcileState != ReconcileStateReady {
+		t.Fatalf("admission cleanup incomplete: %#v", updated)
+	}
+}
+
+func TestSetReconcileStateCASReportsCommittedGenerationWithoutResurrectingRemovedAuth(t *testing.T) {
+	generation := strings.Repeat("a", 64)
+	durable := &Auth{ID: "seat-a", Provider: "gemini", Status: StatusActive, ReconcileState: ReconcileStateProbing, Metadata: map[string]any{"type": "gemini"}}
+	manager := newReconcileManager(t, &reconcileExecutor{}, ReconcileStateProbing)
+	store := &reconcileGenerationStore{auth: durable, generation: generation}
+	store.removeOnSave = func() { manager.Remove(context.Background(), "seat-a") }
+	manager.SetStore(store)
+	updated, committedGeneration, errSet := manager.SetReconcileStateCAS(context.Background(), "seat-a", generation, ReconcileStateCooling, "probe_retryable", time.Now().Add(time.Minute), nil)
+	if updated != nil {
+		t.Fatalf("removed auth was republished: %#v", updated)
+	}
+	var committed *ReconcileCommittedError
+	if !errors.As(errSet, &committed) || committed.Generation != committedGeneration || committedGeneration != strings.Repeat("b", 64) {
+		t.Fatalf("generation=%q error=%v", committedGeneration, errSet)
+	}
+	if _, exists := manager.GetByID("seat-a"); exists {
+		t.Fatal("committed CAS resurrected removed runtime auth")
+	}
+}
+
+func TestSetReconcileStateCASWaitsForPreparationThenRebasesLifecycle(t *testing.T) {
+	generation := strings.Repeat("a", 64)
+	durable := &Auth{ID: "seat-a", Provider: "gemini", Status: StatusActive, ReconcileState: ReconcileStateRefreshing, Metadata: map[string]any{"type": "gemini", "disabled": false}}
+	store := &reconcileGenerationStore{auth: durable, generation: generation, saveChanges: true}
+	executor := &blockingReconcilePreparer{started: make(chan struct{}), release: make(chan struct{})}
+	manager := NewManager(store, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(executor)
+	registry.GetGlobalRegistry().RegisterClient(durable.ID, durable.Provider, []*registry.ModelInfo{{ID: "gemini-probe"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(durable.ID) })
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), durable); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	prepareDone := make(chan error, 1)
+	go func() {
+		current, _ := manager.GetByID(durable.ID)
+		_, errPrepare := manager.prepareRequestAuth(context.Background(), executor, current)
+		prepareDone <- errPrepare
+	}()
+	<-executor.started
+	casDone := make(chan struct {
+		auth       *Auth
+		generation string
+		err        error
+	}, 1)
+	go func() {
+		updated, nextGeneration, errSet := manager.SetReconcileStateCAS(context.Background(), durable.ID, generation, ReconcileStateProbing, "refresh_succeeded", time.Time{}, nil)
+		casDone <- struct {
+			auth       *Auth
+			generation string
+			err        error
+		}{updated, nextGeneration, errSet}
+	}()
+	select {
+	case result := <-casDone:
+		t.Fatalf("CAS completed before preparation released: %#v", result)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(executor.release)
+	if errPrepare := <-prepareDone; errPrepare != nil {
+		t.Fatal(errPrepare)
+	}
+	result := <-casDone
+	if !errors.Is(result.err, ErrReconcileGenerationMismatch) || result.auth != nil {
+		t.Fatalf("stale CAS did not fail after preparation changed generation: %#v", result)
+	}
+	preparedGeneration := store.generation
+	updated, nextGeneration, errRetry := manager.SetReconcileStateCAS(context.Background(), durable.ID, preparedGeneration, ReconcileStateProbing, "refresh_succeeded", time.Time{}, nil)
+	if errRetry != nil {
+		t.Fatal(errRetry)
+	}
+	if updated == nil || updated.ReconcileState != ReconcileStateProbing || updated.Metadata["project_id"] != "prepared" || nextGeneration == preparedGeneration {
+		t.Fatalf("retry did not rebase prepared credential: auth=%#v generation=%q", updated, nextGeneration)
+	}
+}
 
 type reconcileExecutor struct {
 	calls        []string

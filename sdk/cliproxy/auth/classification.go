@@ -21,6 +21,7 @@ const (
 	AttributeRuntimeOnly      = "runtime_only"
 	AttributeSource           = "source"
 	AttributeSourceBackend    = "source_backend"
+	AttributeSourceGeneration = "source_generation"
 	AttributeWeight           = "weight"
 )
 

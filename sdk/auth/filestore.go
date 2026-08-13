@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -88,6 +89,9 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	if path == "" {
 		return "", fmt.Errorf("auth filestore: missing file path attribute for %s", auth.ID)
 	}
+	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
+	}
 
 	if auth.Disabled {
 		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
@@ -97,9 +101,25 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
+	unlock, errLock := lockReconcilePath(path)
+	if errLock != nil {
+		return "", errLock
+	}
+	defer unlock()
+	targetPath := path
+	stagedPath := ""
+	if auth.Storage != nil {
+		staged, errStage := os.CreateTemp(filepath.Dir(path), ".auth-save-")
+		if errStage != nil {
+			return "", fmt.Errorf("auth filestore: create save temp: %w", errStage)
+		}
+		stagedPath = staged.Name()
+		if errClose := staged.Close(); errClose != nil {
+			_ = os.Remove(stagedPath)
+			return "", fmt.Errorf("auth filestore: close save temp: %w", errClose)
+		}
+		targetPath = stagedPath
+		defer func() { _ = os.Remove(stagedPath) }()
 	}
 
 	// metadataSetter is a private interface for TokenStorage implementations that support metadata injection.
@@ -116,8 +136,29 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		if setter, ok := auth.Storage.(metadataSetter); ok {
 			setter.SetMetadata(auth.Metadata)
 		}
-		if err = auth.Storage.SaveTokenToFile(path); err != nil {
+		if err = auth.Storage.SaveTokenToFile(targetPath); err != nil {
 			return "", err
+		}
+		info, errStat := os.Lstat(targetPath)
+		if errStat != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("auth filestore: saved credential is unsafe")
+		}
+		if errChmod := os.Chmod(targetPath, 0o600); errChmod != nil {
+			return "", fmt.Errorf("auth filestore: secure saved credential: %w", errChmod)
+		}
+		file, errOpen := os.Open(targetPath)
+		if errOpen != nil {
+			return "", fmt.Errorf("auth filestore: open saved credential: %w", errOpen)
+		}
+		if errSync := file.Sync(); errSync != nil {
+			_ = file.Close()
+			return "", fmt.Errorf("auth filestore: sync saved credential: %w", errSync)
+		}
+		if errClose := file.Close(); errClose != nil {
+			return "", fmt.Errorf("auth filestore: close saved credential: %w", errClose)
+		}
+		if errRename := os.Rename(targetPath, path); errRename != nil {
+			return "", fmt.Errorf("auth filestore: replace saved credential: %w", errRename)
 		}
 	case auth.Metadata != nil:
 		auth.Metadata["disabled"] = auth.Disabled
@@ -125,30 +166,40 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		if errMarshal != nil {
 			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
 		}
-		if existing, errRead := os.ReadFile(path); errRead == nil {
-			if jsonEqual(existing, raw) {
-				break
-			}
-			file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
-			if errOpen != nil {
-				return "", fmt.Errorf("auth filestore: open existing failed: %w", errOpen)
-			}
-			if _, errWrite := file.Write(raw); errWrite != nil {
-				_ = file.Close()
-				return "", fmt.Errorf("auth filestore: write existing failed: %w", errWrite)
-			}
-			if errClose := file.Close(); errClose != nil {
-				return "", fmt.Errorf("auth filestore: close existing failed: %w", errClose)
-			}
+		if existing, errRead := os.ReadFile(path); errRead == nil && jsonEqual(existing, raw) {
 			break
-		} else if !os.IsNotExist(errRead) {
+		} else if errRead != nil && !os.IsNotExist(errRead) {
 			return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
 		}
-		if errWrite := os.WriteFile(path, raw, 0o600); errWrite != nil {
-			return "", fmt.Errorf("auth filestore: write file failed: %w", errWrite)
+		temp, errTemp := os.CreateTemp(filepath.Dir(path), ".auth-save-")
+		if errTemp != nil {
+			return "", fmt.Errorf("auth filestore: create metadata temp: %w", errTemp)
+		}
+		tempPath := temp.Name()
+		defer func() { _ = os.Remove(tempPath) }()
+		if errChmod := temp.Chmod(0o600); errChmod != nil {
+			_ = temp.Close()
+			return "", fmt.Errorf("auth filestore: secure metadata temp: %w", errChmod)
+		}
+		if _, errWrite := temp.Write(raw); errWrite != nil {
+			_ = temp.Close()
+			return "", fmt.Errorf("auth filestore: write metadata temp: %w", errWrite)
+		}
+		if errSync := temp.Sync(); errSync != nil {
+			_ = temp.Close()
+			return "", fmt.Errorf("auth filestore: sync metadata temp: %w", errSync)
+		}
+		if errClose := temp.Close(); errClose != nil {
+			return "", fmt.Errorf("auth filestore: close metadata temp: %w", errClose)
+		}
+		if errRename := os.Rename(tempPath, path); errRename != nil {
+			return "", fmt.Errorf("auth filestore: replace metadata credential: %w", errRename)
 		}
 	default:
 		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
+	}
+	if errSyncDir := syncDirectory(filepath.Dir(path)); errSyncDir != nil {
+		return "", errSyncDir
 	}
 
 	if auth.Attributes == nil {
@@ -161,8 +212,160 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	if strings.TrimSpace(auth.FileName) == "" {
 		auth.FileName = auth.ID
 	}
+	if persisted, errReadGeneration := os.ReadFile(path); errReadGeneration == nil {
+		digest := sha256.Sum256(persisted)
+		if auth.Attributes == nil {
+			auth.Attributes = make(map[string]string)
+		}
+		auth.Attributes[cliproxyauth.AttributeSourceGeneration] = fmt.Sprintf("%x", digest[:])
+	}
 
 	return path, nil
+}
+
+func syncDirectory(path string) error {
+	directory, errOpen := os.Open(path)
+	if errOpen != nil {
+		return fmt.Errorf("auth filestore: open credential directory: %w", errOpen)
+	}
+	if errSync := directory.Sync(); errSync != nil {
+		_ = directory.Close()
+		return fmt.Errorf("auth filestore: sync credential directory: %w", errSync)
+	}
+	if errClose := directory.Close(); errClose != nil {
+		return fmt.Errorf("auth filestore: close credential directory: %w", errClose)
+	}
+	return nil
+}
+
+// LoadReconcile returns an auth rebuilt from the exact durable file generation.
+// Runtime-only fields come from reference, while credential and admission fields
+// always come from disk.
+func (s *FileTokenStore) LoadReconcile(_ context.Context, reference *cliproxyauth.Auth) (*cliproxyauth.Auth, string, error) {
+	if reference == nil {
+		return nil, "", fmt.Errorf("auth filestore: reconcile reference is nil")
+	}
+	path, errPath := s.resolveAuthPath(reference)
+	if errPath != nil || path == "" {
+		return nil, "", fmt.Errorf("auth filestore: reconcile path unavailable")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlock, errLock := lockReconcilePath(path)
+	if errLock != nil {
+		return nil, "", errLock
+	}
+	defer unlock()
+	raw, errRead := os.ReadFile(path)
+	if errRead != nil {
+		return nil, "", fmt.Errorf("auth filestore: read reconcile credential: %w", errRead)
+	}
+	var metadata map[string]any
+	if errJSON := json.Unmarshal(raw, &metadata); errJSON != nil || metadata == nil {
+		return nil, "", fmt.Errorf("auth filestore: invalid reconcile credential")
+	}
+	provider, _ := metadata["type"].(string)
+	provider = strings.TrimSpace(provider)
+	if strings.EqualFold(provider, "gemini") {
+		provider = "gemini-cli"
+	}
+	if !strings.EqualFold(provider, strings.TrimSpace(reference.Provider)) {
+		return nil, "", fmt.Errorf("auth filestore: reconcile provider mismatch")
+	}
+	loaded := reference.Clone()
+	loaded.Storage = nil
+	loaded.Metadata = metadata
+	loaded.Disabled, _ = metadata["disabled"].(bool)
+	if loaded.Disabled {
+		loaded.Status = cliproxyauth.StatusDisabled
+	} else if loaded.Status == cliproxyauth.StatusDisabled {
+		loaded.Status = cliproxyauth.StatusActive
+	}
+	loaded.ReconcileState = ""
+	loaded.ReconcileReason = ""
+	loaded.ReconcileNextAttempt = time.Time{}
+	cliproxyauth.HydrateReconcileMetadata(loaded, metadata)
+	digest := sha256.Sum256(raw)
+	generation := fmt.Sprintf("%x", digest[:])
+	if loaded.Attributes == nil {
+		loaded.Attributes = make(map[string]string)
+	}
+	loaded.Attributes[cliproxyauth.AttributeSourceGeneration] = generation
+	return loaded, generation, nil
+}
+
+// SaveReconcileCAS atomically changes lifecycle/admission metadata only when
+// the on-disk credential is still the generation the caller loaded.
+func (s *FileTokenStore) SaveReconcileCAS(_ context.Context, auth *cliproxyauth.Auth, expectedGeneration string) (string, string, error) {
+	if auth == nil || auth.Metadata == nil {
+		return "", "", fmt.Errorf("auth filestore: incomplete reconcile update")
+	}
+	path, errPath := s.resolveAuthPath(auth)
+	if errPath != nil || path == "" {
+		return "", "", fmt.Errorf("auth filestore: reconcile path unavailable")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlock, errLock := lockReconcilePath(path)
+	if errLock != nil {
+		return "", "", errLock
+	}
+	defer unlock()
+	current, errRead := os.ReadFile(path)
+	if errRead != nil {
+		return "", "", fmt.Errorf("auth filestore: read reconcile generation: %w", errRead)
+	}
+	currentDigest := sha256.Sum256(current)
+	if !strings.EqualFold(strings.TrimSpace(expectedGeneration), fmt.Sprintf("%x", currentDigest[:])) {
+		return "", "", cliproxyauth.ErrReconcileGenerationMismatch
+	}
+	auth.Metadata["disabled"] = auth.Disabled
+	raw, errJSON := json.Marshal(auth.Metadata)
+	if errJSON != nil {
+		return "", "", fmt.Errorf("auth filestore: marshal reconcile update: %w", errJSON)
+	}
+	raw = append(raw, '\n')
+	temp, errTemp := os.CreateTemp(filepath.Dir(path), ".reconcile-cas-")
+	if errTemp != nil {
+		return "", "", fmt.Errorf("auth filestore: create reconcile temp: %w", errTemp)
+	}
+	tempPath := temp.Name()
+	defer func() { _ = os.Remove(tempPath) }()
+	if errChmod := temp.Chmod(0o600); errChmod != nil {
+		_ = temp.Close()
+		return "", "", fmt.Errorf("auth filestore: secure reconcile temp: %w", errChmod)
+	}
+	if _, errWrite := temp.Write(raw); errWrite != nil {
+		_ = temp.Close()
+		return "", "", fmt.Errorf("auth filestore: write reconcile temp: %w", errWrite)
+	}
+	if errSync := temp.Sync(); errSync != nil {
+		_ = temp.Close()
+		return "", "", fmt.Errorf("auth filestore: sync reconcile temp: %w", errSync)
+	}
+	if errClose := temp.Close(); errClose != nil {
+		return "", "", fmt.Errorf("auth filestore: close reconcile temp: %w", errClose)
+	}
+	if errRename := os.Rename(tempPath, path); errRename != nil {
+		return "", "", fmt.Errorf("auth filestore: replace reconcile credential: %w", errRename)
+	}
+	directory, errOpenDir := os.Open(filepath.Dir(path))
+	if errOpenDir != nil {
+		return "", "", fmt.Errorf("auth filestore: open reconcile directory: %w", errOpenDir)
+	}
+	if errSyncDir := directory.Sync(); errSyncDir != nil {
+		_ = directory.Close()
+		return "", "", fmt.Errorf("auth filestore: sync reconcile directory: %w", errSyncDir)
+	}
+	if errCloseDir := directory.Close(); errCloseDir != nil {
+		return "", "", fmt.Errorf("auth filestore: close reconcile directory: %w", errCloseDir)
+	}
+	info, errStat := os.Lstat(path)
+	if errStat != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return "", "", fmt.Errorf("auth filestore: reconcile credential permissions invalid")
+	}
+	newDigest := sha256.Sum256(raw)
+	return path, fmt.Sprintf("%x", newDigest[:]), nil
 }
 
 // List enumerates all auth JSON files under the configured directory.
@@ -199,6 +402,7 @@ func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error)
 
 // Delete removes the auth file.
 func (s *FileTokenStore) Delete(ctx context.Context, id string) error {
+	_ = ctx
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return fmt.Errorf("auth filestore: id is empty")
@@ -207,10 +411,20 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	if errMkdir := os.MkdirAll(filepath.Dir(path), 0o700); errMkdir != nil {
+		return fmt.Errorf("auth filestore: create delete dir: %w", errMkdir)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlock, errLock := lockReconcilePath(path)
+	if errLock != nil {
+		return errLock
+	}
+	defer unlock()
 	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("auth filestore: delete failed: %w", err)
 	}
-	return nil
+	return syncDirectory(filepath.Dir(path))
 }
 
 func (s *FileTokenStore) resolveDeletePath(id string) (string, error) {
@@ -335,9 +549,10 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 		Status:   status,
 		Disabled: disabled,
 		Attributes: map[string]string{
-			cliproxyauth.AttributePath:          path,
-			cliproxyauth.AttributeSource:        path,
-			cliproxyauth.AttributeSourceBackend: cliproxyauth.AuthSourceFile,
+			cliproxyauth.AttributePath:             path,
+			cliproxyauth.AttributeSource:           path,
+			cliproxyauth.AttributeSourceBackend:    cliproxyauth.AuthSourceFile,
+			cliproxyauth.AttributeSourceGeneration: fmt.Sprintf("%x", sha256.Sum256(data)),
 		},
 		Metadata:         metadata,
 		CreatedAt:        info.ModTime(),

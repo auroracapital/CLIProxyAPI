@@ -2,6 +2,7 @@ package synthesizer
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -86,6 +87,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 	}
 	t, _ := metadata["type"].(string)
 	provider := strings.ToLower(strings.TrimSpace(t))
+	generation := fmt.Sprintf("%x", sha256.Sum256(data))
 	if provider == "gemini" {
 		provider = "gemini-cli"
 	}
@@ -119,6 +121,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 				auth.Attributes[coreauth.AttributePath] = fullPath
 				auth.Attributes[coreauth.AttributeSource] = fullPath
 				auth.Attributes[coreauth.AttributeSourceBackend] = coreauth.AuthSourceFile
+				auth.Attributes[coreauth.AttributeSourceGeneration] = generation
 				if disabled {
 					auth.Disabled = true
 					auth.Status = coreauth.StatusDisabled
@@ -188,9 +191,10 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 		Status:   status,
 		Disabled: disabled,
 		Attributes: map[string]string{
-			coreauth.AttributeSource:        fullPath,
-			coreauth.AttributePath:          fullPath,
-			coreauth.AttributeSourceBackend: coreauth.AuthSourceFile,
+			coreauth.AttributeSource:           fullPath,
+			coreauth.AttributePath:             fullPath,
+			coreauth.AttributeSourceBackend:    coreauth.AuthSourceFile,
+			coreauth.AttributeSourceGeneration: generation,
 		},
 		ProxyURL:  proxyURL,
 		Metadata:  metadata,

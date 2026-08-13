@@ -10,6 +10,17 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+type symlinkReplacingTokenStorage struct {
+	target string
+}
+
+func (s *symlinkReplacingTokenStorage) SaveTokenToFile(path string) error {
+	if errRemove := os.Remove(path); errRemove != nil {
+		return errRemove
+	}
+	return os.Symlink(s.target, path)
+}
+
 func TestExtractAccessToken(t *testing.T) {
 	t.Parallel()
 
@@ -143,6 +154,62 @@ func TestFileTokenStoreSaveExistingMetadataSetsFileAttributes(t *testing.T) {
 				t.Errorf("saved auth file = %s, want JSON equal to %s", persisted, expected)
 			}
 		})
+	}
+}
+
+func TestFileTokenStoreSaveRejectsTokenStorageSymlinkSubstitution(t *testing.T) {
+	baseDir := t.TempDir()
+	target := filepath.Join(baseDir, "target.json")
+	canonical := filepath.Join(baseDir, "seat.json")
+	wantTarget := []byte(`{"type":"test","token":"target"}`)
+	wantCanonical := []byte(`{"type":"test","token":"canonical"}`)
+	if errWrite := os.WriteFile(target, wantTarget, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	if errWrite := os.WriteFile(canonical, wantCanonical, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	_, errSave := store.Save(context.Background(), &cliproxyauth.Auth{
+		ID:       "seat.json",
+		FileName: "seat.json",
+		Provider: "test",
+		Storage:  &symlinkReplacingTokenStorage{target: target},
+		Metadata: map[string]any{"type": "test"},
+	})
+	if errSave == nil {
+		t.Fatal("Save accepted a symlink-substituted staging file")
+	}
+	for path, want := range map[string][]byte{canonical: wantCanonical, target: wantTarget} {
+		got, errRead := os.ReadFile(path)
+		if errRead != nil {
+			t.Fatal(errRead)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("%s changed unexpectedly", filepath.Base(path))
+		}
+	}
+}
+
+func TestFileTokenStoreSaveCreatesNestedDirectoryBeforeLock(t *testing.T) {
+	baseDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	auth := &cliproxyauth.Auth{
+		ID:       filepath.Join("nested", "seat.json"),
+		FileName: filepath.Join("nested", "seat.json"),
+		Metadata: map[string]any{"type": "xai", "access_token": "token"},
+	}
+	path, errSave := store.Save(context.Background(), auth)
+	if errSave != nil {
+		t.Fatal(errSave)
+	}
+	if info, errStat := os.Stat(path); errStat != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("saved credential info=%v err=%v", info, errStat)
+	}
+	if info, errStat := os.Stat(path + ".reconcile.lock"); errStat != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("credential lock info=%v err=%v", info, errStat)
 	}
 }
 

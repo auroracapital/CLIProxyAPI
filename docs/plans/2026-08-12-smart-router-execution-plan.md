@@ -1,6 +1,6 @@
 # Smart Model Router and Predictive Account Balancer
 
-Status: implementation verified locally; live shadow/canary and 24-hour soak pending
+Status: generation-safe reconciliation patch verified locally; exact live canary and 24-hour soak pending
 Owner: primary agent
 Canonical runtime: `healify-hub` only
 Proxy path: nginx `:8317` -> CLIProxyAPI `127.0.0.1:8319`
@@ -29,6 +29,9 @@ Explicit model requests remain explicit. Smart model selection applies to `auto`
 - The service must automatically retry retryable failures, use a different candidate, honor provider `Retry-After`, and stop at a bounded request/time budget.
 - No retry after downstream-visible streaming output has begun, unless the protocol can prove replay is safe.
 - No secrets, raw tokens, full account emails, prompts, or PHI in routing logs or metrics.
+- Every controller filesystem mutation and lifecycle write is generation-CAS guarded. Rollback acknowledgement requires exact durable/runtime generation convergence; timestamp changes are never sufficient.
+- After refresh-token rotation, rollback preserves the newest credential generation while restoring the archived admission state. Candidate rotations are atomically restaged before the prior canonical credential is restored.
+- A successful attributed probe is followed by atomic admission that clears quarantine/error/cooldown state; `ready` alone is not accepted unless the seat is active, available, enabled, and generation-converged.
 - nginx remains the public/tailnet ingress and rate-limit layer; CLIProxyAPI remains bound to loopback on `:8319`.
 
 ## 3. Baseline findings
@@ -376,12 +379,16 @@ Current verified evidence, 2026-08-13:
 - `go test ./... -count=1` passes across the repository.
 - Focused routing, management, config, reconciliation, and least-pressure race tests pass.
 - Changed-package `go vet` passes. Repository-wide vet still reports pre-existing warnings in untouched logging/plugin-host files.
-- The controller compiles and all 19 Python unit tests pass.
+- The controller compiles and all 52 Python unit tests pass, including delayed watcher publication, candidate token rotation, generation-fenced rollback/restaging, response-loss recovery, and two-run first-install recovery.
+- Durable reconcile mutations use opaque HMAC generations and compare-and-swap; status fails closed without a generation-capable file store, probe endpoints cannot admit directly, and committed-but-unpublished CAS results are explicit.
+- File credential saves/deletes participate in the shared per-seat lock protocol; atomic writes fsync the file and directory, reject symlink-substituted staging, and watcher deletes retain a runtime seat only after validating the authoritative replacement generation/provider.
 - Formatting, `git diff --check`, workflow YAML parsing, and changed-file credential-pattern scan pass.
-- A `linux/arm64` server build succeeds; the latest pre-rollout artifact hash is recorded in the session evidence.
+- A static `linux/arm64` server build succeeds; current uncommitted candidate SHA-256 is `732c2b6786ef8359b6c2e0e79de1f7d4246ee4533357c92b1b69a969ad45ee75` (must be rebuilt from the final commit before rollout).
+- The focused Go+vet fast gate completes locally in 2.47 seconds and the Python reconciler gate in 0.31 seconds, comfortably below the one-minute critical-path target on this machine.
+- The current uncommitted diff passes gitleaks pre-commit and stdin scans with zero findings.
 - The service and timer templates pass `systemd-analyze verify` on the arm64 hub with systemd 255.
 - Live topology remains nginx `:8317` to loopback CLIProxyAPI `:8319`; the Mac has no local CLIProxy/crsproxy listener or refresh process.
-- The live hub still runs CLIProxyAPI `7.2.128` and has 19 auth files, nine of them mode `0664`; no new binary, config, unit, or inventory has been deployed.
+- The live hub still runs `v7.2.130-smart-router.5` (`157b6def`) in shadow-only mode with 19 desired/runtime seats; the reconciler service/timer remain disabled/inactive under the dry-run override, and no new binary, config, controller, unit, or inventory has been deployed in this checkpoint.
 
 Remaining production evidence:
 

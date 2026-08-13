@@ -2,6 +2,7 @@ package cliproxy
 
 import (
 	"context"
+	"os"
 	"strings"
 	"time"
 
@@ -133,6 +134,14 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 			}
 			if id == "" {
 				continue
+			}
+			if update.Path != "" {
+				if info, errStat := os.Stat(update.Path); errStat == nil && info.Mode().IsRegular() {
+					if current, ok := s.coreManager.GetByID(id); ok && current != nil && s.coreManager.ReconcileSourceGenerationCurrent(registrationCtx, current) {
+						log.Debugf("ignoring stale auth delete for %s", id)
+						continue
+					}
+				}
 			}
 			s.applyCoreAuthRemoval(registrationCtx, id)
 			needsAliasRebuild = true
@@ -274,6 +283,26 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 		return nil
 	}
 	auth = auth.Clone()
+	if auth.AuthSourceKind() == coreauth.AuthSourceFile {
+		var prepared *coreauth.Auth
+		errMutation := s.coreManager.WithCredentialMutation(auth.ID, func() error {
+			prepared = s.prepareCoreAuthForModelRegistrationUnlocked(ctx, auth)
+			return nil
+		})
+		if errMutation != nil {
+			log.Errorf("failed to serialize file-backed auth %s: %v", auth.ID, errMutation)
+			return nil
+		}
+		return prepared
+	}
+	return s.prepareCoreAuthForModelRegistrationUnlocked(ctx, auth)
+}
+
+func (s *Service) prepareCoreAuthForModelRegistrationUnlocked(ctx context.Context, auth *coreauth.Auth) *coreauth.Auth {
+	if !s.coreManager.ReconcileSourceGenerationCurrent(ctx, auth) {
+		log.Debugf("ignoring stale file-backed auth generation for %s", auth.ID)
+		return nil
+	}
 	s.ensureExecutorsForAuthWithContext(ctx, auth, false)
 
 	// IMPORTANT: Update coreManager FIRST, before model registration.

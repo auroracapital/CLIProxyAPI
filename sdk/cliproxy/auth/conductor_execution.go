@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -979,7 +980,10 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 		return target, nil
 	}
 
-	saved, errUpdate := m.Update(ctx, updated)
+	if errPersist := m.persist(ctx, updated); errPersist != nil {
+		return target, fmt.Errorf("persist prepared auth: %w", errPersist)
+	}
+	saved, errUpdate := m.Update(WithSkipPersist(ctx), updated)
 	if errUpdate != nil {
 		return updated, errUpdate
 	}

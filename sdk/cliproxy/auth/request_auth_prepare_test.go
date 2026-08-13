@@ -51,6 +51,22 @@ type requestPrepareExecutor struct {
 	observed     []*Auth
 }
 
+type blockingRequestPrepareExecutor struct {
+	requestPrepareExecutor
+	started chan struct{}
+	release chan struct{}
+}
+
+func (e *blockingRequestPrepareExecutor) PrepareRequestAuth(ctx context.Context, auth *Auth) (*Auth, error) {
+	close(e.started)
+	select {
+	case <-e.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return e.requestPrepareExecutor.PrepareRequestAuth(ctx, auth)
+}
+
 func (e *requestPrepareExecutor) Identifier() string { return "antigravity" }
 
 func (e *requestPrepareExecutor) ShouldPrepareRequestAuth(auth *Auth) bool {
@@ -398,6 +414,49 @@ func TestManagerExecute_PreparesAndPersistsMissingRequestAuthMetadata(t *testing
 	}
 	if got := executor.prepareCalls.Load(); got != 1 {
 		t.Fatalf("prepare calls after second execute = %d, want 1", got)
+	}
+}
+
+func TestDeleteCredentialWaitsForRequestPreparationAndWins(t *testing.T) {
+	const model = "gemini-3.1-pro"
+	store := &requestPrepareStore{}
+	executor := &blockingRequestPrepareExecutor{started: make(chan struct{}), release: make(chan struct{})}
+	manager := NewManager(store, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &Auth{ID: "auth-request-prepare-delete", Provider: "antigravity", Metadata: map[string]any{"access_token": "token"}}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+	prepareDone := make(chan error, 1)
+	go func() {
+		_, errExecute := manager.Execute(context.Background(), []string{auth.Provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+		prepareDone <- errExecute
+	}()
+	<-executor.started
+	deleteStarted := make(chan struct{})
+	deleteDone := make(chan error, 1)
+	go func() {
+		deleteDone <- manager.DeleteCredential(context.Background(), auth.ID, func() error {
+			close(deleteStarted)
+			return nil
+		})
+	}()
+	select {
+	case <-deleteStarted:
+		t.Fatal("delete entered durable mutation before request preparation completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(executor.release)
+	if errPrepare := <-prepareDone; errPrepare != nil {
+		t.Fatal(errPrepare)
+	}
+	if errDelete := <-deleteDone; errDelete != nil {
+		t.Fatal(errDelete)
+	}
+	if _, exists := manager.GetByID(auth.ID); exists {
+		t.Fatal("request preparation resurrected deleted auth")
 	}
 }
 

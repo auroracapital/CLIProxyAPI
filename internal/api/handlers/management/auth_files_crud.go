@@ -156,8 +156,8 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 					full = abs
 				}
 			}
-			if err = os.Remove(full); err == nil {
-				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
+			if _, errStat := os.Stat(full); errStat == nil {
+				if errDel := h.deleteAuthFileRecord(ctx, full, ""); errDel != nil {
 					c.JSON(500, gin.H{"error": errDel.Error()})
 					return
 				}
@@ -361,13 +361,13 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 			targetPath = abs
 		}
 	}
-	if errRemove := os.Remove(targetPath); errRemove != nil {
-		if os.IsNotExist(errRemove) {
+	if _, errStat := os.Stat(targetPath); errStat != nil {
+		if os.IsNotExist(errStat) {
 			return filepath.Base(name), http.StatusNotFound, errAuthFileNotFound
 		}
-		return filepath.Base(name), http.StatusInternalServerError, fmt.Errorf("failed to remove file: %w", errRemove)
+		return filepath.Base(name), http.StatusInternalServerError, fmt.Errorf("failed to stat file: %w", errStat)
 	}
-	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
+	if errDeleteRecord := h.deleteAuthFileRecord(ctx, targetPath, targetID); errDeleteRecord != nil {
 		return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
 	}
 	h.removeAuthsForPath(ctx, targetPath, targetID)
