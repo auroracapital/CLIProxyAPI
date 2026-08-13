@@ -107,6 +107,7 @@ def rendered_config(policy: dict[str, Any], client_key: str, base_key: str, stat
         "auth-dir": str(state_dir / "auths"),
         "api-keys": [client_key],
         "debug": False,
+        "commercial-mode": True,
         "logging-to-file": False,
         "usage-statistics-enabled": False,
         "proxy-url": "",

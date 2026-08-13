@@ -38,6 +38,8 @@ class AutoRouterArtifactTests(unittest.TestCase):
         policy = self.policy()
         config = renderer.rendered_config(policy, "front-secret", "base-secret", Path("/var/lib/cliproxy-auto-router"))
         self.assertEqual((config["host"], config["port"]), ("127.0.0.1", 8320))
+        self.assertTrue(config["commercial-mode"])
+        self.assertFalse(config["logging-to-file"])
         self.assertEqual(config["routing"]["auto"]["mode"], "exclusive")
         provider = config["openai-compatibility"][0]
         self.assertEqual(provider["base-url"], "http://127.0.0.1:8319/v1")
