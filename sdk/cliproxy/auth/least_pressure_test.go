@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -593,6 +594,13 @@ func TestShadowLeastPressurePredictsWithoutChangingProductionSelection(t *testin
 	observer.mu.Unlock()
 	if len(events) != 2 || events[0].Stage != "account_prediction" || events[0].ShadowMatch || !events[1].ShadowMatch {
 		t.Fatalf("shadow events = %#v", events)
+	}
+	if events[0].SeatBucket != routingSeatBucket(busy.ID) || events[1].SeatBucket != routingSeatBucket(idle.ID) ||
+		strings.Contains(events[0].SeatBucket+events[1].SeatBucket, "auth-") {
+		t.Fatalf("shadow seat buckets = %#v", events)
+	}
+	if events[0].PredictedSeatBucket != routingSeatBucket(idle.ID) || events[1].PredictedSeatBucket != routingSeatBucket(idle.ID) {
+		t.Fatalf("shadow predicted seat buckets = %#v", events)
 	}
 }
 

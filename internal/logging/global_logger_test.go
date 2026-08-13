@@ -101,6 +101,58 @@ func TestLogFormatterPrintsPluginFields(t *testing.T) {
 	}
 }
 
+func TestLogFormatterPrintsRoutingFields(t *testing.T) {
+	entry := log.NewEntry(log.New())
+	entry.Time = time.Date(2026, 8, 13, 1, 2, 3, 0, time.Local)
+	entry.Level = log.InfoLevel
+	entry.Message = "routing decision"
+	entry.Data["routing_schema_version"] = 1
+	entry.Data["routing_stage"] = "account_prediction"
+	entry.Data["routing_mode"] = "shadow"
+	entry.Data["routing_task"] = "code"
+	entry.Data["routing_score_version"] = "v1"
+	entry.Data["routing_model"] = "gpt-5.3-codex"
+	entry.Data["routing_provider"] = "codex"
+	entry.Data["routing_reason"] = "keyword_code"
+	entry.Data["routing_outcome"] = "predicted"
+	entry.Data["routing_attempt"] = 2
+	entry.Data["routing_candidate_count"] = 3
+	entry.Data["routing_duration_ms"] = 17
+	entry.Data["routing_selector"] = "shadow_least_pressure"
+	entry.Data["routing_shadow_match"] = true
+	entry.Data["routing_seat_bucket"] = "h1_0123456789abcdef"
+	entry.Data["routing_predicted_seat_bucket"] = "h1_fedcba9876543210"
+
+	formatted, errFormat := (&LogFormatter{}).Format(entry)
+	if errFormat != nil {
+		t.Fatalf("Format() error = %v", errFormat)
+	}
+
+	line := string(formatted)
+	for _, want := range []string{
+		"routing_schema_version=1",
+		"routing_stage=account_prediction",
+		"routing_mode=shadow",
+		"routing_task=code",
+		"routing_score_version=v1",
+		"routing_model=gpt-5.3-codex",
+		"routing_provider=codex",
+		"routing_reason=keyword_code",
+		"routing_outcome=predicted",
+		"routing_attempt=2",
+		"routing_candidate_count=3",
+		"routing_duration_ms=17",
+		"routing_selector=shadow_least_pressure",
+		"routing_shadow_match=true",
+		"routing_seat_bucket=h1_0123456789abcdef",
+		"routing_predicted_seat_bucket=h1_fedcba9876543210",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("formatted line %q missing %s", line, want)
+		}
+	}
+}
+
 func TestLogFormatterOmitsGenericPathField(t *testing.T) {
 	entry := log.NewEntry(log.New())
 	entry.Time = time.Date(2026, 6, 25, 20, 20, 0, 0, time.Local)

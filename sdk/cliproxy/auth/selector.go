@@ -2,6 +2,9 @@ package auth
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -22,6 +25,34 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	cliproxysession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
 )
+
+var routingSeatBucketKey, routingSeatBucketEnabled = newRoutingSeatBucketKey()
+
+func newRoutingSeatBucketKey() ([32]byte, bool) {
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		return key, false
+	}
+	return key, true
+}
+
+func routingSeatBucket(authID string) string {
+	authID = strings.TrimSpace(authID)
+	if authID == "" || !routingSeatBucketEnabled {
+		return ""
+	}
+	digest := hmac.New(sha256.New, routingSeatBucketKey[:])
+	_, _ = digest.Write([]byte("cliproxy-routing-seat-v1\x00"))
+	_, _ = digest.Write([]byte(authID))
+	return fmt.Sprintf("h1_%x", digest.Sum(nil)[:8])
+}
+
+func predictedRoutingSeatBucket(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	return routingSeatBucket(auth.ID)
+}
 
 // RoundRobinSelector provides a simple provider scoped round-robin selection strategy.
 type RoundRobinSelector struct {
@@ -836,16 +867,18 @@ func (s *ShadowLeastPressureSelector) Pick(ctx context.Context, provider, model 
 		actual.pressureLease = &credentialPressureLease{tracker: tracker, authID: actual.ID, startedAt: time.Now()}
 	}
 	if opts.RoutingObserver != nil {
-		opts.RoutingObserver.ObserveRouting(cliproxyexecutor.NormalizeRoutingEvent(cliproxyexecutor.RoutingEvent{
-			Stage:          "account_prediction",
-			Mode:           "shadow",
-			Model:          model,
-			Provider:       provider,
-			Outcome:        "predicted",
-			CandidateCount: len(available),
-			Selector:       "shadow_least_pressure",
-			ShadowMatch:    predicted != nil && predicted.ID == actual.ID,
-		}))
+		opts.RoutingObserver.ObserveRouting(cliproxyexecutor.RoutingEvent{
+			Stage:               "account_prediction",
+			Mode:                "shadow",
+			Model:               model,
+			Provider:            provider,
+			Outcome:             "predicted",
+			CandidateCount:      len(available),
+			Selector:            "shadow_least_pressure",
+			ShadowMatch:         predicted != nil && predicted.ID == actual.ID,
+			SeatBucket:          routingSeatBucket(actual.ID),
+			PredictedSeatBucket: predictedRoutingSeatBucket(predicted),
+		})
 	}
 	return actual, nil
 }

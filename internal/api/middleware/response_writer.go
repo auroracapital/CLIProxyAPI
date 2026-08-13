@@ -703,7 +703,7 @@ func mergeFileBodySource(payload []byte, source *logging.FileBodySource) ([]byte
 		}
 		buf.WriteByte('\n')
 	}
-	if errWrite := source.WriteTo(&buf); errWrite != nil {
+	if errWrite := source.WriteAllTo(&buf); errWrite != nil {
 		return nil, errWrite
 	}
 	return buf.Bytes(), nil

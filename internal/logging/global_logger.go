@@ -38,6 +38,9 @@ var logFieldOrder = []string{
 	"mode", "budget", "level", "original_mode", "original_value", "min", "max", "clamped_to", "error",
 	"credential", "connection", "proxy_scheme", "remote_transport",
 	"media_session_id", "call_id", "peer", "state", "reason",
+	"routing_schema_version", "routing_stage", "routing_mode", "routing_task", "routing_score_version",
+	"routing_model", "routing_provider", "routing_reason", "routing_outcome", "routing_attempt",
+	"routing_candidate_count", "routing_duration_ms", "routing_selector", "routing_shadow_match", "routing_seat_bucket", "routing_predicted_seat_bucket",
 }
 
 var quotedLogFields = map[string]struct{}{

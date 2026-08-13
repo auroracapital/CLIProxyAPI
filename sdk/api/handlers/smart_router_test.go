@@ -6,10 +6,12 @@ import (
 	"io"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -18,6 +20,23 @@ import (
 
 type captureRoutingObserver struct {
 	events []coreexecutor.RoutingEvent
+}
+
+type lockedRoutingLogBuffer struct {
+	mu      sync.Mutex
+	builder strings.Builder
+}
+
+func (b *lockedRoutingLogBuffer) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.builder.Write(value)
+}
+
+func (b *lockedRoutingLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.builder.String()
 }
 
 func (o *captureRoutingObserver) ObserveRouting(event coreexecutor.RoutingEvent) {
@@ -152,14 +171,15 @@ func TestSmartRouterShadowComputesWithoutChangingDispatch(t *testing.T) {
 }
 
 func TestStructuredRoutingObserverDoesNotLogSensitiveRequestData(t *testing.T) {
-	var output strings.Builder
+	registerSmartRouterModel(t, "routing-log-safe-client", "codex", "safe-model", nil)
+	var output lockedRoutingLogBuffer
 	logger := log.StandardLogger()
 	oldOutput := logger.Out
 	oldLevel := logger.Level
 	oldFormatter := logger.Formatter
 	logger.SetOutput(&output)
 	logger.SetLevel(log.InfoLevel)
-	logger.SetFormatter(&log.JSONFormatter{})
+	logger.SetFormatter(&logging.LogFormatter{})
 	t.Cleanup(func() {
 		logger.SetOutput(oldOutput)
 		logger.SetLevel(oldLevel)
@@ -170,22 +190,116 @@ func TestStructuredRoutingObserverDoesNotLogSensitiveRequestData(t *testing.T) {
 	observer.ObserveRouting(coreexecutor.RoutingEvent{
 		Stage: "model_attempt", Mode: "active", TaskClass: "code", ScoreVersion: "v1",
 		Model: "safe-model", Provider: "safe-provider", Reason: "rate_limited", Outcome: "failed",
+		Attempt: 2, CandidateCount: 3, Duration: 17 * time.Millisecond, Selector: "least_pressure",
 	})
 	deadline := time.Now().Add(time.Second)
-	for output.Len() == 0 && time.Now().Before(deadline) {
+	for output.String() == "" && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if output.Len() == 0 {
+	if output.String() == "" {
 		t.Fatal("routing observer did not emit log event")
 	}
-	logged, errRead := io.ReadAll(strings.NewReader(output.String()))
+	logged := output.String()
+	for _, want := range []string{
+		"routing_schema_version=1",
+		"routing_stage=model_attempt",
+		"routing_mode=active",
+		"routing_task=code",
+		"routing_score_version=v1",
+		"routing_model=safe-model",
+		"routing_provider=custom",
+		"routing_reason=rate_limited",
+		"routing_outcome=failed",
+		"routing_attempt=2",
+		"routing_candidate_count=3",
+		"routing_duration_ms=17",
+		"routing_selector=least_pressure",
+		"routing_shadow_match=false",
+		"routing_seat_bucket=",
+		"routing_predicted_seat_bucket=",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("routing log %q missing %s", logged, want)
+		}
+	}
+	loggedBytes, errRead := io.ReadAll(strings.NewReader(logged))
 	if errRead != nil {
 		t.Fatal(errRead)
 	}
 	for _, sentinel := range []string{"patient-name", "Bearer secret", "person@example.com", "/opt/crsproxy/auths", "raw-auth-id"} {
-		if strings.Contains(string(logged), sentinel) {
-			t.Fatalf("routing log leaked sentinel %q: %s", sentinel, logged)
+		if strings.Contains(string(loggedBytes), sentinel) {
+			t.Fatalf("routing log leaked sentinel %q: %s", sentinel, loggedBytes)
 		}
+	}
+}
+
+func TestRoutingLogFieldsOmitUnregisteredModelsAndCategorizeProviders(t *testing.T) {
+	for _, value := range []string{
+		"patient-name",
+		"0123456789abcdef0123456789abcdef",
+		"patient-name-unicode",
+	} {
+		fields, ok := routingLogFields(coreexecutor.RoutingEvent{
+			Stage: "account_selection", Mode: "active", Model: value, Provider: "tenant-provider",
+			Outcome: "selected", Selector: "round_robin",
+		})
+		if !ok {
+			t.Fatalf("routingLogFields(%q) rejected otherwise valid event", value)
+		}
+		if fields["routing_model"] != "" || fields["routing_provider"] != "custom" {
+			t.Fatalf("routingLogFields(%q) = %#v, want omitted model and custom provider", value, fields)
+		}
+	}
+	for _, value := range []string{"https://host/path", "/etc/passwd", "patient@example.com", "Bearer secret"} {
+		fields, ok := routingLogFields(coreexecutor.RoutingEvent{
+			Stage: "account_selection", Mode: "active", Model: value, Provider: "tenant-provider",
+			Outcome: "selected", Selector: "round_robin",
+		})
+		if !ok {
+			t.Fatalf("routingLogFields(%q) rejected otherwise valid event", value)
+		}
+		if fields["routing_model"] != "" {
+			t.Fatalf("routingLogFields(%q) leaked model: %#v", value, fields)
+		}
+	}
+}
+
+func TestRoutingLogFieldsRejectInvalidCategoricalEvent(t *testing.T) {
+	if fields, ok := routingLogFields(coreexecutor.RoutingEvent{
+		Stage: "prompt injection", Mode: "unknown", Outcome: "raw upstream body",
+	}); ok || fields != nil {
+		t.Fatalf("routingLogFields() = %#v, %v; want rejected", fields, ok)
+	}
+}
+
+func TestRoutingLogFieldsAcceptCurrentSmartRouteScoreVersion(t *testing.T) {
+	registerSmartRouterModel(t, "routing-log-v2-client", "codex", "routing-log-v2-model", nil)
+	fields, ok := routingLogFields(coreexecutor.RoutingEvent{
+		Stage: "model_decision", Mode: "shadow", TaskClass: "code", ScoreVersion: smartRouteScoreVersion,
+		Model: "routing-log-v2-model", Reason: "keyword_code", Outcome: "selected",
+	})
+	if !ok || fields["routing_score_version"] != smartRouteScoreVersion || fields["routing_model"] != "routing-log-v2-model" {
+		t.Fatalf("routingLogFields() = %#v, %v", fields, ok)
+	}
+}
+
+func TestRoutingLogFieldsOnlyAcceptOpaqueSeatBuckets(t *testing.T) {
+	for _, value := range []string{"raw-auth-id", "patient@example.com", "/opt/crsproxy/auths/seat.json", "h1_nothex"} {
+		fields, ok := routingLogFields(coreexecutor.RoutingEvent{
+			Stage: "account_selection", Mode: "active", Outcome: "selected", Selector: "round_robin", SeatBucket: value,
+		})
+		if !ok || fields["routing_seat_bucket"] != "" {
+			t.Fatalf("routingLogFields(%q) = %#v, %v; want empty bucket", value, fields, ok)
+		}
+	}
+	fields, ok := routingLogFields(coreexecutor.RoutingEvent{
+		Stage: "account_selection", Mode: "active", Outcome: "selected", Selector: "round_robin", SeatBucket: "h1_0123456789abcdef",
+	})
+	if !ok || fields["routing_seat_bucket"] != "h1_0123456789abcdef" {
+		t.Fatalf("routingLogFields(valid bucket) = %#v, %v", fields, ok)
+	}
+	if fields["routing_predicted_seat_bucket"] != "" {
+		t.Fatalf("routingLogFields(valid bucket) unexpected predicted bucket: %#v", fields)
 	}
 }
 

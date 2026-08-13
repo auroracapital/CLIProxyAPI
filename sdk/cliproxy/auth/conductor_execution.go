@@ -309,7 +309,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 
 		entry := logEntryWithRequestID(ctx)
-		m.emitAccountRoutingEvent(opts.RoutingObserver, "account_selection", provider, routeModel, "selected", len(attempted), len(providers))
+		m.emitAccountRoutingEvent(opts.RoutingObserver, "account_selection", provider, routeModel, auth, "selected", len(attempted), len(providers))
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
@@ -452,7 +452,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 
 		entry := logEntryWithRequestID(ctx)
-		m.emitAccountRoutingEvent(opts.RoutingObserver, "account_selection", provider, routeModel, "selected", len(attempted), len(providers))
+		m.emitAccountRoutingEvent(opts.RoutingObserver, "account_selection", provider, routeModel, auth, "selected", len(attempted), len(providers))
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
@@ -633,7 +633,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 
 		entry := logEntryWithRequestID(ctx)
-		m.emitAccountRoutingEvent(opts.RoutingObserver, "account_selection", provider, routeModel, "selected", len(attempted), len(providers))
+		m.emitAccountRoutingEvent(opts.RoutingObserver, "account_selection", provider, routeModel, auth, "selected", len(attempted), len(providers))
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		if selection != nil {
 			if errRuntimeAuth := m.bindHomeSelectionRuntimeAuth(ctx, opts, selection); errRuntimeAuth != nil {
@@ -756,8 +756,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	}
 }
 
-func (m *Manager) emitAccountRoutingEvent(observer cliproxyexecutor.RoutingObserver, stage, provider, model, outcome string, attempt, candidates int) {
-	if observer == nil {
+func (m *Manager) emitAccountRoutingEvent(observer cliproxyexecutor.RoutingObserver, stage, provider, model string, auth *Auth, outcome string, attempt, candidates int) {
+	if observer == nil || auth == nil {
 		return
 	}
 	selector := "custom"
@@ -775,7 +775,7 @@ func (m *Manager) emitAccountRoutingEvent(observer cliproxyexecutor.RoutingObser
 	}
 	observer.ObserveRouting(cliproxyexecutor.RoutingEvent{
 		Stage: stage, Mode: "active", Provider: provider, Model: model,
-		Outcome: outcome, Attempt: attempt, CandidateCount: candidates, Selector: selector,
+		Outcome: outcome, Attempt: attempt, CandidateCount: candidates, Selector: selector, SeatBucket: routingSeatBucket(auth.ID),
 	})
 }
 

@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"strings"
 	"sync/atomic"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
@@ -17,6 +19,7 @@ var defaultRoutingLogObserver = newStructuredRoutingObserver()
 type structuredRoutingObserver struct {
 	events  chan coreexecutor.RoutingEvent
 	dropped atomic.Uint64
+	invalid atomic.Uint64
 }
 
 func newStructuredRoutingObserver() *structuredRoutingObserver {
@@ -29,7 +32,6 @@ func (o *structuredRoutingObserver) ObserveRouting(event coreexecutor.RoutingEve
 	if o == nil {
 		return
 	}
-	event = coreexecutor.NormalizeRoutingEvent(event)
 	select {
 	case o.events <- event:
 	default:
@@ -39,27 +41,69 @@ func (o *structuredRoutingObserver) ObserveRouting(event coreexecutor.RoutingEve
 
 func (o *structuredRoutingObserver) run() {
 	for event := range o.events {
-		log.WithFields(log.Fields{
-			"routing_schema_version":  event.SchemaVersion,
-			"routing_stage":           event.Stage,
-			"routing_mode":            event.Mode,
-			"routing_task":            event.TaskClass,
-			"routing_score_version":   event.ScoreVersion,
-			"routing_model":           event.Model,
-			"routing_provider":        event.Provider,
-			"routing_reason":          event.Reason,
-			"routing_outcome":         event.Outcome,
-			"routing_attempt":         event.Attempt,
-			"routing_candidate_count": event.CandidateCount,
-			"routing_duration_ms":     event.Duration.Milliseconds(),
-			"routing_selector":        event.Selector,
-			"routing_shadow_match":    event.ShadowMatch,
-		}).Info("routing decision")
+		fields, ok := routingLogFields(event)
+		if !ok {
+			o.invalid.Add(1)
+			continue
+		}
+		log.WithFields(fields).Info("routing decision")
+	}
+}
+
+func routingLogFields(event coreexecutor.RoutingEvent) (log.Fields, bool) {
+	normalized := coreexecutor.NormalizeRoutingEvent(event)
+	if !routingEventEnumsWereValid(event, normalized) {
+		return nil, false
+	}
+	if normalized.Model != "" && registry.GetGlobalRegistry().GetModelInfo(normalized.Model, "") == nil {
+		normalized.Model = ""
+	}
+	normalized.Provider = routingProviderCategory(normalized.Provider)
+	return log.Fields{
+		"routing_schema_version":        normalized.SchemaVersion,
+		"routing_stage":                 normalized.Stage,
+		"routing_mode":                  normalized.Mode,
+		"routing_task":                  normalized.TaskClass,
+		"routing_score_version":         normalized.ScoreVersion,
+		"routing_model":                 normalized.Model,
+		"routing_provider":              normalized.Provider,
+		"routing_reason":                normalized.Reason,
+		"routing_outcome":               normalized.Outcome,
+		"routing_attempt":               normalized.Attempt,
+		"routing_candidate_count":       normalized.CandidateCount,
+		"routing_duration_ms":           normalized.Duration.Milliseconds(),
+		"routing_selector":              normalized.Selector,
+		"routing_shadow_match":          normalized.ShadowMatch,
+		"routing_seat_bucket":           normalized.SeatBucket,
+		"routing_predicted_seat_bucket": normalized.PredictedSeatBucket,
+	}, true
+}
+
+func routingEventEnumsWereValid(raw, normalized coreexecutor.RoutingEvent) bool {
+	return strings.ToLower(strings.TrimSpace(raw.Stage)) == normalized.Stage &&
+		strings.ToLower(strings.TrimSpace(raw.Mode)) == normalized.Mode &&
+		strings.ToLower(strings.TrimSpace(raw.TaskClass)) == normalized.TaskClass &&
+		strings.ToLower(strings.TrimSpace(raw.ScoreVersion)) == normalized.ScoreVersion &&
+		strings.ToLower(strings.TrimSpace(raw.Reason)) == normalized.Reason &&
+		strings.ToLower(strings.TrimSpace(raw.Outcome)) == normalized.Outcome &&
+		strings.ToLower(strings.TrimSpace(raw.Selector)) == normalized.Selector
+}
+
+func routingProviderCategory(provider string) string {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	switch provider {
+	case "", "aistudio", "antigravity", "claude", "codex", "gemini", "gemini-cli", "gemini-interactions", "kimi", "openai", "openai-compatibility", "vertex", "xai":
+		return provider
+	default:
+		if strings.HasPrefix(provider, "openai-compatible-") {
+			return "openai-compatible"
+		}
+		return "custom"
 	}
 }
 
 func emitRoutingEvent(observer coreexecutor.RoutingObserver, event coreexecutor.RoutingEvent) {
 	if observer != nil {
-		observer.ObserveRouting(coreexecutor.NormalizeRoutingEvent(event))
+		observer.ObserveRouting(event)
 	}
 }
