@@ -89,6 +89,12 @@ func describeOpenAICompatibilityUpdate(oldEntry, newEntry config.OpenAICompatibi
 	if !optionalIntEqual(oldEntry.RequestRetry, newEntry.RequestRetry) {
 		details = append(details, fmt.Sprintf("request-retry %s -> %s", formatOptionalInt(oldEntry.RequestRetry), formatOptionalInt(newEntry.RequestRetry)))
 	}
+	if strings.TrimSpace(oldEntry.FirstByteTimeout) != strings.TrimSpace(newEntry.FirstByteTimeout) {
+		details = append(details, fmt.Sprintf("first-byte-timeout %q -> %q", strings.TrimSpace(oldEntry.FirstByteTimeout), strings.TrimSpace(newEntry.FirstByteTimeout)))
+	}
+	if strings.TrimSpace(oldEntry.Timeout) != strings.TrimSpace(newEntry.Timeout) {
+		details = append(details, fmt.Sprintf("timeout %q -> %q", strings.TrimSpace(oldEntry.Timeout), strings.TrimSpace(newEntry.Timeout)))
+	}
 	if oldKeyCount != newKeyCount {
 		details = append(details, fmt.Sprintf("api-keys %d -> %d", oldKeyCount, newKeyCount))
 	}

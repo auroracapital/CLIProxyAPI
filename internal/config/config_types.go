@@ -822,6 +822,51 @@ type OpenAICompatibility struct {
 
 	// RequestScopedErrors configures custom classification rules for upstream errors.
 	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
+
+	// FirstByteTimeout bounds one upstream attempt until response headers arrive and,
+	// for streams, until the first body byte. On expiry the attempt fails as a 504 so
+	// the credential/model cools briefly and the next candidate is tried.
+	// Accepts Go durations ("20s") or whole seconds ("20"). Empty or "0" disables it.
+	FirstByteTimeout string `yaml:"first-byte-timeout,omitempty" json:"first-byte-timeout,omitempty"`
+
+	// Timeout bounds one whole non-streaming upstream attempt, body included.
+	// Streams ignore it: once bytes flow there is no total cap. Same format as FirstByteTimeout.
+	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+}
+
+// FirstByteTimeoutDuration returns the parsed first-byte timeout, or 0 when unset or invalid.
+func (c *OpenAICompatibility) FirstByteTimeoutDuration() time.Duration {
+	if c == nil {
+		return 0
+	}
+	return parseOptionalAttemptTimeout(c.FirstByteTimeout)
+}
+
+// TimeoutDuration returns the parsed total non-streaming timeout, or 0 when unset or invalid.
+func (c *OpenAICompatibility) TimeoutDuration() time.Duration {
+	if c == nil {
+		return 0
+	}
+	return parseOptionalAttemptTimeout(c.Timeout)
+}
+
+// parseOptionalAttemptTimeout parses a positive duration ("20s") or whole seconds ("20").
+// Anything else, including zero and negative values, disables the timeout.
+func parseOptionalAttemptTimeout(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if d, err := time.ParseDuration(raw); err == nil {
+		if d > 0 {
+			return d
+		}
+		return 0
+	}
+	if secs, err := strconv.Atoi(raw); err == nil && secs > 0 && int64(secs) <= maxBootstrapTimeoutSeconds {
+		return time.Duration(secs) * time.Second
+	}
+	return 0
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.

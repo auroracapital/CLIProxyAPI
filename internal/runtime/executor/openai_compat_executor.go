@@ -146,7 +146,10 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
+	firstByteTimeout, totalTimeout := e.attemptTimeouts(auth)
+	attempt := startOpenAICompatAttempt(ctx, firstByteTimeout, totalTimeout)
+	defer attempt.release()
+	httpReq, err := http.NewRequestWithContext(attempt.ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return resp, err
 	}
@@ -181,7 +184,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
+	attempt.firstByteReceived()
 	if err != nil {
+		err = attempt.timeoutError(e.Identifier(), err)
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
@@ -200,6 +205,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	body, err := io.ReadAll(httpResp.Body)
 	if err != nil {
+		err = attempt.timeoutError(e.Identifier(), err)
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
@@ -362,7 +368,16 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
+	// Streams get the first-byte timeout only; once bytes flow there is no total cap.
+	firstByteTimeout, _ := e.attemptTimeouts(auth)
+	attempt := startOpenAICompatAttempt(ctx, firstByteTimeout, 0)
+	attemptHandedOff := false
+	defer func() {
+		if !attemptHandedOff {
+			attempt.release()
+		}
+	}()
+	httpReq, err := http.NewRequestWithContext(attempt.ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return nil, err
 	}
@@ -400,6 +415,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		err = attempt.timeoutError(e.Identifier(), err)
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
@@ -414,15 +430,38 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		err = newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, b)
 		return nil, err
 	}
+	var streamBody io.Reader = httpResp.Body
+	if firstByteTimeout > 0 {
+		// Hold the stream back until the first body byte, so an upstream that
+		// sends headers and then stalls still fails before anything is committed
+		// to the client and the conductor can try the next candidate.
+		buffered := bufio.NewReader(httpResp.Body)
+		if _, errPeek := buffered.Peek(1); errPeek != nil {
+			if errTimeout := attempt.timeoutError(e.Identifier(), errPeek); errTimeout != errPeek {
+				if errClose := httpResp.Body.Close(); errClose != nil {
+					log.Errorf("openai compat executor: close response body error: %v", errClose)
+				}
+				helps.RecordAPIResponseError(ctx, e.cfg, errTimeout)
+				err = errTimeout
+				return nil, err
+			}
+			// Other read errors (including EOF) are replayed by the reader below
+			// and handled by the normal stream path.
+		}
+		streamBody = buffered
+	}
+	attempt.firstByteReceived()
+	attemptHandedOff = true
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		defer attempt.release()
 		defer func() {
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("openai compat executor: close response body error: %v", errClose)
 			}
 		}()
-		scanner := bufio.NewScanner(httpResp.Body)
+		scanner := bufio.NewScanner(streamBody)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
 		var param any
