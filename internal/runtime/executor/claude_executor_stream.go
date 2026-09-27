@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
@@ -546,6 +547,26 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	return result, nil
 }
 
+// claudeStreamRateLimitPattern matches rate-limit wording in an SSE error
+// message when Anthropic omits or varies error.type.
+var claudeStreamRateLimitPattern = regexp.MustCompile(`(?i)rate.?limit`)
+
+// claudeStreamErrorEventStatus maps an in-stream {"type":"error"} event to an
+// HTTP status so the conductor applies the right cooldown. A rate limit must
+// be 429 (quota cooldown with backoff), not 502 (10s transient cooldown), or
+// a rate-limited seat is retried every few seconds.
+func claudeStreamErrorEventStatus(errType, message string) int {
+	errType = strings.ToLower(strings.TrimSpace(errType))
+	switch {
+	case errType == "rate_limit_error" || claudeStreamRateLimitPattern.MatchString(message):
+		return http.StatusTooManyRequests
+	case errType == "overloaded_error":
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusBadGateway
+	}
+}
+
 func validateClaudeStreamingResponse(data []byte) error {
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	scanner.Buffer(nil, 52_428_800)
@@ -578,7 +599,7 @@ func validateClaudeStreamingResponse(data []byte) error {
 			if message == "" {
 				message = "unknown upstream error"
 			}
-			return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned error event: " + message}
+			return statusErr{code: claudeStreamErrorEventStatus(root.Get("error.type").String(), message), msg: "claude executor: upstream returned error event: " + message}
 		case "message_start":
 			message := root.Get("message")
 			if strings.TrimSpace(message.Get("id").String()) == "" || strings.TrimSpace(message.Get("model").String()) == "" {

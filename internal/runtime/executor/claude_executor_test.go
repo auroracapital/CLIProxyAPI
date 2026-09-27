@@ -2917,7 +2917,7 @@ func TestClaudeExecutor_ExecuteOpenAINonStreamRejectsClaudeErrorEvent(t *testing
 	if err == nil {
 		t.Fatal("Execute error = nil, want upstream error event")
 	}
-	assertStatusErr(t, err, http.StatusBadGateway)
+	assertStatusErr(t, err, http.StatusServiceUnavailable)
 	if !strings.Contains(err.Error(), "upstream overloaded") {
 		t.Fatalf("Execute error = %q, want upstream overloaded", err.Error())
 	}
